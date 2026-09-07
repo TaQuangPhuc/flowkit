@@ -40,14 +40,34 @@ RPC_OPERATION = "jwpduf"
 RPC_PROJECT_MEDIA = "Zzl0ze"
 RPC_MEDIA = "as29s"
 RPC_UPLOAD_IMAGE = "maseQ"
+# Label only — StreamChat is not a batchexecute rpcid; the URL is STREAM_CHAT_PATH.
+RPC_STREAM_CHAT = "StreamChat"
+# Page-load bind for the creation-agent conversation StreamChat is scoped to.
+# Inner payload is ``["<session uuid>"]``; the same id is StreamChat slot 0.
+RPC_CHAT_SESSION = "GN0Bre"
+
+STREAM_CHAT_PATH = (
+    "/_/AiSandboxAngularFrontend/data/"
+    "google.internal.labs.aisandbox.proto.flow.agent.v1.FlowCreationAgentService/StreamChat"
+)
 
 CAPTCHA_IMAGE = "IMAGE_GENERATION"
 CAPTCHA_VIDEO = "VIDEO_GENERATION"
+# StreamChat (r2v ingredients) — captured 2026-09-07 off Flow UI grecaptcha.execute.
+CAPTCHA_CHAT = "CHAT_GENERATION"
 
 #: The extension substitutes a freshly minted reCAPTCHA token for this marker.
 #: It has to be a placeholder rather than a real token because the mint has to
 #: happen in the page, moments before the request leaves.
 CAPTCHA_SLOT = "__CAPTCHA__"
+
+#: StreamChat is scoped to a creation-agent conversation the page already has.
+#: The extension replaces this with the GN0Bre session it finds in the tab.
+#: A random uuid here is rejected as PUBLIC_ERROR_UNUSUAL_ACTIVITY.
+CHAT_SESSION_SLOT = "__CHAT_SESSION__"
+
+#: Trailing mode flag on the captured r2v StreamChat call. Keep as observed.
+STREAM_CHAT_VIDEO_MODE = 3
 
 #: Wire names this path accepts. Everything else is rejected outright by Flow.
 #: ``GEM_PIX_2`` is Nano Banana Pro, ``NARWHAL`` is Banana 2. Flow Kit uses Pro
@@ -288,16 +308,21 @@ def parse_envelope(text: str) -> list[RpcResult]:
     return results
 
 
-def first_payload(text: str, rpcid: str) -> Any:
-    """The payload of the first matching envelope, or raise what went wrong."""
+def first_payload(text: str, rpcid: str | None = None) -> Any:
+    """The payload of the first matching envelope, or raise what went wrong.
+
+    ``rpcid=None`` takes the first ok envelope — StreamChat has no rpcids=
+    query and the wrb.fr id is not known until a response is captured.
+    """
     results = parse_envelope(text)
     for result in results:
-        if result.rpcid != rpcid:
+        if rpcid and result.rpcid != rpcid:
             continue
         if not result.ok:
-            raise RpcError(rpcid, result.error)
+            raise RpcError(result.rpcid, result.error)
         return result.data
-    raise FlowBatchError(f"no {rpcid} envelope in response ({len(results)} others)")
+    label = rpcid or "envelope"
+    raise FlowBatchError(f"no {label} envelope in response ({len(results)} others)")
 
 
 # ── request builders ─────────────────────────────────────────────────────────
@@ -340,6 +365,41 @@ def image_request(prompt: str, project_id: str, count: int = 1,
                       _client_uuid(), _client_uuid()])
     return build_envelope(RPC_GEN_IMAGE, [None, items, 1, _context(project_id),
                                           [_client_uuid()]])
+
+
+def stream_chat_request(prompt: str, project_id: str,
+                        ref_media_ids: list[str],
+                        session_id: str = CHAT_SESSION_SLOT,
+                        mode: int = STREAM_CHAT_VIDEO_MODE) -> str:
+    """Ingredients-to-video as the creation-agent chat sends it.
+
+    Captured 2026-09-07 off Flow's StreamChat call: not batchexecute
+    ``[[[rpcid, inner, null, generic]]]``, but ``[null, "<inner json>"]``.
+    Inner slots, in order: conversation id, ``[[[[prompt]]]], [[mediaId], …]``,
+    then ``["projects/<id>", null, [captcha, 1], null, null, mode]``.
+    """
+    if not ref_media_ids:
+        raise ValueError("r2v StreamChat needs at least one reference media id")
+    inner = [
+        session_id,
+        [
+            [[[prompt]]],
+            [[mid] for mid in ref_media_ids],
+        ],
+        [
+            f"projects/{project_id}",
+            None,
+            [CAPTCHA_SLOT, 1],
+            None,
+            None,
+            mode,
+        ],
+    ]
+    return json.dumps(
+        [None, json.dumps(inner, separators=(",", ":"), ensure_ascii=False)],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
 
 
 def video_request(prompt: str, project_id: str, source_media_id: str,
@@ -429,6 +489,70 @@ def read_uploaded_media_id(payload: Any) -> str:
     return media_id
 
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
+
+
+def _operation_from_node(node: list) -> Operation:
+    try:
+        return read_operation([None, 50, [node]])
+    except FlowBatchError:
+        return Operation(operation_id=node[0], project_id=None, status=None)
+
+
+def _is_stream_chat_record(node: list) -> bool:
+    """``[mediaId, projectId, sceneId, "CAE"]`` as StreamChat listing rows look."""
+    if len(node) < 4:
+        return False
+    if not isinstance(node[1], str) or not _UUID_RE.match(node[1]):
+        return False
+    status = node[3]
+    return isinstance(status, str) and 1 <= len(status) <= 8
+
+
+def read_stream_chat_operation(payload: Any) -> Operation:
+    """Pull an operation out of a StreamChat payload.
+
+    The i2v generate answers ``[null, 50, [[opId, projectId, sceneId, status]]]``.
+    StreamChat wraps chat events around that; a chat-message uuid often
+    appears first and is *not* the listing key. Prefer a record whose
+    second slot is a project uuid and whose fourth is a short status
+    (``CAE`` once finished). A bare uuid is the last resort.
+    """
+    direct = None
+    try:
+        direct = read_operation(payload)
+    except FlowBatchError:
+        pass
+    fallback = None
+    preferred = None
+    for node in _walk_lists(payload):
+        if not isinstance(node, list) or not node:
+            continue
+        head = node[0]
+        if not isinstance(head, str) or not _UUID_RE.match(head):
+            continue
+        if head.lower().startswith("projects"):
+            continue
+        op = _operation_from_node(node)
+        if _is_stream_chat_record(node):
+            if isinstance(node[3], str) and node[3] == "CAE":
+                return op
+            if preferred is None:
+                preferred = op
+        elif fallback is None:
+            fallback = op
+    if preferred:
+        return preferred
+    if direct:
+        return direct
+    if fallback:
+        return fallback
+    raise FlowBatchError("StreamChat response carried no operation")
+
+
 def read_operation(payload: Any) -> Operation:
     """`[null, 50, [[opId, projectId, sceneId, status, …]]]`.
 
@@ -469,8 +593,11 @@ def read_operation_error(record: list) -> Optional[str]:
 def find_media_id(payload: Any, operation_id: str) -> Optional[str]:
     """Look an operation up in the project listing and take its media id.
 
-    Entries look like
+    i2v entries look like
     ``[opId, null, null, [title, created, null, null, mediaId, clientUuid, done], projectId]``.
+    StreamChat r2v entries look like
+    ``[mediaId, projectId, sceneId, "CAE", …]`` — slot 0 *is* the media id
+    (``as29s`` on it returns the clip).
     """
     for node in _walk_lists(payload):
         if len(node) < 4 or node[0] != operation_id:
@@ -478,6 +605,8 @@ def find_media_id(payload: Any, operation_id: str) -> Optional[str]:
         detail = node[3]
         if isinstance(detail, list) and len(detail) > 4 and isinstance(detail[4], str):
             return detail[4]
+        if _is_stream_chat_record(node):
+            return node[0]
     return None
 
 
@@ -498,8 +627,15 @@ def find_media_id_in_text(text: str, operation_id: str) -> Optional[str]:
     start = text.find(operation_id)
     if start == -1:
         return None
+    window = text[start:start + 800]
     match = _MEDIA_SLOT.search(text, start, start + 800)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    # r2v StreamChat: the listing key is the media id, followed by project,
+    # scene, then status ``CAE``.
+    if '"CAE"' in window or r'\"CAE\"' in window:
+        return operation_id
+    return None
 
 
 def read_media_urls(payload: Any, media_id: str) -> MediaUrls:

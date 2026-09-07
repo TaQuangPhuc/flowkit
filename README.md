@@ -252,9 +252,10 @@ Three capabilities have no captured payload, so they fail with
 | Capability | Status | Workaround |
 |---|---|---|
 | 4K/1080p upscale (`/fk-pipeline` last step) | unported | none — keep the 1080p render |
-| Reference-to-video (r2v) | unported | `FLOW_ALLOW_DEGRADED=1` → i2v off the first reference |
 | Start+end-frame chaining (`/fk-gen-chain-videos`) | unported | `FLOW_ALLOW_DEGRADED=1` → i2v off the start frame |
 | Omni Flash (`model_family=omni_flash`) | unported | use `model_family=veo` |
+
+Reference-to-video (r2v) is ported: `POST /api/flow/generate-video-refs` goes through Flow's StreamChat path with recaptcha action `CHAT_GENERATION`.
 
 Restoring one starts with a capture, not a guess: [`docs/CAPTURE.md`](docs/CAPTURE.md).
 
@@ -819,7 +820,7 @@ String patterns in `error_message` that the worker recognizes:
 | `NO_FLOW_KEY` | Extension has no captured bearer token — **legacy path only**, expected on the batch path | Only meaningful with `USE_BATCH_RPC=0` |
 | `NO_AT_TOKEN` | Flow tab is signed out, on an interstitial, or still booting | Open `flow.google.com`, sign in, let the app load |
 | `NO_FLOW_PROJECT` | No Flow project to scope the RPC to | Pin `FLOW_PROJECT_ID` — **terminal, not retried** |
-| `UNSUPPORTED_ON_BATCH_API` | Upscale / r2v / chaining — payload never captured | See `docs/CAPTURE.md` — **terminal, not retried** |
+| `UNSUPPORTED_ON_BATCH_API` | Upscale / chaining — payload never captured | See `docs/CAPTURE.md` — **terminal, not retried** |
 | `NO_FLOW_TAB` | No Google Flow tab available for reCAPTCHA | User must open a Flow tab |
 | `Failed to fetch` | Network drop inside extension service worker | Retry with backoff |
 | `timeout` / WS 60s no response | Extension hung mid-request | Re-queue PENDING |

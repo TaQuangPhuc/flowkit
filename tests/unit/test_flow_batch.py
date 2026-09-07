@@ -122,6 +122,48 @@ class TestVideoRequest:
         assert inner(fb.video_request("go", self.PID, "mid", crop=crop))[0][0][4][5] == crop
 
 
+class TestStreamChatRequest:
+    PID = "11111111-2222-3333-4444-555555555555"
+
+    def _inner(self, freq):
+        outer = json.loads(freq)
+        assert outer[0] is None
+        return json.loads(outer[1])
+
+    def test_prompt_and_refs_land_in_the_captured_slots(self):
+        payload = self._inner(fb.stream_chat_request(
+            "man picks flowers", self.PID, ["mid-a", "mid-b"]))
+        assert payload[1][0][0][0][0] == "man picks flowers"
+        assert payload[1][1] == [["mid-a"], ["mid-b"]]
+        assert payload[2][0] == f"projects/{self.PID}"
+        assert payload[2][2] == [fb.CAPTCHA_SLOT, 1]
+        assert payload[2][5] == fb.STREAM_CHAT_VIDEO_MODE
+        assert payload[0] == fb.CHAT_SESSION_SLOT
+
+    def test_empty_refs_are_refused(self):
+        with pytest.raises(ValueError):
+            fb.stream_chat_request("go", self.PID, [])
+
+    def test_envelope_is_not_the_batchexecute_generic_wrapper(self):
+        freq = fb.stream_chat_request("go", self.PID, ["mid-a"])
+        parsed = json.loads(freq)
+        assert parsed[0] is None
+        assert isinstance(parsed[1], str)
+
+    def test_reader_prefers_the_cae_record_over_an_earlier_chat_uuid(self):
+        chat = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        media = "12345678-1234-1234-1234-1234567890ab"
+        project = self.PID
+        scene = "99999999-9999-9999-9999-999999999999"
+        payload = [
+            ["chat-event", chat, "hello"],
+            [media, project, scene, "CAE"],
+        ]
+        op = fb.read_stream_chat_operation(payload)
+        assert op.operation_id == media
+        assert op.status == "CAE"
+
+
 class TestReaders:
     OP = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     MID = "12345678-1234-1234-1234-1234567890ab"
@@ -172,6 +214,20 @@ class TestReaders:
     def test_the_media_id_is_found_in_a_decoded_listing_too(self):
         payload = [[self.OP, None, None, ["t", 1, None, None, self.MID], "proj"]]
         assert fb.find_media_id(payload, self.OP) == self.MID
+
+    def test_stream_chat_listing_row_uses_slot_zero_as_media(self):
+        """r2v rows are [mediaId, projectId, sceneId, CAE]; as29s on slot 0 works."""
+        project = "11111111-2222-3333-4444-555555555555"
+        scene = "99999999-9999-9999-9999-999999999999"
+        payload = [[self.MID, project, scene, "CAE", None, ["title"]]]
+        assert fb.find_media_id(payload, self.MID) == self.MID
+
+    def test_stream_chat_listing_text_treats_cae_key_as_media(self):
+        text = (
+            f'["{self.MID}","11111111-2222-3333-4444-555555555555",'
+            f'"99999999-9999-9999-9999-999999999999","CAE",null,'
+        )
+        assert fb.find_media_id_in_text(text, self.MID) == self.MID
 
     def test_urls_are_split_by_kind(self):
         video = f"https://{fb.MEDIA_HOST}/video/{self.MID}?s=1"

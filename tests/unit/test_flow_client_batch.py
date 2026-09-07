@@ -40,9 +40,10 @@ def client(monkeypatch):
     c.responses = {}
     c.calls = []
 
-    async def fake_batch_rpc(rpcid, freq, captcha_action=None, match=None, timeout=300):
+    async def fake_batch_rpc(rpcid, freq, captcha_action=None, match=None,
+                             timeout=300, path=None):
         c.calls.append({"rpcid": rpcid, "freq": freq,
-                        "captcha": captcha_action, "match": match})
+                        "captcha": captcha_action, "match": match, "path": path})
         canned = c.responses.get(rpcid, {"data": ""})
         return canned(match) if callable(canned) else canned
 
@@ -145,18 +146,39 @@ class TestGenerateVideo:
         payload = json.loads(json.loads(client.calls[0]["freq"])[0][0][1])
         assert payload[0][0][4][1] == "start-mid"
 
-    async def test_r2v_fails_loudly_by_default(self, client):
-        result = await client.generate_video_from_references(["a", "b"], "go", PROJECT, "s")
-        assert "UNSUPPORTED_ON_BATCH_API" in result["error"]
+    async def test_r2v_posts_stream_chat_with_the_reference_ids(self, client):
+        client.responses[fb.RPC_STREAM_CHAT] = self._submitted(client)
+        result = await client.generate_video_from_references(
+            ["ref-a", "ref-b"], "go", PROJECT, "s")
 
-    async def test_degraded_r2v_uses_the_first_reference_as_the_start_frame(self, client, monkeypatch):
-        import agent.services.flow_client as module
-        monkeypatch.setattr(module, "FLOW_ALLOW_DEGRADED", True)
-        client.responses[fb.RPC_GEN_VIDEO] = self._submitted(client)
+        assert not _is_error(result)
+        call = client.calls[0]
+        assert call["rpcid"] == fb.RPC_STREAM_CHAT
+        assert call["path"] == fb.STREAM_CHAT_PATH
+        assert call["captcha"] == fb.CAPTCHA_CHAT
+        outer = json.loads(call["freq"])
+        inner = json.loads(outer[1])
+        assert inner[0] == fb.CHAT_SESSION_SLOT
+        assert inner[1][0][0][0][0] == "go"
+        assert inner[1][1] == [["ref-a"], ["ref-b"]]
+        assert inner[2][0] == f"projects/{PROJECT}"
+        assert inner[2][2][0] == fb.CAPTCHA_SLOT
+        assert inner[2][5] == fb.STREAM_CHAT_VIDEO_MODE
+        assert result["data"]["operations"][0]["operation"]["name"] == OPERATION
 
-        await client.generate_video_from_references(["ref-a", "ref-b"], "go", PROJECT, "s")
-        payload = json.loads(json.loads(client.calls[0]["freq"])[0][0][1])
-        assert payload[0][0][4][1] == "ref-a"
+    async def test_r2v_reuses_the_gn0bre_chat_session(self, client):
+        client.remember_chat_session("8c72f80b-41ff-42f6-9dff-5a759553f9f4")
+        client.responses[fb.RPC_STREAM_CHAT] = self._submitted(client)
+        result = await client.generate_video_from_references(
+            ["ref-a"], "go", PROJECT, "s")
+        assert not _is_error(result)
+        inner = json.loads(json.loads(client.calls[0]["freq"])[1])
+        assert inner[0] == "8c72f80b-41ff-42f6-9dff-5a759553f9f4"
+
+    async def test_r2v_without_refs_fails_before_a_call(self, client):
+        result = await client.generate_video_from_references([], "go", PROJECT, "s")
+        assert "No reference media_ids" in result["error"]
+        assert not client.calls
 
     async def test_upscale_is_unported_and_has_no_fallback(self, client, monkeypatch):
         import agent.services.flow_client as module

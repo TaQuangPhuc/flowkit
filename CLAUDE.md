@@ -30,11 +30,12 @@ that change how you work:
 
 - **Projects are not created by Flow Kit any more.** Make one in the Flow UI and
   pin its uuid as `FLOW_PROJECT_ID`, or pass `flow_project_id` to `POST /api/projects`.
-- **Four capabilities are unported** because their payloads were never captured:
-  4K upscale, r2v, start+end-frame chaining, and Omni Flash. They fail with
+- **Three capabilities are unported** because their payloads were never captured:
+  4K upscale, start+end-frame chaining, and Omni Flash. They fail with
   `UNSUPPORTED_ON_BATCH_API` rather than silently producing the wrong thing.
-  `FLOW_ALLOW_DEGRADED=1` drops chaining and r2v to plain i2v; upscale has no
-  fallback. To restore one properly, see `docs/CAPTURE.md`.
+  `FLOW_ALLOW_DEGRADED=1` drops chaining to plain i2v; upscale has no
+  fallback. r2v is ported (StreamChat + `CHAT_GENERATION`). To restore an
+  unported call properly, see `docs/CAPTURE.md`.
 - **A poll saying "Media not found." is not a failure.** Finished jobs report it.
 
 ## Skills

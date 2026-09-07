@@ -472,40 +472,86 @@ async function runBatchRpc(cmd) {
   const [injected] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     world: 'MAIN',
-    args: [cmd.rpcid, freq, MAX_RPC_TEXT, cmd.match || null],
-    func: async (rpcid, freqStr, maxText, match) => {
+    args: [cmd.rpcid, freq, MAX_RPC_TEXT, cmd.match || null, cmd.path || null],
+    func: async (rpcid, freqStr, maxText, match, customPath) => {
       const wiz = globalThis.WIZ_global_data || {};
       const at = wiz.SNlM0e;
       const sid = wiz.FdrFJe;
       const bl = wiz.cfb2h;
       if (!at) return { error: 'NO_AT_TOKEN' };
+      if (freqStr.includes('__CHAT_SESSION__')) {
+        const reExact = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const fromBag = (bag, keyed) => {
+          try {
+            for (let i = 0; i < bag.length; i++) {
+              const k = bag.key(i) || '';
+              const v = (bag.getItem(k) || '').trim();
+              if (keyed && !/session|conversation|chat|thread|agent/i.test(k + v)) continue;
+              if (reExact.test(v)) return v;
+            }
+          } catch {}
+          return null;
+        };
+        const found = globalThis.__FLOW_CHAT_SESSION__
+          || fromBag(localStorage, true) || fromBag(sessionStorage, true)
+          || fromBag(localStorage, false) || fromBag(sessionStorage, false);
+        if (!found) return { error: 'NO_CHAT_SESSION' };
+        freqStr = freqStr.split('__CHAT_SESSION__').join(found);
+      }
+      const isStreamChat = !!(customPath && customPath.includes('StreamChat'));
+      const hl = isStreamChat ? 'en' : 'en-AU';
       const reqid = Math.floor(Math.random() * 900000) + 100000;
-      const url =
-        `/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=${encodeURIComponent(rpcid)}` +
-        `&f.sid=${encodeURIComponent(sid || '')}&bl=${encodeURIComponent(bl || '')}` +
-        `&hl=en-AU&_reqid=${reqid}&rt=c`;
-      const resp = await fetch(url, {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
-          'x-same-domain': '1',
-        },
-        body: new URLSearchParams({ 'f.req': freqStr, at }),
-      });
-      const text = await resp.text();
+      const base = customPath
+        || (`/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=${encodeURIComponent(rpcid)}`);
+      const join = base.includes('?') ? '&' : '?';
+      const qs = isStreamChat
+        ? `bl=${encodeURIComponent(bl || '')}&f.sid=${encodeURIComponent(sid || '')}&hl=${hl}&_reqid=${reqid}&rt=c`
+        : `f.sid=${encodeURIComponent(sid || '')}&bl=${encodeURIComponent(bl || '')}&hl=${hl}&_reqid=${reqid}&rt=c`;
+      const url = `${base}${join}${qs}`;
+      const body = new URLSearchParams({ 'f.req': freqStr, at }).toString();
+      let status;
+      let text;
+      if (isStreamChat) {
+        const xhrResult = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', url, true);
+          xhr.withCredentials = true;
+          xhr.setRequestHeader('content-type', 'application/x-www-form-urlencoded;charset=UTF-8');
+          xhr.setRequestHeader('x-same-domain', '1');
+          xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText || '' });
+          xhr.onerror = () => reject(new Error('XHR_FAILED'));
+          xhr.send(body);
+        });
+        status = xhrResult.status;
+        text = xhrResult.text;
+      } else {
+        const resp = await fetch(url, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'x-same-domain': '1',
+          },
+          body,
+        });
+        status = resp.status;
+        text = await resp.text();
+      }
       // The project listing is tens of megabytes and all we ever want from it
       // is one entry. Cutting it down here keeps that payload inside the tab
       // instead of pushing it through the bridge on every poll.
       if (match) {
         const found = text.indexOf(match);   // not `at` — that is the CSRF token above
+        // Keep bytes before the needle too: r2v listing keys sit ahead of
+        // the prompt title, so a title match would otherwise miss mediaId.
+        const from = found === -1 ? 0 : Math.max(0, found - 700);
         return {
-          status: resp.status,
+          status,
           matched: found !== -1,
-          text: found === -1 ? '' : text.slice(found, found + 800),
+          text: found === -1 ? '' : text.slice(from, found + 800),
         };
       }
-      return { status: resp.status, text: text.slice(0, maxText) };
+      return { status, text: text.slice(0, maxText) };
     },
   });
 
@@ -514,7 +560,7 @@ async function runBatchRpc(cmd) {
 
 async function handleBatchRpc(msg) {
   const { id, params } = msg;
-  const { rpcid, freq, captchaAction, match } = params || {};
+  const { rpcid, freq, captchaAction, match, path } = params || {};
   if (!rpcid || !freq) {
     sendToAgent({ id, status: 400, error: 'INVALID_BATCH_RPC' });
     return;
@@ -535,7 +581,7 @@ async function handleBatchRpc(msg) {
   }
 
   try {
-    const out = await runBatchRpc({ id, rpcid, freq, captchaAction, match });
+    const out = await runBatchRpc({ id, rpcid, freq, captchaAction, match, path });
     if (out.error) {
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = out.error; }
       if (visible) updateRequestLog(id, { status: 'failed', error: out.error });

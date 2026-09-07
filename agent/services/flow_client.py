@@ -55,6 +55,9 @@ class FlowClient:
         self._ws_disconnect_count = 0
         self._ws_connected_at: Optional[float] = None
         self._ws_last_disconnect_at: Optional[float] = None
+        # Creation-agent conversation id from GN0Bre. StreamChat must reuse it;
+        # a minted uuid comes back PUBLIC_ERROR_UNUSUAL_ACTIVITY.
+        self._chat_session_id: Optional[str] = None
 
     def set_extension(self, ws):
         """Called when extension connects via WS."""
@@ -112,6 +115,14 @@ class FlowClient:
             len(disconnected_pending),
             len(self._extensions),
         )
+
+    def remember_chat_session(self, session_id: str) -> None:
+        """Pin the Flow creation-agent conversation StreamChat has to reuse."""
+        sid = (session_id or "").strip()
+        if not sid or sid == self._chat_session_id:
+            return
+        self._chat_session_id = sid
+        logger.info("Flow chat session %s", sid)
 
     def _extension_candidates(self, require_token: bool):
         """Return usable extensions in preferred routing order."""
@@ -480,29 +491,41 @@ class FlowClient:
     async def batch_rpc(self, rpcid: str, freq: str,
                         captcha_action: str | None = None,
                         match: str | None = None,
-                        timeout: float = 300) -> dict:
+                        timeout: float = 300,
+                        path: str | None = None) -> dict:
         """Run one batchexecute RPC in the Flow page. Returns the raw body.
 
         ``match`` asks the extension to cut the response down to an 800-byte
         window around that string before handing it back. The project listing
         is tens of megabytes for the one entry we want, and the cheapest place
         to throw the rest away is inside the tab.
+
+        ``path`` overrides the default ``/data/batchexecute?rpcids=…`` URL —
+        StreamChat lives on a service path, not a rpcid.
         """
         params: dict = {"rpcid": rpcid, "freq": freq}
         if captcha_action:
             params["captchaAction"] = captcha_action
         if match:
             params["match"] = match
+        if path:
+            params["path"] = path
         return await self._send("batch_rpc", params, timeout=timeout)
 
-    async def _batch_payload(self, rpcid: str, freq: str,
+    async def _batch_payload(self, rpcid: str | None, freq: str,
                              captcha_action: str | None = None,
-                             timeout: float = 300):
+                             timeout: float = 300,
+                             path: str | None = None):
         """One RPC, unwrapped to its inner payload. Raises on anything else."""
-        result = await self.batch_rpc(rpcid, freq, captcha_action, timeout=timeout)
+        label = rpcid or "StreamChat"
+        result = await self.batch_rpc(label, freq, captcha_action,
+                                      timeout=timeout, path=path)
         if result.get("error"):
-            raise fb.FlowBatchError(f"{rpcid}: {result['error']}")
-        return fb.first_payload(result.get("data") or "", rpcid)
+            raise fb.FlowBatchError(f"{label}: {result['error']}")
+        raw = result.get("data") or ""
+        if rpcid:
+            return fb.first_payload(raw, rpcid)
+        return fb.first_payload(raw)
 
     def _batch_project_id(self, project_id: str) -> str:
         """The Flow project an RPC is scoped to.
@@ -675,22 +698,35 @@ class FlowClient:
                 reference_media_ids, prompt, project_id, scene_id,
                 aspect_ratio, user_paygate_tier)
 
-        if not FLOW_ALLOW_DEGRADED:
-            return {"error": _unsupported(
-                "reference-to-video (r2v)",
-                "its payload was never captured off the new UI",
-            )}
         if not reference_media_ids:
             return {"error": "No reference media_ids for r2v"}
-        logger.warning(
-            "Scene %s: r2v is not on the batch path — running i2v off the first "
-            "reference %s because FLOW_ALLOW_DEGRADED=1",
-            str(scene_id)[:12], reference_media_ids[0][:12])
-        return await self.generate_video(
-            start_image_media_id=reference_media_ids[0], prompt=prompt,
-            project_id=project_id, scene_id=scene_id, aspect_ratio=aspect_ratio,
-            user_paygate_tier=user_paygate_tier,
-        )
+
+        try:
+            pid = self._batch_project_id(project_id)
+            session = self._chat_session_id or fb.CHAT_SESSION_SLOT
+            logger.info("r2v StreamChat session=%s", session)
+            freq = fb.stream_chat_request(
+                prompt, pid, reference_media_ids, session_id=session)
+            result = await self.batch_rpc(
+                fb.RPC_STREAM_CHAT, freq, fb.CAPTCHA_CHAT,
+                timeout=120, path=fb.STREAM_CHAT_PATH,
+            )
+            if result.get("error"):
+                raise fb.FlowBatchError(f"StreamChat: {result['error']}")
+            raw = result.get("data") or ""
+            try:
+                payload = fb.first_payload(raw)
+                operation = fb.read_stream_chat_operation(payload)
+            except Exception:
+                logger.error("[DEBUG] r2v StreamChat raw (%d chars): %s",
+                             len(raw), raw[:2000])
+                raise
+        except Exception as e:
+            logger.error("[DEBUG] r2v StreamChat failed: %s", e)
+            return _batch_error(e)
+
+        self._remember_operation(operation.operation_id, pid)
+        return {"status": 200, "data": {"operations": [_as_pending_operation(operation.operation_id)]}}
 
     async def upscale_video(self, media_id: str, scene_id: str,
                              aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
@@ -801,7 +837,18 @@ class FlowClient:
             return None, complaint
         if not project_id:
             return None, "no project id for the listing lookup"
-        return await self._media_id_for(operation_id, project_id), complaint
+        media_id = await self._media_id_for(operation_id, project_id)
+        if media_id:
+            return media_id, complaint
+        # StreamChat r2v keys the listing row by the media id. i2v
+        # slot-matching misses that shape; as29s on the id still serves it.
+        try:
+            urls = await self._batch_media_urls(operation_id)
+            if urls.video or urls.image:
+                return operation_id, complaint
+        except Exception:
+            pass
+        return None, complaint
 
     async def _media_id_for(self, operation_id: str, project_id: str) -> str | None:
         """Find an operation's media id in the project listing.
