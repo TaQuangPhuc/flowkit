@@ -1293,10 +1293,16 @@ def run_pipeline_worker(job_id: str):
     else:
         flow_mode = "pov"
 
-    # Enforce fallback if no model image uploaded for modes requiring model
+    # Enforce fallback or default model if no model image uploaded for modes requiring model
     if flow_mode in ["ugc", "store_review"] and not model_file.exists():
-        print("No model image provided, falling back to POV mode.")
-        flow_mode = "pov"
+        default_model = Path("/home/pc/flowkit/mau/human.jpg")
+        if default_model.exists():
+            import shutil
+            shutil.copy(default_model, model_file)
+            print(f"UGC mode: Auto-assigned default realistic creator model {default_model} -> {model_file}")
+        else:
+            print("No model image provided, falling back to POV mode.")
+            flow_mode = "pov"
 
     video_engine = job.get("video_engine", "veo")
     if "veo" in str(job.get("video_model", "")).lower():
@@ -2171,9 +2177,11 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                 bgm_path=bgm_info.get("file")
             )
 
+            total_dur = len(valid_clips) * scene_duration
             update_job(
                 job_id,
                 status="COMPLETED",
+                error=None,
                 message=f"Hoàn thành xuất sắc toàn bộ {len(valid_clips)}/{num_scenes} phân cảnh ({total_dur} giây)!",
                 final_video_url=f"/job/{job_id}/final",
                 completed_at=time.time(),
@@ -2903,6 +2911,29 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             return
 
         if p in ["api/tvc/list", "api/jobs/list"]:
+            # Parse tenant_id from query string or X-Tenant-Id header
+            tenant_id = None
+            if "?" in self.path:
+                try:
+                    from urllib.parse import parse_qs, urlparse
+                    qs = parse_qs(urlparse(self.path).query)
+                    if "tenant_id" in qs and qs["tenant_id"]:
+                        tenant_id = str(qs["tenant_id"][0]).strip()
+                except Exception:
+                    pass
+            if not tenant_id:
+                tenant_id = str(self.headers.get("X-Tenant-Id") or "").strip()
+
+            # Strict Tenant Isolation: Never leak another tenant's jobs or return jobs to caller without tenant_id
+            if not tenant_id:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                if not head_only:
+                    self.wfile.write(json.dumps({"ok": True, "jobs": []}, ensure_ascii=False).encode("utf-8"))
+                return
+
             jobs_out = []
             if WORK_DIR.exists():
                 for p_dir in WORK_DIR.iterdir():
@@ -2917,6 +2948,11 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             for jid, j in JOBS.items():
                 if not isinstance(j, dict):
                     continue
+                # Verify tenant ownership
+                job_tenant = str(j.get("tenant_id") or "").strip()
+                if job_tenant != tenant_id:
+                    continue
+
                 final_file = WORK_DIR / jid / "final_tvc.mp4"
                 final_video = j.get("final_video_url")
                 if not final_video and final_file.exists():
@@ -2938,6 +2974,7 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
                     jobs_out.append({
                         "job_id": jid,
+                        "tenant_id": job_tenant,
                         "status": j.get("status", "COMPLETED"),
                         "created_at": created_ms,
                         "final_video_url": final_video or f"/job/{jid}/final",
@@ -3673,6 +3710,18 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
         job_dir.mkdir(parents=True, exist_ok=True)
 
         parts = body.split(b"--" + boundary)
+        tenant_id = ""
+        if "?" in self.path:
+            try:
+                from urllib.parse import parse_qs, urlparse
+                qs = parse_qs(urlparse(self.path).query)
+                if "tenant_id" in qs and qs["tenant_id"]:
+                    tenant_id = str(qs["tenant_id"][0]).strip()
+            except Exception:
+                pass
+        if not tenant_id:
+            tenant_id = str(self.headers.get("X-Tenant-Id") or "").strip()
+
         flow_mode = "pov"
         video_engine = "veo"
         resolution = "720p"
@@ -3690,7 +3739,12 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
         product_highlights = ""
 
         for part in parts:
-            if b'name="flow_mode"' in part and b"\r\n\r\n" in part:
+            if b'name="tenant_id"' in part and b"\r\n\r\n" in part:
+                _, val = part.split(b"\r\n\r\n", 1)
+                t_val = val.strip().decode(errors="ignore")
+                if t_val:
+                    tenant_id = t_val
+            elif b'name="flow_mode"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 m_str = val.strip().decode(errors="ignore")
                 if m_str in ["pov", "unboxing", "demo", "ugc", "store_review", "tvc"]:
@@ -3815,6 +3869,7 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
         JOBS[job_id] = {
             "job_id": job_id,
+            "tenant_id": str(tenant_id).strip() if tenant_id else "",
             "status": "QUEUED",
             "message": "Đang khởi động pipeline tự động...",
             "flow_mode": flow_mode,
@@ -3836,6 +3891,10 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             "total_steps": 5,
             "created_at": time.time()
         }
+        try:
+            (job_dir / "job.json").write_text(json.dumps(JOBS[job_id], indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
         threading.Thread(target=run_pipeline_worker, args=(job_id,), daemon=True).start()
 
