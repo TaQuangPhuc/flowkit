@@ -545,23 +545,23 @@ class UnusualAuditManager:
 
             for key, rec in self._proxy_records.items():
                 acc = account_by_proxy.get(key) or account_by_proxy.get(rec.redacted)
-                worker_label = (acc.get("label") or acc.get("id")) if acc else "Chưa gán worker"
+                worker_label = (acc.get("label") or acc.get("id")) if acc else "Chưa gán nick (Sẵn sàng trong Pool)"
 
                 reqs = rec.total_requests
                 pct = min(100, round((reqs / safe_threshold) * 100))
 
                 if reqs < int(safe_threshold * 0.6):
                     risk = "SAFE"
-                    recommendation = f"Rất an toàn (còn ~{max(0, safe_threshold - reqs)} reqs trước ngưỡng khuyến nghị)"
+                    recommendation = f"Cực kỳ an toàn (còn ~{max(0, safe_threshold - reqs)} requests trước ngưỡng khuyến nghị)"
                 elif reqs < safe_threshold:
                     risk = "MODERATE"
-                    recommendation = f"Đang ở ngưỡng hoạt động tốt (còn ~{max(0, safe_threshold - reqs)} reqs)"
+                    recommendation = f"Hoạt động tốt (còn ~{max(0, safe_threshold - reqs)} requests)"
                 elif reqs < clean_median:
                     risk = "WARNING"
-                    recommendation = "Đã chạm ngưỡng an toàn, nên chuẩn bị xoay proxy"
+                    recommendation = "Đã chạm ngưỡng an toàn (cần chuẩn bị xoay proxy)"
                 else:
                     risk = "CRITICAL"
-                    recommendation = "Nguy cơ cao gặp UNUSUAL_ACTIVITY, nên xoay proxy ngay"
+                    recommendation = "Ngưỡng nguy cơ cao gặp UNUSUAL_ACTIVITY (nên xoay proxy ngay)"
 
                 active_proxies.append({
                     "proxy": rec.redacted,
