@@ -212,6 +212,14 @@ async def add_to_proxy_pool(body: ProxyPoolAddBody):
     }
 
 
+@router.get("/unusual-threshold")
+async def get_accounts_unusual_threshold():
+    """Forensic analysis: how many requests per IP before hitting unusual activity."""
+    from agent.services.unusual_audit import get_unusual_audit
+    audit_mgr = get_unusual_audit()
+    return audit_mgr.compute_threshold_analysis()
+
+
 @router.get("/{nick_id}")
 async def get_one(nick_id: str, reveal: bool = True):
     row = get_account(nick_id)
@@ -302,5 +310,6 @@ async def rename_nick(nick_id: str, body: RenameBody):
         raise HTTPException(400, str(exc)) from exc
     _reload_router()
     return _live_row(saved, reveal=True)
+
 
 

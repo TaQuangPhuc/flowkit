@@ -620,3 +620,12 @@ async def test_recaptcha_endpoint(worker_id: str = "nick-a", action: str = "FLOW
     except Exception as e:
         return {"ok": False, "worker_id": worker_id, "action": action, "error": str(e)}
 
+
+@router.get("/diagnostics/unusual-threshold")
+async def get_unusual_threshold():
+    """Get forensic analysis of requests per IP before unusual activity occurs."""
+    from agent.services.unusual_audit import get_unusual_audit
+    audit_mgr = get_unusual_audit()
+    return audit_mgr.compute_threshold_analysis()
+
+
