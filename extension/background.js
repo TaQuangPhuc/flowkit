@@ -670,10 +670,18 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
     if (!shouldInject) throw error;
 
     // Inject content script and retry
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['content.js'],
-    });
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content.js'],
+      });
+    } catch (e) {
+      const execMsg = e?.message || '';
+      if (execMsg.includes('Frame with ID 0 is showing error page') || execMsg.includes('cannot be scripted')) {
+        try { await chrome.tabs.update(tabId, { url: FLOW_TAB_URL }); } catch {}
+      }
+      throw e;
+    }
     await sleep(200);
     return await chrome.tabs.sendMessage(tabId, payload);
   }
@@ -736,12 +744,17 @@ async function solveCaptcha(requestId, captchaAction) {
       const msg = e?.message || '';
       errors.push(msg);
       // Tab evaporated mid-call (window closed, discarded again, navigated
-      // away). Move on to the next candidate rather than failing the job.
+      // away, or error page). Move on to the next candidate rather than failing the job.
       if (
         msg.includes('No current window') ||
         msg.includes('No tab with id') ||
-        msg.includes('Receiving end does not exist')
+        msg.includes('Receiving end does not exist') ||
+        msg.includes('Frame with ID 0 is showing error page') ||
+        msg.includes('cannot be scripted')
       ) {
+        if ((msg.includes('Frame with ID 0 is showing error page') || msg.includes('cannot be scripted')) && tab?.id) {
+          try { await chrome.tabs.update(tab.id, { url: FLOW_TAB_URL }); } catch {}
+        }
         continue;
       }
       return { error: msg };

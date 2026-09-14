@@ -542,6 +542,30 @@ async def stop_nick(nick_id: str) -> bool:
             proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
             pass
+    else:
+        orphan_pid = find_running_chrome_pid(nick_id)
+        if orphan_pid:
+            try:
+                os.killpg(os.getpgid(orphan_pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(orphan_pid, signal.SIGTERM)
+                except Exception:
+                    pass
+            stopped = True
+            for _ in range(40):
+                if not _pid_is_live(orphan_pid):
+                    break
+                await asyncio.sleep(0.1)
+            if _pid_is_live(orphan_pid):
+                try:
+                    os.killpg(os.getpgid(orphan_pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        os.kill(orphan_pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.2)
     drop_stale_chrome_lock(chrome_data_dir(nick_id))
     await stop_bridge(nick_id)
     return stopped
