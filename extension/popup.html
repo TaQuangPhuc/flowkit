@@ -225,6 +225,49 @@
       text-align: center;
       letter-spacing: 0.04em;
     }
+
+    .profile-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+
+    .profile-row label {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      flex-shrink: 0;
+    }
+
+    .profile-row input {
+      flex: 1;
+      min-width: 0;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 11px;
+      padding: 4px 6px;
+    }
+
+    .profile-row input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    #profile-project {
+      font-size: 9px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 120px;
+    }
   </style>
 </head>
 <body>
@@ -232,6 +275,12 @@
     <div class="header-title"><span>Flow Kit</span> Extension</div>
     <button id="btn-panel">Side Panel</button>
   </header>
+
+  <div class="profile-row">
+    <label for="profile-id">Nick</label>
+    <input id="profile-id" placeholder="nick-a" spellcheck="false" autocomplete="off" />
+    <span id="profile-project" title="Flow project learned from the tab"></span>
+  </div>
 
   <div class="log-header">
     Recent Requests

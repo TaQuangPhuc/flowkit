@@ -25,19 +25,32 @@ function _bodyToText(body) {
 function _stashChatSession(url, body) {
   try {
     const u = String(url || '');
-    if (!u.includes('rpcids=GN0Bre') && !u.includes('rpcids%3DGN0Bre')) return;
     const text = _bodyToText(body);
+    const blob = u + ' ' + (text || '');
+    if (
+      !blob.includes('GN0Bre')
+      && !u.includes('StreamChat')
+      && !u.includes('CreationAgent')
+    ) return;
     if (!text) return;
     let freq = null;
     if (text.includes('f.req=')) freq = new URLSearchParams(text).get('f.req');
     else if (text.trim().startsWith('[')) freq = text;
     if (!freq) return;
     const envelope = JSON.parse(freq);
-    let inner = envelope[0][0][1];
-    if (typeof inner === 'string') inner = JSON.parse(inner);
-    const sid = inner && inner[0];
-    if (typeof sid === 'string' && /^[0-9a-f-]{36}$/i.test(sid)) {
+    const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    let sid = null;
+    if (Array.isArray(envelope) && envelope[0] === null && typeof envelope[1] === 'string') {
+      const inner = JSON.parse(envelope[1]);
+      if (typeof inner?.[0] === 'string') sid = inner[0];
+    } else {
+      let inner = envelope[0][0][1];
+      if (typeof inner === 'string') inner = JSON.parse(inner);
+      if (typeof inner?.[0] === 'string') sid = inner[0];
+    }
+    if (typeof sid === 'string' && re.test(sid)) {
       window.__FLOW_CHAT_SESSION__ = sid;
+      try { window.postMessage({ type: 'FLOW_CHAT_SESSION', session: sid }, '*'); } catch {}
     }
   } catch {}
 }
@@ -83,10 +96,105 @@ XMLHttpRequest.prototype.send = function (body) {
   return _xhrSend.call(this, body);
 };
 
-window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
-  const { requestId, pageAction } = detail;
+window.__flowRunBatch = async function (rpcid, freqStr, maxText, match, customPath) {
   try {
-    await waitForGrecaptcha();
+    const wiz = window.WIZ_global_data || {};
+    const at = wiz.SNlM0e;
+    const sid = wiz.FdrFJe;
+    const bl = wiz.cfb2h;
+    if (!at) return { error: 'NO_AT_TOKEN' };
+    if (typeof freqStr === 'string' && freqStr.includes('__CHAT_SESSION__')) {
+      const reExact = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const fromBag = (bag, keyed) => {
+        try {
+          for (let i = 0; i < bag.length; i++) {
+            const k = bag.key(i) || '';
+            const v = (bag.getItem(k) || '').trim();
+            if (keyed && !/session|conversation|chat|thread|agent/i.test(k + v)) continue;
+            if (reExact.test(v)) return v;
+          }
+        } catch {}
+        return null;
+      };
+      const found = window.__FLOW_CHAT_SESSION__
+        || fromBag(localStorage, true) || fromBag(sessionStorage, true)
+        || fromBag(localStorage, false) || fromBag(sessionStorage, false);
+      if (!found) return { error: 'NO_CHAT_SESSION' };
+      freqStr = freqStr.split('__CHAT_SESSION__').join(found);
+    }
+    const isStreamChat = !!(customPath && String(customPath).includes('StreamChat'));
+    const hl = isStreamChat ? 'en' : 'en-AU';
+    const reqid = Math.floor(Math.random() * 900000) + 100000;
+    const base = customPath
+      || (`/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=${encodeURIComponent(rpcid)}`);
+    const join = String(base).includes('?') ? '&' : '?';
+    const qs = isStreamChat
+      ? `bl=${encodeURIComponent(bl || '')}&f.sid=${encodeURIComponent(sid || '')}&hl=${hl}&_reqid=${reqid}&rt=c`
+      : `f.sid=${encodeURIComponent(sid || '')}&bl=${encodeURIComponent(bl || '')}&hl=${hl}&_reqid=${reqid}&rt=c`;
+    const url = `${base}${join}${qs}`;
+    const body = new URLSearchParams({ 'f.req': freqStr, at }).toString();
+    const cap = typeof maxText === 'number' && maxText > 0 ? maxText : 32000000;
+    let status;
+    let text;
+    if (isStreamChat) {
+      const xhrResult = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.withCredentials = true;
+        xhr.setRequestHeader('content-type', 'application/x-www-form-urlencoded;charset=UTF-8');
+        xhr.setRequestHeader('x-same-domain', '1');
+        xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText || '' });
+        xhr.onerror = () => reject(new Error('XHR_FAILED'));
+        xhr.send(body);
+      });
+      status = xhrResult.status;
+      text = xhrResult.text;
+    } else {
+      const resp = await _originalFetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          'x-same-domain': '1',
+        },
+        body,
+      });
+      status = resp.status;
+      text = await resp.text();
+    }
+    if (match) {
+      const found = text.indexOf(match);
+      const from = found === -1 ? 0 : Math.max(0, found - 700);
+      return {
+        status,
+        matched: found !== -1,
+        text: found === -1 ? '' : text.slice(from, found + 800),
+      };
+    }
+    return { status, text: text.slice(0, cap) };
+  } catch (e) {
+    return { error: e?.message || 'BATCH_PAGE_FAILED' };
+  }
+};
+
+window.addEventListener('message', async (event) => {
+  if (event.source !== window) return;
+  const data = event.data;
+  if (!data || data.type !== 'FLOW_BATCH_RPC') return;
+  const result = await window.__flowRunBatch(
+    data.rpcid, data.freq, data.maxText, data.match, data.path,
+  );
+  window.postMessage({
+    type: 'FLOW_BATCH_RPC_RESULT',
+    requestId: data.requestId,
+    result,
+  }, '*');
+});
+
+window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
+  const { requestId, pageAction, recaptchaCode, recaptchaError } = detail;
+  try {
+    await waitForGrecaptcha(recaptchaCode, recaptchaError);
     const token = await window.grecaptcha.enterprise.execute(SITE_KEY, {
       action: pageAction,
     });
@@ -100,14 +208,81 @@ window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
   }
 });
 
-function waitForGrecaptcha(timeout = 22000) {   // it loads lazily; 10s was optimistic
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const check = () => {
-      if (window.grecaptcha?.enterprise?.execute) return resolve();
-      if (Date.now() - start > timeout) return reject(new Error('grecaptcha not available'));
-      setTimeout(check, 200);
-    };
-    check();
-  });
+let _recaptchaPolicy = null;
+let _recaptchaLoading = null;
+
+function recaptchaPolicy() {
+  const tt = window.trustedTypes;
+  if (!tt) return null;
+  if (_recaptchaPolicy) return _recaptchaPolicy;
+  try {
+    _recaptchaPolicy = tt.createPolicy('flowkitRecaptcha', {
+      createScript: (code) => code,
+      createScriptURL: (url) => url,
+    });
+  } catch {
+    _recaptchaPolicy = tt.defaultPolicy;
+  }
+  return _recaptchaPolicy;
+}
+
+function runRecaptchaCode(code) {
+  const policy = recaptchaPolicy();
+  if (policy && policy.createScript) {
+    (0, eval)(policy.createScript(code));
+    return;
+  }
+  (0, eval)(code);
+}
+
+function installRecaptchaStub() {
+  const cfg = window.___grecaptcha_cfg = window.___grecaptcha_cfg || {};
+  const api = window.grecaptcha = window.grecaptcha || {};
+  const enterprise = api.enterprise = api.enterprise || {};
+  enterprise.ready = enterprise.ready || function (fn) {
+    (cfg.fns = cfg.fns || []).push(fn);
+  };
+  window.__recaptcha_api = 'https://www.google.com/recaptcha/enterprise/';
+  (cfg.enterprise = cfg.enterprise || []).push(true);
+  (cfg.enterprise2fa = cfg.enterprise2fa || []).push(true);
+  (cfg.render = cfg.render || []).push(SITE_KEY);
+  (cfg['anchor-ms'] = cfg['anchor-ms'] || []).push(20000);
+  (cfg['execute-ms'] = cfg['execute-ms'] || []).push(30000);
+  window.__google_recaptcha_client = true;
+}
+
+async function ensureGrecaptchaScript(recaptchaCode, recaptchaError) {
+  if (window.grecaptcha?.enterprise?.execute) return;
+  if (_recaptchaLoading) return _recaptchaLoading;
+  _recaptchaLoading = (async () => {
+    let code = recaptchaCode;
+    if (!code) {
+      if (recaptchaError) throw new Error(recaptchaError);
+      const loaderUrl = 'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(SITE_KEY);
+      const loader = await (await fetch(loaderUrl, { credentials: 'omit' })).text();
+      const match = loader.match(/https:\/\/www\.gstatic\.com\/recaptcha\/releases\/[^'"\s]+\/recaptcha__\w+\.js/);
+      if (!match) throw new Error('recaptcha release url missing');
+      code = await (await fetch(match[0], { credentials: 'omit' })).text();
+    }
+    installRecaptchaStub();
+    runRecaptchaCode(code);
+  })();
+  return _recaptchaLoading;
+}
+
+async function waitForGrecaptcha(recaptchaCode, recaptchaError, timeout = 22000) {
+  let loadError = null;
+  try {
+    await ensureGrecaptchaScript(recaptchaCode, recaptchaError);
+  } catch (err) {
+    loadError = err;
+  }
+  const start = Date.now();
+  while (!window.grecaptcha?.enterprise?.execute) {
+    if (Date.now() - start > timeout) {
+      const extra = loadError ? `: ${loadError.message}` : '';
+      throw new Error('grecaptcha not available' + extra);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
 }

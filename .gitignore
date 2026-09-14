@@ -11,6 +11,20 @@ extension/_metadata/
 output/
 youtube
 agent/active_project.json
+agent/accounts*.json
+agent/proxy_pool.json
+agent/proxy_pool.backup.json
+agent/proxy_quarantine.json
+agent/temp_proxy_session.json
+.claude/settings.local.json
+frames_*
+mau/
+auto_runs/
+scratch_*
+test_kf3_fixed.jpg
+test_tts2.mp3
+logs/
+*.log
 
 # Generated AI tool configs (run: python setup.py)
 .claude/commands/fk-*

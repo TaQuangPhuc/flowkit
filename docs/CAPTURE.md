@@ -15,12 +15,13 @@ request bodies to disk, so it goes in for one session and comes straight back ou
 | step | rpcid | notes |
 |---|---|---|
 | generate image | `ogiZ0b` | signed CDN url comes back inline |
-| generate video | `eb1hJf` | returns an operation id |
+| generate video (i2v) | `eb1hJf` | start image + crop; returns an operation id |
+| generate video (t2v) | `YhhmEf` | no media slot; model `veo_3_1_t2v_lite_low_priority`; UI sends 2 variants |
 | poll operation | `jwpduf` | status `CAE` means finished |
 | operation → media id | `Zzl0ze` | `projects/<id>`; the listing is ~17 MB |
 | media id → urls | `as29s` | signed `/video/` + poster `/image/` |
 | upload an image | `maseQ` | base64 in the payload, captcha like a generate |
-| reference-to-video | `StreamChat` | creation-agent path, not batchexecute; captcha action `CHAT_GENERATION`; session from `GN0Bre` |
+| reference-to-video | `StreamChat` | creation-agent path, not batchexecute; captcha action `CHAT_GENERATION`; session from `csbIsb` (CreateSession) **response**. `mrlkwd` lists sessions; `GN0Bre` is GetSession |
 
 Missing, and each blocked behind a capture: **video upscale**,
 **start+end-frame chaining**, and the **base-image** variant of the image edit.

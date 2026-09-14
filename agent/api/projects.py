@@ -429,7 +429,13 @@ async def generate_thumbnail(pid: str, body: ThumbnailRequest):
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(gen_result.url) as resp:
                     if resp.status == 200:
-                        output_path.write_bytes(await resp.read())
+                        raw_bytes = await resp.read()
+                        try:
+                            from agent.services.watermark_remover import remove_watermark_from_bytes
+                            clean_bytes = remove_watermark_from_bytes(raw_bytes)
+                            output_path.write_bytes(clean_bytes)
+                        except Exception:
+                            output_path.write_bytes(raw_bytes)
                     else:
                         raise HTTPException(502, f"Failed to download image: HTTP {resp.status}")
         except aiohttp.ClientError as e:

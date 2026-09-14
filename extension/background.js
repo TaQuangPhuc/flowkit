@@ -13,6 +13,8 @@
  */
 
 const AGENT_WS_URL = 'ws://127.0.0.1:9222';
+// Nick copies rewrite this to "nick-a" so handshake does not wait on profile.json.
+const BAKED_PROFILE_ID = null;
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
 
@@ -31,6 +33,9 @@ let flowKey = null;
 let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
 let state = 'off'; // off | idle | running
 let manualDisconnect = false;
+// Cached so extension_ready can go out on onopen without awaiting storage.
+let profileId = null;
+let flowProjectId = null;
 let metrics = {
   tokenCapturedAt: null,
   requestCount: 0,   // captcha-consuming requests only (gen image/video/upscale)
@@ -107,13 +112,75 @@ function ensureInitialized() {
   return initializationPromise;
 }
 
+async function loadBakedProfileId() {
+  try {
+    const url = chrome.runtime.getURL('profile.json');
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const baked = await res.json();
+    const id = String(baked?.profileId || '').trim();
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
 async function initialize() {
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret']);
+  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'profileId', 'flowProjectId']);
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
+  if (BAKED_PROFILE_ID) profileId = BAKED_PROFILE_ID;
+  else if (data.profileId) profileId = data.profileId;
+  if (data.flowProjectId) flowProjectId = data.flowProjectId;
+  if (!profileId) {
+    const baked = await loadBakedProfileId();
+    if (baked) {
+      profileId = baked;
+      chrome.storage.local.set({ profileId });
+    }
+  } else {
+    chrome.storage.local.set({ profileId });
+  }
   connectToAgent();
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
+}
+
+const FLOW_PROJECT_RE = /flow\.google\.com\/project\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+
+function flowProjectFromUrl(url) {
+  const m = String(url || '').match(FLOW_PROJECT_RE);
+  return m ? m[1] : null;
+}
+
+function sendProfileUpdate() {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: 'profile_update',
+    profileId,
+    flowProjectId,
+  }));
+}
+
+async function refreshFlowProject() {
+  try {
+    const tabs = await chrome.tabs.query({ url: flowUrls });
+    let found = null;
+    for (const tab of tabs) {
+      const pid = flowProjectFromUrl(tab.url);
+      if (pid) {
+        found = pid;
+        break;
+      }
+    }
+    if (found && found !== flowProjectId) {
+      flowProjectId = found;
+      chrome.storage.local.set({ flowProjectId });
+      sendProfileUpdate();
+    }
+  } catch {
+    // tabs.query is unavailable in some test fakes
+  }
 }
 
 // MV3 workers can be suspended and restarted without onStartup firing.
@@ -148,6 +215,247 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
   ['requestHeaders', 'extraHeaders'],
 );
+
+// ─── Flow RPC netlog (r2v session + payload capture) ────────
+// Observes the signed-in tab's POSTs under /_/. Polls / project listing /
+// media fetches are skipped so the log stays readable. GN0Bre / StreamChat
+// session ids are stashed on the page and forwarded to the agent.
+const NETLOG_HOSTS = ['https://flow.google.com/_/*'];
+const NETLOG_SKIP = /rpcids=(jwpduf|Zzl0ze|as29s)|rpcids%3D(jwpduf|Zzl0ze|as29s)/;
+const NETLOG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const NETLOG_FREQ_MAX = 24000;
+const netlogPending = new Map();
+let _stashedChatSession = null;
+
+function netlogRpcid(url) {
+  const u = String(url || '');
+  if (u.includes('StreamChat')) return 'StreamChat';
+  if (u.includes('CreationAgent')) return 'CreationAgent';
+  const m = u.match(/rpcids=([A-Za-z0-9]+)/) || u.match(/rpcids%3D([A-Za-z0-9]+)/);
+  return m ? m[1] : null;
+}
+
+function netlogDecodeBody(requestBody) {
+  if (!requestBody) return null;
+  if (requestBody.formData) {
+    const freq = requestBody.formData['f.req'];
+    if (Array.isArray(freq) && freq[0]) return String(freq[0]);
+    try { return JSON.stringify(requestBody.formData); } catch { return null; }
+  }
+  const raw = requestBody.raw;
+  if (!raw?.length || !raw[0]?.bytes) return null;
+  try {
+    return new TextDecoder().decode(new Uint8Array(raw[0].bytes));
+  } catch {
+    return null;
+  }
+}
+
+function netlogFreq(body) {
+  if (!body) return null;
+  const text = String(body);
+  if (text.includes('f.req=')) {
+    try { return new URLSearchParams(text).get('f.req'); } catch { return null; }
+  }
+  const trimmed = text.trim();
+  if (trimmed.startsWith('[')) return trimmed;
+  return text.slice(0, NETLOG_FREQ_MAX);
+}
+
+function isChatRpc(url, freq) {
+  const blob = String(url || '') + ' ' + String(freq || '');
+  return /GN0Bre|StreamChat|CreationAgent|FlowCreationAgent/i.test(blob);
+}
+
+function firstUuid(text) {
+  const m = String(text || '').match(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+  );
+  return m ? m[0] : null;
+}
+
+function extractChatSession(url, freq) {
+  if (!freq) return null;
+  try {
+    const env = JSON.parse(freq);
+    if (Array.isArray(env) && env.length >= 2 && env[0] === null && typeof env[1] === 'string') {
+      const inner = JSON.parse(env[1]);
+      if (typeof inner?.[0] === 'string' && NETLOG_UUID.test(inner[0])) return inner[0];
+    }
+    const item = env?.[0]?.[0];
+    const rpcid = item?.[0];
+    let inner = item?.[1];
+    if (typeof inner === 'string') inner = JSON.parse(inner);
+    const fromUrl = String(url || '').includes('GN0Bre');
+    if ((rpcid === 'GN0Bre' || fromUrl) && typeof inner?.[0] === 'string' && NETLOG_UUID.test(inner[0])) {
+      return inner[0];
+    }
+  } catch {}
+  if (isChatRpc(url, freq)) return firstUuid(freq);
+  return null;
+}
+
+function stashChatSession(sid) {
+  if (!sid || sid === _stashedChatSession) return;
+  _stashedChatSession = sid;
+  chrome.tabs.query({ url: flowUrls }).then((tabs) => {
+    for (const tab of tabs) {
+      if (!tab.id || tab.discarded) continue;
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        args: [sid],
+        func: (id) => { globalThis.__FLOW_CHAT_SESSION__ = id; },
+      }).catch(() => {});
+    }
+  }).catch(() => {});
+}
+
+function reportChatSession(sid) {
+  if (!sid || !NETLOG_UUID.test(sid)) return;
+  const fresh = sid !== _stashedChatSession;
+  stashChatSession(sid);
+  if (!fresh && ws?.readyState !== WebSocket.OPEN) return;
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'chat_session',
+      session: sid,
+      profileId,
+      flowProjectId,
+    }));
+  }
+}
+
+function installPageChatHook() {
+  if (globalThis.__FLOW_CHAT_HOOK__) return globalThis.__FLOW_CHAT_SESSION__ || null;
+  globalThis.__FLOW_CHAT_HOOK__ = true;
+  const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const interesting = (url, text) => /GN0Bre|StreamChat|CreationAgent|FlowCreationAgent/i.test(
+    String(url || '') + ' ' + String(text || ''),
+  );
+  const bodyToText = (body) => {
+    if (body == null) return null;
+    if (typeof body === 'string') return body;
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return body.toString();
+    return null;
+  };
+  const pull = (url, body) => {
+    try {
+      const text = bodyToText(body);
+      if (!interesting(url, text) || !text) return;
+      let freq = null;
+      if (text.includes('f.req=')) freq = new URLSearchParams(text).get('f.req');
+      else if (text.trim().startsWith('[')) freq = text;
+      if (!freq) return;
+      const m = String(freq).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      if (!m) return;
+      globalThis.__FLOW_CHAT_SESSION__ = m[0];
+      try { globalThis.postMessage({ type: 'FLOW_CHAT_SESSION', session: m[0] }, '*'); } catch {}
+    } catch {}
+  };
+  const origFetch = globalThis.fetch;
+  if (typeof origFetch === 'function') {
+    globalThis.fetch = async function (...args) {
+      try {
+        const input = args[0];
+        const init = args[1] || {};
+        const url = typeof input === 'string' ? input : input?.url || '';
+        let body = init.body;
+        if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
+          try { body = await input.clone().text(); } catch { body = null; }
+        }
+        pull(url, body);
+      } catch {}
+      return origFetch.apply(this, args);
+    };
+  }
+  if (globalThis.XMLHttpRequest) {
+    const xo = XMLHttpRequest.prototype.open;
+    const xs = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      this.__flowChatUrl = url;
+      return xo.call(this, method, url, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function (body) {
+      try { pull(this.__flowChatUrl, body); } catch {}
+      return xs.call(this, body);
+    };
+  }
+  const fromBag = (bag, keyed) => {
+    try {
+      for (let i = 0; i < bag.length; i++) {
+        const k = bag.key(i) || '';
+        const v = (bag.getItem(k) || '').trim();
+        if (keyed && !/session|conversation|chat|thread|agent/i.test(k + v)) continue;
+        if (re.test(v)) return v;
+      }
+    } catch {}
+    return null;
+  };
+  const found = globalThis.__FLOW_CHAT_SESSION__
+    || fromBag(localStorage, true) || fromBag(sessionStorage, true);
+  if (typeof found === 'string' && re.test(found)) {
+    globalThis.__FLOW_CHAT_SESSION__ = found;
+  }
+  return globalThis.__FLOW_CHAT_SESSION__ || null;
+}
+
+async function probeChatSession() {
+  if (_stashedChatSession) reportChatSession(_stashedChatSession);
+  const tabs = await chrome.tabs.query({ url: flowUrls });
+  for (const tab of tabs) {
+    if (!tab.id || tab.discarded) continue;
+    try {
+      const [inj] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        func: installPageChatHook,
+      });
+      const sid = inj?.result;
+      if (typeof sid === 'string' && NETLOG_UUID.test(sid)) {
+        reportChatSession(sid);
+        return;
+      }
+    } catch {}
+  }
+}
+
+function postNetlog(rec) {
+  fetch('http://127.0.0.1:8100/api/ext/netlog', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...rec, profileId }),
+  }).catch(() => {});
+}
+
+chrome.webRequest.onBeforeRequest.addListener((d) => {
+  if (d.method && d.method !== 'POST') return;
+  if (NETLOG_SKIP.test(d.url || '')) return;
+  const body = netlogDecodeBody(d.requestBody);
+  const freq = netlogFreq(body);
+  const url = d.url || '';
+  const session = extractChatSession(url, freq);
+  if (session) reportChatSession(session);
+  if (netlogPending.size > 80) netlogPending.clear();
+  netlogPending.set(d.requestId, {
+    ts: new Date().toISOString(),
+    url,
+    rpcid: netlogRpcid(url),
+    session,
+    freq: freq ? String(freq).slice(0, NETLOG_FREQ_MAX) : null,
+  });
+}, { urls: NETLOG_HOSTS }, ['requestBody']);
+
+chrome.webRequest.onCompleted.addListener((d) => {
+  const rec = netlogPending.get(d.requestId);
+  if (!rec) return;
+  netlogPending.delete(d.requestId);
+  postNetlog({ ...rec, statusCode: d.statusCode });
+}, { urls: NETLOG_HOSTS });
+
+chrome.webRequest.onErrorOccurred.addListener((d) => {
+  netlogPending.delete(d.requestId);
+}, { urls: NETLOG_HOSTS });
 
 let _openingFlowTab = false;
 
@@ -214,15 +522,22 @@ function connectToAgent() {
     // Token refresh alarm — 45 min gives buffer before ~60 min expiry
     chrome.alarms.create('token-refresh', { periodInMinutes: 45 });
 
-    // Send current state + resend token if we have one
+    // Send current state + resend token if we have one.
+    // Extra fields are optional; keep this send synchronous so a cold MV3
+    // worker is ready before the first RPC.
     ws.send(JSON.stringify({
       type: 'extension_ready',
       flowKeyPresent: !!flowKey,
       tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+      profileId,
+      flowProjectId,
     }));
     if (flowKey) {
       ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
     }
+    if (_stashedChatSession) reportChatSession(_stashedChatSession);
+    void refreshFlowProject();
+    void probeChatSession();
   };
 
   ws.onmessage = async ({ data }) => {
@@ -237,6 +552,8 @@ function connectToAgent() {
         await handleTrpcRequest(msg);
       } else if (msg.method === 'solve_captcha') {
         await handleSolveCaptcha(msg);
+      } else if (msg.method === 'reload_flow_tab') {
+        await handleReloadFlowTab(msg);
       } else if (msg.method === 'get_status') {
         sendToAgent({
           id: msg.id,
@@ -246,6 +563,8 @@ function connectToAgent() {
             manualDisconnect,
             tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
             metrics,
+            profileId,
+            flowProjectId,
           },
         });
       } else if (msg.type === 'callback_secret') {
@@ -280,6 +599,8 @@ function scheduleReconnect() {
 function keepAlive() {
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'ping' }));
+    void refreshFlowProject();
+    void probeChatSession();
   } else {
     connectToAgent();
   }
@@ -306,13 +627,41 @@ function sendToAgent(msg) {
 
 // ─── reCAPTCHA Solving ──────────────────────────────────────
 
+const RECAPTCHA_SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
+let _recaptchaCode = null;
+
+async function loadRecaptchaCode() {
+  if (_recaptchaCode) return _recaptchaCode;
+  const loaderUrl = 'https://www.google.com/recaptcha/enterprise.js?render='
+    + encodeURIComponent(RECAPTCHA_SITE_KEY);
+  const loaderResp = await fetch(loaderUrl);
+  if (!loaderResp.ok) throw new Error(`recaptcha loader HTTP ${loaderResp.status}`);
+  const loader = await loaderResp.text();
+  const match = loader.match(/https:\/\/www\.gstatic\.com\/recaptcha\/releases\/[^'"\s]+\/recaptcha__\w+\.js/);
+  if (!match) throw new Error('recaptcha release url missing');
+  const codeResp = await fetch(match[0]);
+  if (!codeResp.ok) throw new Error(`recaptcha en HTTP ${codeResp.status}`);
+  _recaptchaCode = await codeResp.text();
+  return _recaptchaCode;
+}
+
 async function requestCaptchaFromTab(tabId, requestId, pageAction) {
+  let recaptchaCode = null;
+  let recaptchaError = null;
   try {
-    return await chrome.tabs.sendMessage(tabId, {
-      type: 'GET_CAPTCHA',
-      requestId,
-      pageAction,
-    });
+    recaptchaCode = await loadRecaptchaCode();
+  } catch (error) {
+    recaptchaError = error?.message || String(error);
+  }
+  const payload = {
+    type: 'GET_CAPTCHA',
+    requestId,
+    pageAction,
+    recaptchaCode,
+    recaptchaError,
+  };
+  try {
+    return await chrome.tabs.sendMessage(tabId, payload);
   } catch (error) {
     const msg = error?.message || '';
     const shouldInject =
@@ -326,11 +675,7 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
       files: ['content.js'],
     });
     await sleep(200);
-    return await chrome.tabs.sendMessage(tabId, {
-      type: 'GET_CAPTCHA',
-      requestId,
-      pageAction,
-    });
+    return await chrome.tabs.sendMessage(tabId, payload);
   }
 }
 
@@ -379,6 +724,8 @@ async function solveCaptcha(requestId, captchaAction) {
     const tab = await reviveTabIfNeeded(candidate);
     if (!tab) continue;
     try {
+      // execute() often never installs on a backgrounded Flow tab.
+      try { await chrome.tabs.update(tab.id, { active: true }); } catch {}
       const resp = await captchaFromTab(tab.id, requestId, captchaAction);
       if (!resp?.token) {
         errors.push(resp?.error || 'NO_TOKEN');
@@ -431,6 +778,31 @@ async function handleSolveCaptcha(msg) {
   sendToAgent({ id, result });
 }
 
+async function handleReloadFlowTab(msg) {
+  const { id } = msg;
+  try {
+    const tabs = await chrome.tabs.query({ url: flowUrls });
+    let reloadedCount = 0;
+    for (const tab of tabs) {
+      if (!tab.discarded) {
+        try {
+          await chrome.tabs.reload(tab.id);
+          reloadedCount++;
+        } catch (_) {}
+      }
+    }
+    if (reloadedCount === 0) {
+      await chrome.tabs.create({ url: FLOW_TAB_URL, active: false });
+      reloadedCount = 1;
+    }
+    // Give page 3.5 seconds to reload DOM, WIZ_global_data, and re-init grecaptcha
+    await sleep(3500);
+    sendToAgent({ id, result: { ok: true, reloaded: reloadedCount } });
+  } catch (err) {
+    sendToAgent({ id, result: { ok: false, error: err?.message || String(err) } });
+  }
+}
+
 // ─── Page-context RPC runner (the current path) ─────────────
 //
 // Flow's frontend signs its calls with cookies and a per-page `at` token, and
@@ -469,92 +841,45 @@ async function runBatchRpc(cmd) {
     freq = freq.split(CAPTCHA_SLOT).join(solved.token);
   }
 
-  const [injected] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: 'MAIN',
-    args: [cmd.rpcid, freq, MAX_RPC_TEXT, cmd.match || null, cmd.path || null],
-    func: async (rpcid, freqStr, maxText, match, customPath) => {
-      const wiz = globalThis.WIZ_global_data || {};
-      const at = wiz.SNlM0e;
-      const sid = wiz.FdrFJe;
-      const bl = wiz.cfb2h;
-      if (!at) return { error: 'NO_AT_TOKEN' };
-      if (freqStr.includes('__CHAT_SESSION__')) {
-        const reExact = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-        const fromBag = (bag, keyed) => {
-          try {
-            for (let i = 0; i < bag.length; i++) {
-              const k = bag.key(i) || '';
-              const v = (bag.getItem(k) || '').trim();
-              if (keyed && !/session|conversation|chat|thread|agent/i.test(k + v)) continue;
-              if (reExact.test(v)) return v;
-            }
-          } catch {}
-          return null;
-        };
-        const found = globalThis.__FLOW_CHAT_SESSION__
-          || fromBag(localStorage, true) || fromBag(sessionStorage, true)
-          || fromBag(localStorage, false) || fromBag(sessionStorage, false);
-        if (!found) return { error: 'NO_CHAT_SESSION' };
-        freqStr = freqStr.split('__CHAT_SESSION__').join(found);
-      }
-      const isStreamChat = !!(customPath && customPath.includes('StreamChat'));
-      const hl = isStreamChat ? 'en' : 'en-AU';
-      const reqid = Math.floor(Math.random() * 900000) + 100000;
-      const base = customPath
-        || (`/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=${encodeURIComponent(rpcid)}`);
-      const join = base.includes('?') ? '&' : '?';
-      const qs = isStreamChat
-        ? `bl=${encodeURIComponent(bl || '')}&f.sid=${encodeURIComponent(sid || '')}&hl=${hl}&_reqid=${reqid}&rt=c`
-        : `f.sid=${encodeURIComponent(sid || '')}&bl=${encodeURIComponent(bl || '')}&hl=${hl}&_reqid=${reqid}&rt=c`;
-      const url = `${base}${join}${qs}`;
-      const body = new URLSearchParams({ 'f.req': freqStr, at }).toString();
-      let status;
-      let text;
-      if (isStreamChat) {
-        const xhrResult = await new Promise((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.open('POST', url, true);
-          xhr.withCredentials = true;
-          xhr.setRequestHeader('content-type', 'application/x-www-form-urlencoded;charset=UTF-8');
-          xhr.setRequestHeader('x-same-domain', '1');
-          xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText || '' });
-          xhr.onerror = () => reject(new Error('XHR_FAILED'));
-          xhr.send(body);
-        });
-        status = xhrResult.status;
-        text = xhrResult.text;
-      } else {
-        const resp = await fetch(url, {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
-            'x-same-domain': '1',
-          },
-          body,
-        });
-        status = resp.status;
-        text = await resp.text();
-      }
-      // The project listing is tens of megabytes and all we ever want from it
-      // is one entry. Cutting it down here keeps that payload inside the tab
-      // instead of pushing it through the bridge on every poll.
-      if (match) {
-        const found = text.indexOf(match);   // not `at` — that is the CSRF token above
-        // Keep bytes before the needle too: r2v listing keys sit ahead of
-        // the prompt title, so a title match would otherwise miss mediaId.
-        const from = found === -1 ? 0 : Math.max(0, found - 700);
-        return {
-          status,
-          matched: found !== -1,
-          text: found === -1 ? '' : text.slice(from, found + 800),
-        };
-      }
-      return { status, text: text.slice(0, maxText) };
-    },
-  });
+  const args = [cmd.rpcid, freq, MAX_RPC_TEXT, cmd.match || null, cmd.path || null];
 
+  // Prefer the content-script bridge: Chrome 152 seeded unpacked copies often
+  // resolve executeScript with an empty result, which became NO_INJECTION_RESULT
+  // on every r2v bind. injected.js already sits in MAIN and owns WIZ / at.
+  try {
+    const viaContent = await chrome.tabs.sendMessage(tab.id, {
+      type: 'BATCH_RPC',
+      requestId: cmd.id,
+      rpcid: cmd.rpcid,
+      freq,
+      maxText: MAX_RPC_TEXT,
+      match: cmd.match || null,
+      path: cmd.path || null,
+    });
+    if (viaContent && (viaContent.text || viaContent.error || viaContent.status)) {
+      return viaContent;
+    }
+  } catch (_) {
+    // no content script on this tab — fall through to executeScript
+  }
+
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      args,
+      func: async (rpcid, freqStr, maxText, match, customPath) => {
+        if (typeof globalThis.__flowRunBatch === 'function') {
+          return globalThis.__flowRunBatch(rpcid, freqStr, maxText, match, customPath);
+        }
+        return { error: 'NO_BATCH_RUNNER' };
+      },
+    });
+  } catch (e) {
+    return { error: e?.message || 'INJECT_FAILED' };
+  }
+  const injected = (results || []).find((row) => row && row.result != null);
   return injected?.result || { error: 'NO_INJECTION_RESULT' };
 }
 
@@ -798,7 +1123,25 @@ function broadcastStatus() {
   chrome.runtime.sendMessage({ type: 'STATUS_PUSH' }).catch(() => {});
 }
 
+if (chrome.tabs?.onUpdated) {
+  chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+    if (changeInfo.status === 'complete') void probeChatSession();
+    if (!changeInfo.url && changeInfo.status !== 'complete') return;
+    const pid = flowProjectFromUrl(changeInfo.url || tab?.url);
+    if (!pid || pid === flowProjectId) return;
+    flowProjectId = pid;
+    chrome.storage.local.set({ flowProjectId });
+    sendProfileUpdate();
+  });
+}
+
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === 'FLOW_CHAT_SESSION') {
+    reportChatSession(msg.session);
+    reply({ ok: true });
+    return;
+  }
+
   if (msg.type === 'STATUS') {
     reply({
       connected: ws?.readyState === WebSocket.OPEN,
@@ -813,7 +1156,17 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
         lastError: metrics.lastError,
       },
       state,
+      profileId,
+      flowProjectId,
     });
+  }
+
+  if (msg.type === 'SET_PROFILE_ID') {
+    profileId = String(msg.profileId || '').trim() || null;
+    chrome.storage.local.set({ profileId });
+    sendProfileUpdate();
+    reply({ ok: true, profileId });
+    return true;
   }
 
   if (msg.type === 'DISCONNECT') {

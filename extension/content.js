@@ -9,10 +9,45 @@
   (document.head || document.documentElement).appendChild(s);
 })();
 
+window.addEventListener('message', (event) => {
+  if (event.source !== window) return;
+  const sid = event.data && event.data.session;
+  if (event.data && event.data.type === 'FLOW_CHAT_SESSION' && typeof sid === 'string') {
+    chrome.runtime.sendMessage({ type: 'FLOW_CHAT_SESSION', session: sid }).catch(() => {});
+  }
+});
+
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === 'BATCH_RPC') {
+    const requestId = msg.requestId || `batch-${Date.now()}`;
+    const handler = (event) => {
+      if (event.source !== window) return;
+      const data = event.data;
+      if (!data || data.type !== 'FLOW_BATCH_RPC_RESULT' || data.requestId !== requestId) return;
+      window.removeEventListener('message', handler);
+      clearTimeout(timer);
+      reply(data.result || { error: 'NO_BATCH_RESULT' });
+    };
+    const timer = setTimeout(() => {
+      window.removeEventListener('message', handler);
+      reply({ error: 'BATCH_TIMEOUT' });
+    }, 60000);
+    window.addEventListener('message', handler);
+    window.postMessage({
+      type: 'FLOW_BATCH_RPC',
+      requestId,
+      rpcid: msg.rpcid,
+      freq: msg.freq,
+      maxText: msg.maxText,
+      match: msg.match || null,
+      path: msg.path || null,
+    }, '*');
+    return true;
+  }
+
   if (msg.type !== 'GET_CAPTCHA') return;
 
-  const { requestId, pageAction } = msg;
+  const { requestId, pageAction, recaptchaCode, recaptchaError } = msg;
 
   const handler = (e) => {
     if (e.detail?.requestId === requestId) {
@@ -30,7 +65,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   window.addEventListener('CAPTCHA_RESULT', handler);
 
   window.dispatchEvent(new CustomEvent('GET_CAPTCHA', {
-    detail: { requestId, pageAction },
+    detail: { requestId, pageAction, recaptchaCode, recaptchaError },
   }));
 
   return true; // keep channel open for async reply

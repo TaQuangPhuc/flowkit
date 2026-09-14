@@ -15,23 +15,38 @@ Both shape their answers the same way, so everything downstream — the worker's
 parsers, the operation poller, the scene/character updaters — is transport-blind.
 """
 import asyncio
+import contextvars
 import json
 import logging
+import os
 import time
 import uuid
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from agent.config import (
+    BASE_DIR,
     GOOGLE_FLOW_API, GOOGLE_API_KEY, ENDPOINTS,
     VIDEO_MODELS, UPSCALE_MODELS, IMAGE_MODELS, VIDEO_POLL_TIMEOUT,
     USE_BATCH_RPC, FLOW_PROJECT_ID, FLOW_ALLOW_DEGRADED,
-    DEFAULT_PAYGATE_TIER,
+    DEFAULT_PAYGATE_TIER, PROFILE_MAX_CONCURRENT,
 )
 from agent import config as _config
 from agent.services import flow_batch as fb
 from agent.services.headers import random_headers
 
 logger = logging.getLogger(__name__)
+
+_R2V_OPS_PATH = BASE_DIR / ".scratch" / "r2v_ops.json"
+_GETSESSION_DUMP = BASE_DIR / ".scratch" / "getsession-last.txt"
+_LISTING_DUMP = BASE_DIR / ".scratch" / "listing-last.txt"
+_R2V_AS29S_CAP = 12
+
+# Which Chrome nick the current RPC is running on. `_send` reads this so a
+# high-level call can pin (or fail over) without every envelope builder
+# knowing about WebSockets.
+_current_route: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "flow_route", default=None,
+)
 
 
 class FlowClient:
@@ -50,14 +65,55 @@ class FlowClient:
         self._operation_projects: dict[str, str] = {}
         self._operation_media: dict[str, str] = {}
         self._operation_polls: dict[str, int] = {}
+        # Which nick created an operation / media id. Poll, get_media, and
+        # i2v-after-upload must stay on that Chrome — Flow projects do not
+        # exist on another Google account.
+        self._operation_profiles: dict[str, str] = {}
+        self._media_profiles: dict[str, str] = {}
+        # r2v StreamChat: the submit uuid is often a chat-message id, not the
+        # listing key. Poll then asks GetSession (GN0Bre) on this conversation.
+        self._operation_chat_sessions: dict[str, str] = {}
+        self._operation_ref_ids: dict[str, tuple[str, ...]] = {}
         # WS stats
         self._ws_connect_count = 0
         self._ws_disconnect_count = 0
         self._ws_connected_at: Optional[float] = None
         self._ws_last_disconnect_at: Optional[float] = None
         # Creation-agent conversation id from GN0Bre. StreamChat must reuse it;
-        # a minted uuid comes back PUBLIC_ERROR_UNUSUAL_ACTIVITY.
+        # a minted uuid comes back PUBLIC_ERROR_UNUSUAL_ACTIVITY. Global is the
+        # single-nick fallback; live r2v reads the per-WS copy.
         self._chat_session_id: Optional[str] = None
+        self._profile_chat_sessions: dict[str, str] = {}
+        self._chat_bind_inflight: set[str] = set()
+        from agent.services.accounts import load_nick_pins
+        self._configured_profiles: list[dict] = load_nick_pins()
+        self._profile_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._last_route: Optional[dict] = None
+        self._load_r2v_ops()
+
+    def reload_configured_profiles(self) -> None:
+        from agent.services.accounts import load_nick_pins
+        self._configured_profiles = load_nick_pins()
+        for ws, session in list(self._extensions.items()):
+            if not session.get("chat_session_id"):
+                pid = self._session_project(session)
+                if pid and self._UUID_RE.match(str(pid)):
+                    session["project_id"] = pid
+                    asyncio.create_task(self._ensure_chat_session(ws))
+
+    async def bind_chat_session(self, profile_id: str) -> dict:
+        """Trigger chat session binding for a connected profile."""
+        for ws, session in list(self._extensions.items()):
+            sid = session.get("profile_id")
+            if sid and str(sid).strip().lower() == str(profile_id).strip().lower():
+                pid = self._session_project(session)
+                if pid and self._UUID_RE.match(str(pid)):
+                    session["project_id"] = pid
+                    await self._ensure_chat_session(ws)
+                    chat_id = session.get("chat_session_id")
+                    return {"ok": bool(chat_id), "session": chat_id, "profile_id": sid}
+                return {"ok": False, "error": f"no Flow project UUID for profile {sid}"}
+        return {"ok": False, "error": f"profile {profile_id} is not connected"}
 
     def set_extension(self, ws):
         """Called when extension connects via WS."""
@@ -66,6 +122,10 @@ class FlowClient:
             "flow_key": None,
             "token_captured_at": None,
             "unavailable_until": 0,
+            "profile_id": None,
+            "project_id": None,
+            "chat_session_id": None,
+            "in_flight": 0,
         }
         # A new unauthenticated profile must not displace an already
         # authenticated extension. It becomes active after token_captured.
@@ -116,16 +176,34 @@ class FlowClient:
             len(self._extensions),
         )
 
-    def remember_chat_session(self, session_id: str) -> None:
+    def remember_chat_session(
+        self,
+        session_id: str,
+        profile_id: str | None = None,
+        ws=None,
+    ) -> None:
         """Pin the Flow creation-agent conversation StreamChat has to reuse."""
         sid = (session_id or "").strip()
-        if not sid or sid == self._chat_session_id:
+        if not sid:
             return
-        self._chat_session_id = sid
-        logger.info("Flow chat session %s", sid)
+        if sid != self._chat_session_id:
+            self._chat_session_id = sid
+            logger.info("Flow chat session %s", sid)
+        if ws is not None and ws in self._extensions:
+            self._extensions[ws]["chat_session_id"] = sid
+        if profile_id:
+            if self._profile_chat_sessions.get(profile_id) != sid:
+                self._profile_chat_sessions[profile_id] = sid
+                logger.info("Flow chat session %s on profile %s", sid, profile_id)
+            for session in self._extensions.values():
+                if session.get("profile_id") == profile_id:
+                    session["chat_session_id"] = sid
+            return
+        if len(self._extensions) == 1:
+            next(iter(self._extensions.values()))["chat_session_id"] = sid
 
     def _extension_candidates(self, require_token: bool):
-        """Return usable extensions in preferred routing order."""
+        """Return usable extensions, least-busy first."""
         now = time.time()
         candidates = []
         for ws, session in self._extensions.items():
@@ -139,20 +217,20 @@ class FlowClient:
             candidates.append({
                 "ws": ws,
                 "available": session.get("unavailable_until", 0) <= now,
-                "active": ws is self._extension_ws,
+                "in_flight": int(session.get("in_flight") or 0),
                 "recency": recency or 0,
             })
 
-        # Prefer an available active session, then the most recently
-        # authenticated alternatives. Temporarily unavailable sessions remain
-        # last-resort candidates so a single-profile setup can still recover.
+        # Available nicks first, then the fewest in-flight RPCs. Temporarily
+        # unavailable sessions stay last-resort so a single-profile setup can
+        # still recover. Do not prefer "the active socket" — that serialized
+        # every job onto one Chrome.
         candidates.sort(
             key=lambda item: (
-                item["available"],
-                item["active"] and item["available"],
-                item["recency"],
+                not item["available"],
+                item["in_flight"],
+                -item["recency"],
             ),
-            reverse=True,
         )
         return [item["ws"] for item in candidates]
 
@@ -161,6 +239,480 @@ class FlowClient:
         candidates = self._extension_candidates(require_token)
         return candidates[0] if candidates else None
 
+    def _profile_sema(self, key: str) -> asyncio.Semaphore:
+        cap = max(1, int(PROFILE_MAX_CONCURRENT or 1))
+        if key not in self._profile_semaphores:
+            self._profile_semaphores[key] = asyncio.Semaphore(cap)
+        return self._profile_semaphores[key]
+
+    def _configured_project(self, profile_id: str | None) -> str | None:
+        if not profile_id:
+            return None
+        for row in self._configured_profiles:
+            if row.get("id") == profile_id:
+                pid = (row.get("project_id") or "").strip()
+                return pid or None
+        return None
+
+    def _session_project(self, session: dict) -> str | None:
+        return session.get("project_id") or self._configured_project(session.get("profile_id"))
+
+    def _learn_project(self, profile_id: str | None, project_id: str | None) -> None:
+        if not profile_id or not project_id or not self._UUID_RE.match(str(project_id)):
+            return
+        for row in self._configured_profiles:
+            if row.get("id") == profile_id and not row.get("project_id"):
+                row["project_id"] = project_id
+                return
+
+    def _apply_profile_message(self, ws, data: dict) -> None:
+        if ws is None or ws not in self._extensions:
+            return
+        session = self._extensions[ws]
+        profile_id = (data.get("profileId") or "").strip() or None
+        flow_project = (data.get("flowProjectId") or "").strip() or None
+        if profile_id:
+            session["profile_id"] = profile_id
+            cached = self._profile_chat_sessions.get(profile_id)
+            if cached and not session.get("chat_session_id"):
+                session["chat_session_id"] = cached
+            configured = self._configured_project(profile_id)
+            if configured and not session.get("project_id"):
+                session["project_id"] = configured
+        if flow_project and self._UUID_RE.match(flow_project):
+            session["project_id"] = flow_project
+            self._learn_project(session.get("profile_id"), flow_project)
+
+    def _resolve_pin(
+        self,
+        project_id: str | None = None,
+        profile_id: str | None = None,
+        media_ids: list[str] | None = None,
+        operation_id: str | None = None,
+    ) -> str | None:
+        """Which nick this call is stuck to, if any."""
+        if profile_id:
+            return profile_id
+        if operation_id:
+            pinned = self._operation_profiles.get(operation_id)
+            if pinned:
+                return pinned
+        for mid in media_ids or []:
+            pinned = self._media_profiles.get(mid)
+            if pinned:
+                return pinned
+        req = str(project_id or "").strip()
+        if req and self._UUID_RE.match(req):
+            for session in self._extensions.values():
+                if self._session_project(session) == req:
+                    return session.get("profile_id")
+            for row in self._configured_profiles:
+                if row.get("project_id") == req:
+                    return row.get("id")
+        return None
+
+    def _profile_candidates(
+        self,
+        *,
+        project_id: str | None = None,
+        profile_id: str | None = None,
+        media_ids: list[str] | None = None,
+        operation_id: str | None = None,
+        require_token: bool | None = None,
+    ) -> tuple[str | None, list[dict]]:
+        """Ordered nick routes. Pin is (profile_id or None, routes)."""
+        if require_token is None:
+            require_token = not USE_BATCH_RPC
+        pin = self._resolve_pin(
+            project_id=project_id,
+            profile_id=profile_id,
+            media_ids=media_ids,
+            operation_id=operation_id,
+        )
+        now = time.time()
+        routes = []
+        for ws, session in self._extensions.items():
+            if require_token and not session.get("flow_key"):
+                continue
+            sid = session.get("profile_id")
+            if pin and ws is not pin:
+                if not sid or str(sid).strip().lower() != str(pin).strip().lower():
+                    continue
+            recency = session.get("token_captured_at") or session.get("connected_at") or 0
+            routes.append({
+                "ws": ws,
+                "profile_id": sid,
+                "project_id": self._session_project(session),
+                "pinned": bool(pin),
+                "available": session.get("unavailable_until", 0) <= now,
+                "in_flight": int(session.get("in_flight") or 0),
+                "recency": recency,
+            })
+        routes.sort(
+            key=lambda item: (
+                not item["available"],
+                not bool(item["profile_id"]),
+                not bool(item["project_id"]),
+                item["in_flight"],
+                -item["recency"],
+            ),
+        )
+        return pin, routes
+
+    def _select_profile(
+        self,
+        *,
+        project_id: str | None = None,
+        profile_id: str | None = None,
+        media_ids: list[str] | None = None,
+        operation_id: str | None = None,
+    ) -> dict | None:
+        _pin, routes = self._profile_candidates(
+            project_id=project_id,
+            profile_id=profile_id,
+            media_ids=media_ids,
+            operation_id=operation_id,
+        )
+        return routes[0] if routes else None
+
+    def _route_project_id(self, requested: str, route: dict) -> str:
+        nick_pid = route.get("project_id") or ""
+        if route.get("pinned"):
+            return nick_pid or self._batch_project_id(requested or "")
+        if nick_pid:
+            return nick_pid
+        return self._batch_project_id(requested or "")
+
+    def _chat_session_for_route(self) -> str:
+        route = _current_route.get()
+        if route:
+            ws = route.get("ws")
+            if ws is not None:
+                sid = (self._extensions.get(ws) or {}).get("chat_session_id")
+                if sid:
+                    return sid
+            pid = route.get("profile_id")
+            if pid and self._profile_chat_sessions.get(pid):
+                return self._profile_chat_sessions[pid]
+        return self._chat_session_id or fb.CHAT_SESSION_SLOT
+
+    async def _mint_chat_session(self, project_id: str) -> str:
+        """CreateSession for this r2v. Do not reuse a poisoned conversation.
+
+        A session that already ran ``ask_for_permission`` and was ignored
+        stays stuck on Omni Flash even after video_defaults is pinned.
+        """
+        client_id = fb._client_uuid()
+        created = await self._batch_payload(
+            fb.RPC_CREATE_SESSION,
+            fb.create_session_request(project_id, client_id),
+            timeout=45,
+        )
+        ids = fb.read_session_ids(created, exclude={project_id, client_id})
+        sid = ids[0] if ids else None
+        if not sid:
+            raise fb.FlowBatchError("CreateSession returned no conversation id")
+        route = _current_route.get() or {}
+        self.remember_chat_session(sid, profile_id=route.get("profile_id"))
+        return sid
+
+    def workers(self) -> list[dict]:
+        now = time.time()
+        out = []
+        for session in self._extensions.values():
+            out.append({
+                "profile_id": session.get("profile_id"),
+                "project_id": self._session_project(session),
+                "available": session.get("unavailable_until", 0) <= now,
+                "in_flight": int(session.get("in_flight") or 0),
+                "chat_session": bool(session.get("chat_session_id")),
+                "flow_key_present": bool(session.get("flow_key")),
+            })
+        return out
+
+    async def _run_on_profile(
+        self,
+        builder: Callable[[str], Awaitable[dict]],
+        requested_project: str = "",
+        *,
+        profile_id: str | None = None,
+        media_ids: list[str] | None = None,
+        operation_id: str | None = None,
+        allow_failover: bool = True,
+    ) -> dict:
+        """Run ``builder(flow_project_id)`` on one nick.
+
+        Unpinned work picks the least-busy Chrome and rewrites the RPC onto
+        that nick's Flow project. Pinned work (matching project, existing
+        operation, or media created on a nick) stays there — another account
+        cannot see that project. Failover across nicks is unpinned-only and
+        rebuilds the envelope with the next nick's project id.
+        """
+        pin, candidates = self._profile_candidates(
+            project_id=requested_project,
+            profile_id=profile_id,
+            media_ids=media_ids,
+            operation_id=operation_id,
+        )
+        self._last_route = None
+        if not candidates:
+            if pin:
+                return {"error": f"NO_FLOW_TAB: profile {pin} is not connected"}
+            if self._extensions:
+                return {"error": "Extension not connected"}
+            # Unit tests mock batch_rpc with no sockets. get_media / poll do
+            # not always have a project; generate calls still need one.
+            if requested_project or FLOW_PROJECT_ID:
+                pid = self._batch_project_id(requested_project or "")
+            else:
+                pid = ""
+            return await builder(pid)
+
+        last: dict = {"error": "Extension not connected"}
+        for index, route in enumerate(candidates):
+            pid = self._route_project_id(requested_project, route)
+            token = _current_route.set(route)
+            self._last_route = {
+                "profile_id": route.get("profile_id"),
+                "project_id": pid,
+                "pinned": bool(route.get("pinned")),
+            }
+            session = self._extensions.get(route["ws"])
+            sema_key = str(route.get("profile_id") or id(route["ws"]))
+            prof_id = route.get("profile_id") or "nick-a"
+
+            # Telemetry & burst tracker
+            from agent.services.unusual_audit import get_unusual_audit
+            audit_mgr = get_unusual_audit()
+            burst_metrics = audit_mgr.record_request_dispatched(prof_id)
+            t_start = time.time()
+
+            try:
+                async with self._profile_sema(sema_key):
+                    if session is not None:
+                        session["in_flight"] = int(session.get("in_flight") or 0) + 1
+                    try:
+                        last = await builder(pid)
+                    except Exception as e:
+                        last = _batch_error(e)
+                    finally:
+                        if session is not None:
+                            session["in_flight"] = max(
+                                0, int(session.get("in_flight") or 1) - 1,
+                            )
+            finally:
+                _current_route.reset(token)
+
+            duration_ms = int((time.time() - t_start) * 1000)
+
+            if isinstance(last, dict):
+                raw_err = str(last.get("error") or last.get("data") or "")
+                
+                # Check for successful RPC
+                if not last.get("error") and (
+                    not isinstance(last.get("status"), int) or last["status"] < 400
+                ):
+                    from agent.services.accounts import get_account
+                    acc = get_account(prof_id)
+                    p_url = acc.get("proxy_url", "") if acc else ""
+                    audit_mgr.record_request_success(prof_id, p_url)
+
+                elif "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in raw_err:
+                    # Identify RPC ID
+                    rpc_id = "unknown"
+                    for known_rpc in ["agJzFb", "ogiZ0b", "eb1hJf", "YhhmEf", "k42Yye", "o30O0e", "pDU0ue"]:
+                        if known_rpc in raw_err:
+                            rpc_id = known_rpc
+                            break
+
+                    logger.warning(
+                        "UNUSUAL_ACTIVITY detected on %s (RPC %s)! Synchronously rotating proxy...",
+                        prof_id, rpc_id,
+                    )
+
+                    rotation_info = {
+                        "rotation_triggered": False,
+                        "retry_attempted": False,
+                        "retry_success": False,
+                    }
+
+                    try:
+                        try:
+                            from agent.services.proxy_checker import quarantine_proxy
+                            from agent.services.accounts import get_account
+                            acc = get_account(prof_id)
+                            if acc and acc.get("proxy_url"):
+                                quarantine_proxy(acc["proxy_url"], reason="PUBLIC_ERROR_UNUSUAL_ACTIVITY", cooldown_seconds=900)
+                        except Exception as q_err:
+                            logger.warning("Could not quarantine proxy for %s: %s", prof_id, q_err)
+
+                        from agent.services.proxy_pool import rotate_nick_proxy
+                        rot_res = await rotate_nick_proxy(prof_id, preflight=True)
+                        rotation_info["rotation_triggered"] = True
+                        rotation_info["new_proxy"] = rot_res.get("proxy")
+                        if rot_res.get("proxy"):
+                            p_clean = rot_res["proxy"].split("@")[-1]
+                            rotation_info["new_proxy_ip"] = p_clean.split(":")[0] if ":" in p_clean else p_clean
+
+                        last["proxy_rotated"] = True
+                        last["new_proxy"] = rot_res.get("proxy")
+                        last["retryable"] = True
+                        last["message"] = (
+                            f"UNUSUAL_ACTIVITY: Proxy đã được đổi thành công sang IP mới ({rot_res.get('proxy')}). "
+                            "Vui lòng retry lại ngay."
+                        )
+
+                        # Attempt one immediate retry with the new proxy
+                        if not getattr(self, "_in_retry", False):
+                            self._in_retry = True
+                            try:
+                                logger.info(
+                                    "Auto-retrying request for %s on new proxy %s...",
+                                    prof_id, rot_res.get("proxy"),
+                                )
+                                # Reload Flow tab in Chrome so reCAPTCHA Enterprise and session tokens
+                                # are re-evaluated cleanly on the new proxy IP.
+                                token_route = _current_route.set(route)
+                                try:
+                                    logger.info("Requesting Chrome extension to reload Flow tab for %s...", prof_id)
+                                    reload_res = await self._send("reload_flow_tab", {}, timeout=20)
+                                    logger.info("Reload Flow tab response for %s: %s", prof_id, reload_res)
+                                    rotation_info["flow_tab_reloaded"] = bool(
+                                        reload_res and reload_res.get("result", {}).get("ok")
+                                    )
+                                except Exception as rel_err:
+                                    logger.warning("Could not reload Flow tab on %s: %s", prof_id, rel_err)
+                                    rotation_info["flow_tab_reloaded"] = False
+                                    rotation_info["flow_tab_reload_error"] = str(rel_err)
+                                finally:
+                                    _current_route.reset(token_route)
+
+                                # Settle delay after page reload for reCAPTCHA Enterprise stub
+                                await asyncio.sleep(1.5)
+
+                                # Pre-flight test: verify 1 live reCAPTCHA Enterprise token can be minted on the new proxy
+                                token_probe = _current_route.set(route)
+                                try:
+                                    logger.info("Pre-flight testing reCAPTCHA Enterprise token on new proxy for %s...", prof_id)
+                                    probe_res = await self._send("solve_captcha", {"captchaAction": "FLOW_PROBE"}, timeout=15)
+                                    probe_data = probe_res.get("result") or probe_res or {}
+                                    if probe_data.get("token"):
+                                        logger.info("✅ reCAPTCHA Enterprise test probe PASSED on %s (len: %d)!", prof_id, len(probe_data["token"]))
+                                        rotation_info["recaptcha_token_verified"] = True
+                                    else:
+                                        logger.warning("⚠️ reCAPTCHA Enterprise test probe failed on %s: %s", prof_id, probe_data.get("error"))
+                                        rotation_info["recaptcha_token_verified"] = False
+                                except Exception as probe_err:
+                                    logger.warning("reCAPTCHA test probe error on %s: %s", prof_id, probe_err)
+                                    rotation_info["recaptcha_token_verified"] = False
+                                finally:
+                                    _current_route.reset(token_probe)
+
+                                token_retry = _current_route.set(route)
+                                try:
+                                    try:
+                                        retry_last = await builder(pid)
+                                    except Exception as e:
+                                        retry_last = _batch_error(e)
+
+                                    rotation_info["retry_attempted"] = True
+                                    if not retry_last.get("error") and (
+                                        not isinstance(retry_last.get("status"), int)
+                                        or retry_last["status"] < 400
+                                    ):
+                                        logger.info("Auto-retry on new proxy SUCCEEDED for %s!", prof_id)
+                                        rotation_info["retry_success"] = True
+                                        audit_mgr.record_unusual_event(
+                                            worker_id=prof_id,
+                                            rpc_id=rpc_id,
+                                            raw_error=raw_err,
+                                            burst_metrics=burst_metrics,
+                                            call_duration_ms=duration_ms,
+                                            payload_summary={"project_id": pid},
+                                            rotation_info=rotation_info,
+                                        )
+                                        audit_mgr.record_request_success(prof_id, rot_res.get("proxy_url", ""))
+                                        return retry_last
+
+                                    rotation_info["retry_success"] = False
+                                    rotation_info["retry_error"] = str(retry_last.get("error") or "")[:200]
+                                    last = retry_last
+                                    last["proxy_rotated"] = True
+                                    last["new_proxy"] = rot_res.get("proxy")
+                                    last["retryable"] = True
+                                    last["message"] = (
+                                        f"UNUSUAL_ACTIVITY: Proxy đã được đổi thành công sang IP mới ({rot_res.get('proxy')}). "
+                                        "Vui lòng retry lại ngay."
+                                    )
+                                finally:
+                                    _current_route.reset(token_retry)
+                            finally:
+                                self._in_retry = False
+                    except Exception as rot_exc:
+                        logger.error("Auto-rotation failed for %s: %s", prof_id, rot_exc)
+                        rotation_info["rotation_error"] = str(rot_exc)
+
+                    # Persist full audit record
+                    audit_mgr.record_unusual_event(
+                        worker_id=prof_id,
+                        rpc_id=rpc_id,
+                        raw_error=raw_err,
+                        burst_metrics=burst_metrics,
+                        call_duration_ms=duration_ms,
+                        payload_summary={"project_id": pid},
+                        rotation_info=rotation_info,
+                    )
+
+                elif ("failed: [13]" in raw_err or "ogiz0b failed: [13]" in raw_err.lower()) and not getattr(self, "_in_retry_13", False):
+                    prof_id = route.get("profile_id") or "worker"
+                    self._in_retry_13 = True
+                    try:
+                        logger.warning(
+                            "Transient Google RPC [13] on %s! Backing off 2.5s and auto-retrying...",
+                            prof_id,
+                        )
+                        await asyncio.sleep(2.5)
+                        token_retry = _current_route.set(route)
+                        try:
+                            try:
+                                retry_last = await builder(pid)
+                            except Exception as e:
+                                retry_last = _batch_error(e)
+                            if not retry_last.get("error") and (
+                                not isinstance(retry_last.get("status"), int)
+                                or retry_last["status"] < 400
+                            ):
+                                logger.info("Auto-retry on RPC [13] SUCCEEDED for %s!", prof_id)
+                                return retry_last
+                            last = retry_last
+                        finally:
+                            _current_route.reset(token_retry)
+                    except Exception as r13_exc:
+                        logger.error("Auto-retry on RPC [13] failed for %s: %s", prof_id, r13_exc)
+                    finally:
+                        self._in_retry_13 = False
+
+
+            has_alternative = index + 1 < len(candidates)
+            if (
+                isinstance(last, dict)
+                and self._should_failover(last)
+                and allow_failover
+                and not route.get("pinned")
+                and has_alternative
+            ):
+                if route["ws"] in self._extensions:
+                    self._extensions[route["ws"]]["unavailable_until"] = (
+                        time.time() + 60
+                    )
+                logger.warning(
+                    "Profile %s unavailable; retrying through another nick",
+                    route.get("profile_id") or "anonymous",
+                )
+                continue
+            return last
+        return last
+
     @staticmethod
     def _should_failover(result: dict) -> bool:
         """Return true for profile-local failures that another tab can solve."""
@@ -168,6 +720,7 @@ class FlowClient:
         return any(marker in message for marker in (
             "no_flow_key",
             "no_flow_tab",
+            "no_flow_project",
             # Batch path: this profile's Flow tab cannot sign a request — it is
             # signed out, still booting, or Chrome discarded it. Another
             # profile's tab may be perfectly able to.
@@ -179,6 +732,7 @@ class FlowClient:
             "extension_switched",
             "public_error_per_model_daily_quota_reached",
             "public_error_user_quota_reached",
+            "failed: [13]",
         ))
 
     def set_flow_key(self, key: str):
@@ -206,6 +760,7 @@ class FlowClient:
             "connects": self._ws_connect_count,
             "disconnects": self._ws_disconnect_count,
             "uptime_s": uptime,
+            "workers": self.workers(),
         }
 
     async def handle_message(self, data: dict, websocket=None):
@@ -217,14 +772,44 @@ class FlowClient:
                 self._extensions[source_ws]["flow_key"] = key
                 self._extensions[source_ws]["token_captured_at"] = time.time()
                 self._extension_ws = source_ws
+                self._apply_profile_message(source_ws, data)
             self._flow_key = key
             logger.info("Flow key captured from extension")
             asyncio.create_task(self._sync_tier())
             return
 
-        if data.get("type") == "extension_ready":
-            logger.info("Extension ready, flowKey=%s", "yes" if data.get("flowKeyPresent") else "no")
-            asyncio.create_task(self._sync_tier())
+        if data.get("type") in ("extension_ready", "profile_update"):
+            source_ws = websocket or self._extension_ws
+            self._apply_profile_message(source_ws, data)
+            session = self._extensions.get(source_ws) or {}
+            logger.info(
+                "Extension %s profile=%s project=%s flowKey=%s",
+                data.get("type"),
+                session.get("profile_id"),
+                session.get("project_id"),
+                "yes" if data.get("flowKeyPresent") or session.get("flow_key") else "no",
+            )
+            if data.get("type") == "extension_ready":
+                asyncio.create_task(self._sync_tier())
+            if not session.get("chat_session_id"):
+                pid = self._session_project(session)
+                if pid and self._UUID_RE.match(str(pid)):
+                    self._chat_bind_task = asyncio.create_task(
+                        self._ensure_chat_session(source_ws)
+                    )
+            return
+
+        if data.get("type") == "chat_session":
+            source_ws = websocket or self._extension_ws
+            sid = (data.get("session") or "").strip()
+            self._apply_profile_message(source_ws, data)
+            session = self._extensions.get(source_ws) or {}
+            profile_id = session.get("profile_id") or (data.get("profileId") or "").strip() or None
+            self.remember_chat_session(sid, profile_id=profile_id, ws=source_ws)
+            logger.info(
+                "chat_session %s profile=%s",
+                sid, profile_id,
+            )
             return
 
         if data.get("type") == "media_urls_refresh":
@@ -247,6 +832,93 @@ class FlowClient:
             if not self._pending[req_id].done():
                 self._pending[req_id].set_result(data)
             return
+
+    _CHAT_BIND_RETRY = ("NO_INJECTION_RESULT", "NO_FLOW_TAB", "FLOW_TAB_DISCARDED", "Timeout")
+
+    async def _ensure_chat_session(self, ws) -> None:
+        """Mint or reuse a creation-agent conversation on this nick.
+
+        Opening Ingredients in the Flow UI only lists sessions (``mrlkwd``);
+        the conversation StreamChat needs is created by ``csbIsb`` and lives
+        in that *response*. Bind it here so /nicks r2v goes green without a
+        human clicking Ingredients or relaying a uuid.
+        """
+        if not USE_BATCH_RPC:
+            return
+        session = self._extensions.get(ws) or {}
+        if session.get("chat_session_id"):
+            return
+        profile_id = session.get("profile_id")
+        project_id = self._session_project(session) or FLOW_PROJECT_ID
+        if not project_id or not self._UUID_RE.match(str(project_id)):
+            logger.info("chat session auto-bind deferred: no valid project_id yet for profile=%s", profile_id)
+            return
+        session["project_id"] = str(project_id)
+        guard = str(profile_id or id(ws))
+        if guard in self._chat_bind_inflight:
+            return
+        self._chat_bind_inflight.add(guard)
+
+        async def run(pid: str):
+            listed = await self._batch_payload(
+                fb.RPC_LIST_SESSIONS, fb.list_sessions_request(pid), timeout=45)
+            logger.info("ListSessions profile=%s payload=%r", profile_id, listed)
+            ids = fb.read_session_ids(listed, exclude={pid})
+            sid = ids[0] if ids else None
+            if not sid:
+                client_id = fb._client_uuid()
+                created = await self._batch_payload(
+                    fb.RPC_CREATE_SESSION,
+                    fb.create_session_request(pid, client_id),
+                    timeout=45,
+                )
+                logger.info("CreateSession profile=%s payload=%r", profile_id, created)
+                ids = fb.read_session_ids(created, exclude={pid, client_id})
+                sid = ids[0] if ids else None
+            if not sid:
+                raise fb.FlowBatchError(
+                    "no chat session uuid in ListSessions/CreateSession"
+                )
+            self.remember_chat_session(sid, profile_id=profile_id, ws=ws)
+            return {"ok": True, "session": sid}
+
+        last_error = None
+        try:
+            for attempt, wait in enumerate((0, 1.5, 3.0, 5.0, 8.0)):
+                if wait:
+                    await asyncio.sleep(wait)
+                if ws not in self._extensions:
+                    return
+                if (self._extensions.get(ws) or {}).get("chat_session_id"):
+                    return
+                try:
+                    result = await self._run_on_profile(
+                        run, str(project_id),
+                        profile_id=profile_id, allow_failover=False,
+                    )
+                except Exception as exc:
+                    result = {"error": str(exc)}
+                if isinstance(result, dict) and result.get("ok"):
+                    return
+                last_error = (result or {}).get("error") if isinstance(result, dict) else result
+                transient = any(
+                    token in str(last_error or "") for token in self._CHAT_BIND_RETRY
+                )
+                logger.warning(
+                    "chat session auto-bind attempt %s profile=%s: %s",
+                    attempt + 1, profile_id, last_error,
+                )
+                if not transient:
+                    break
+        except Exception:
+            logger.exception("chat session auto-bind failed profile=%s", profile_id)
+        finally:
+            self._chat_bind_inflight.discard(guard)
+        if last_error:
+            logger.warning(
+                "chat session auto-bind failed profile=%s: %s",
+                profile_id, last_error,
+            )
 
     async def _sync_tier(self):
         """Detect current tier from credits API and update all active projects."""
@@ -412,7 +1084,11 @@ class FlowClient:
         # session cookie, so demanding a flow key there would reject every
         # profile — no profile on that path ever captures one.
         needs_token = not USE_BATCH_RPC
-        extension_candidates = self._extension_candidates(require_token=needs_token)
+        routed = _current_route.get()
+        if routed and routed.get("ws"):
+            extension_candidates = [routed["ws"]]
+        else:
+            extension_candidates = self._extension_candidates(require_token=needs_token)
         if not extension_candidates and needs_token:
             return {"error": "NO_FLOW_KEY"}
         if not extension_candidates:
@@ -567,7 +1243,82 @@ class FlowClient:
             self._operation_projects.clear()
             self._operation_media.clear()
             self._operation_polls.clear()
+            self._operation_profiles.clear()
+            self._operation_chat_sessions.clear()
+            self._operation_ref_ids.clear()
         self._operation_projects[operation_id] = project_id
+        route = _current_route.get()
+        if route and route.get("profile_id"):
+            self._operation_profiles[operation_id] = route["profile_id"]
+        self._save_r2v_ops()
+
+    def _remember_media(self, media_id: str, profile_id: str | None = None) -> None:
+        """Which nick uploaded or generated this media id."""
+        if not media_id:
+            return
+        if len(self._media_profiles) > 1024:
+            self._media_profiles.clear()
+        pid = profile_id
+        if not pid:
+            route = _current_route.get()
+            if route:
+                pid = route.get("profile_id")
+        if pid:
+            self._media_profiles[media_id] = pid
+
+    def _load_r2v_ops(self) -> None:
+        """Restore r2v poll handles so an agent restart can still GetSession."""
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        try:
+            raw = json.loads(_R2V_OPS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(raw, dict):
+            return
+        for op_id, row in raw.items():
+            if not isinstance(op_id, str) or not isinstance(row, dict):
+                continue
+            session = row.get("session")
+            project = row.get("project")
+            if session:
+                self._operation_chat_sessions[op_id] = session
+            if project:
+                self._operation_projects[op_id] = project
+            refs = row.get("refs")
+            if isinstance(refs, list):
+                self._operation_ref_ids[op_id] = tuple(
+                    item for item in refs if isinstance(item, str)
+                )
+            profile = row.get("profile")
+            if profile:
+                self._operation_profiles[op_id] = profile
+            media = row.get("media")
+            if media:
+                self._operation_media[op_id] = media
+
+    def _ops_snapshot(self) -> dict:
+        """operation_id → project/session/media so a restart can still poll."""
+        rows = {}
+        for op_id in set(self._operation_projects) | set(self._operation_chat_sessions):
+            rows[op_id] = {
+                "session": self._operation_chat_sessions.get(op_id) or "",
+                "project": self._operation_projects.get(op_id) or "",
+                "refs": list(self._operation_ref_ids.get(op_id) or ()),
+                "profile": self._operation_profiles.get(op_id) or "",
+                "media": self._operation_media.get(op_id) or "",
+            }
+        return rows
+
+    def _save_r2v_ops(self) -> None:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        try:
+            _R2V_OPS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _R2V_OPS_PATH.write_text(
+                json.dumps(self._ops_snapshot(), indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.debug("r2v op map not saved: %s", exc)
 
     # ─── High-level API Methods ──────────────────────────────
 
@@ -607,21 +1358,27 @@ class FlowClient:
             return await self._legacy_generate_images(
                 prompt, project_id, aspect_ratio, user_paygate_tier, character_media_ids)
 
-        try:
-            pid = self._batch_project_id(project_id)
+        refs = list(character_media_ids or [])
+
+        async def run(pid: str):
             freq = fb.image_request(
                 prompt, pid, count=1, aspect=aspect_ratio,
                 model=self._batch_image_model(image_model),
-                ref_media_ids=list(character_media_ids or []) or None,
+                ref_media_ids=refs or None,
             )
             payload = await self._batch_payload(fb.RPC_GEN_IMAGE, freq, fb.CAPTCHA_IMAGE)
+            images = fb.read_images(payload)
+            if not images:
+                return {"status": 502, "error": "Image generation returned no media url"}
+            for image in images:
+                self._remember_media(image.media_id)
+            return {"status": 200, "data": {"media": [_as_media_record(i) for i in images]}}
+
+        try:
+            return await self._run_on_profile(
+                run, project_id, media_ids=refs, allow_failover=True)
         except Exception as e:
             return _batch_error(e)
-
-        images = fb.read_images(payload)
-        if not images:
-            return {"status": 502, "error": "Image generation returned no media url"}
-        return {"status": 200, "data": {"media": [_as_media_record(i) for i in images]}}
 
     async def edit_image(self, prompt: str, source_media_id: str,
                           project_id: str,
@@ -650,16 +1407,44 @@ class FlowClient:
             user_paygate_tier=user_paygate_tier, character_media_ids=refs,
         )
 
-    async def generate_video(self, start_image_media_id: str, prompt: str,
-                              project_id: str, scene_id: str,
+    async def generate_video(self, start_image_media_id: str | None = None, prompt: str = "",
+                              project_id: str = "", scene_id: str = "",
                               aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
                               end_image_media_id: str = None,
                               user_paygate_tier: str = "PAYGATE_TIER_TWO") -> dict:
-        """Submit an i2v generation. Returns operations for the poller."""
+        """Submit i2v (start frame) or t2v (no start frame). Returns operations."""
+        start = start_image_media_id or None
         if not USE_BATCH_RPC:
+            if not start:
+                return {"error": _unsupported(
+                    "text-to-video",
+                    "the legacy REST path has no t2v capture",
+                )}
             return await self._legacy_generate_video(
-                start_image_media_id, prompt, project_id, scene_id,
+                start, prompt, project_id, scene_id,
                 aspect_ratio, end_image_media_id, user_paygate_tier)
+
+        if not start:
+            if end_image_media_id:
+                return {"error": "t2v has no start frame; omit end_image_media_id"}
+
+            async def run_t2v(pid: str):
+                freq = fb.t2v_request(
+                    prompt, pid, aspect=aspect_ratio, model=fb.VIDEO_T2V_MODEL)
+                payload = await self._batch_payload(
+                    fb.RPC_GEN_T2V, freq, fb.CAPTCHA_VIDEO, timeout=120)
+                operations = fb.read_operations(payload)
+                for operation in operations:
+                    self._remember_operation(operation.operation_id, pid)
+                return {"status": 200, "data": {
+                    "operations": [_as_pending_operation(op.operation_id) for op in operations]
+                }}
+
+            try:
+                return await self._run_on_profile(
+                    run_t2v, project_id, allow_failover=True)
+            except Exception as e:
+                return _batch_error(e)
 
         if end_image_media_id:
             if not FLOW_ALLOW_DEGRADED:
@@ -673,20 +1458,25 @@ class FlowClient:
                 str(scene_id)[:12], end_image_media_id[:12])
 
         gen_type = "start_end_frame_2_video" if end_image_media_id else "frame_2_video"
-        try:
-            pid = self._batch_project_id(project_id)
+
+        async def run_i2v(pid: str):
             freq = fb.video_request(
-                prompt, pid, start_image_media_id, aspect=aspect_ratio,
+                prompt, pid, start, aspect=aspect_ratio,
                 model=self._batch_video_model(user_paygate_tier, gen_type, aspect_ratio),
             )
             payload = await self._batch_payload(
                 fb.RPC_GEN_VIDEO, freq, fb.CAPTCHA_VIDEO, timeout=120)
             operation = fb.read_operation(payload)
+            self._remember_operation(operation.operation_id, pid)
+            return {"status": 200, "data": {
+                "operations": [_as_pending_operation(operation.operation_id)]
+            }}
+
+        try:
+            return await self._run_on_profile(
+                run_i2v, project_id, media_ids=[start], allow_failover=True)
         except Exception as e:
             return _batch_error(e)
-
-        self._remember_operation(operation.operation_id, pid)
-        return {"status": 200, "data": {"operations": [_as_pending_operation(operation.operation_id)]}}
 
     async def generate_video_from_references(self, reference_media_ids: list[str],
                                               prompt: str, project_id: str, scene_id: str,
@@ -701,12 +1491,27 @@ class FlowClient:
         if not reference_media_ids:
             return {"error": "No reference media_ids for r2v"}
 
-        try:
-            pid = self._batch_project_id(project_id)
-            session = self._chat_session_id or fb.CHAT_SESSION_SLOT
-            logger.info("r2v StreamChat session=%s", session)
+        refs = list(reference_media_ids)
+
+        async def run(pid: str):
+            # StreamChat has no model slot. Without this setting the
+            # Ingredients agent picks Omni Flash (~15 credits) and stalls on
+            # ask_for_permission. Captured Kcr7Ub pins lite_low_priority (free).
+            settings = await self.batch_rpc(
+                fb.RPC_PROJECT_SETTINGS,
+                fb.set_video_defaults_request(pid, aspect=aspect_ratio),
+                timeout=45,
+            )
+            if settings.get("error"):
+                raise fb.FlowBatchError(
+                    f"{fb.RPC_PROJECT_SETTINGS}: {settings['error']}")
+            # Fresh conversation — a session that already ignored permission
+            # keeps picking Omni Flash even after the model pin.
+            session = await self._mint_chat_session(pid)
+            logger.info("r2v StreamChat session=%s model=%s",
+                        session, fb.VIDEO_R2V_MODEL)
             freq = fb.stream_chat_request(
-                prompt, pid, reference_media_ids, session_id=session)
+                prompt, pid, refs, session_id=session)
             result = await self.batch_rpc(
                 fb.RPC_STREAM_CHAT, freq, fb.CAPTCHA_CHAT,
                 timeout=120, path=fb.STREAM_CHAT_PATH,
@@ -715,18 +1520,41 @@ class FlowClient:
                 raise fb.FlowBatchError(f"StreamChat: {result['error']}")
             raw = result.get("data") or ""
             try:
-                payload = fb.first_payload(raw)
-                operation = fb.read_stream_chat_operation(payload)
+                chunks = fb.payloads(raw)
+                operation = fb.read_stream_chat_operation(
+                    chunks if len(chunks) != 1 else chunks[0])
+            except fb.FlowBatchError as exc:
+                logger.warning("r2v StreamChat parse: %s raw=%s", exc, raw[:1500])
+                operation = None
             except Exception:
                 logger.error("[DEBUG] r2v StreamChat raw (%d chars): %s",
                              len(raw), raw[:2000])
                 raise
+            op_id = operation.operation_id if operation else None
+            if not fb._valid_uuid(op_id):
+                # Ack had no media/chat uuid. Poll GetSession on this
+                # conversation — that is how the Flow UI finds the clip.
+                if not session or session == fb.CHAT_SESSION_SLOT:
+                    raise fb.FlowBatchError("StreamChat response carried no operation")
+                logger.warning("r2v StreamChat had no uuid; polling via session %s", session)
+                op_id = session
+            self._remember_operation(op_id, pid)
+            if session and session != fb.CHAT_SESSION_SLOT:
+                self._operation_chat_sessions[op_id] = session
+            self._operation_ref_ids[op_id] = tuple(refs)
+            if operation and operation.done and operation.operation_id == op_id:
+                self._operation_media[op_id] = op_id
+            self._save_r2v_ops()
+            return {"status": 200, "data": {
+                "operations": [_as_pending_operation(op_id)]
+            }}
+
+        try:
+            return await self._run_on_profile(
+                run, project_id, media_ids=refs, allow_failover=True)
         except Exception as e:
             logger.error("[DEBUG] r2v StreamChat failed: %s", e)
             return _batch_error(e)
-
-        self._remember_operation(operation.operation_id, pid)
-        return {"status": 200, "data": {"operations": [_as_pending_operation(operation.operation_id)]}}
 
     async def upscale_video(self, media_id: str, scene_id: str,
                              aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
@@ -775,6 +1603,20 @@ class FlowClient:
         return {"status": 200, "data": {"operations": out}}
 
     async def _poll_batch_operation(self, operation_id: str) -> dict:
+        async def run(_pid: str):
+            return await self._poll_batch_operation_inner(operation_id)
+
+        result = await self._run_on_profile(
+            run,
+            self._operation_projects.get(operation_id) or "",
+            operation_id=operation_id,
+            allow_failover=False,
+        )
+        if isinstance(result, dict) and result.get("error") and "operation" not in result:
+            return _as_pending_operation(operation_id, error=result["error"])
+        return result
+
+    async def _poll_batch_operation_inner(self, operation_id: str) -> dict:
         media_id = self._operation_media.get(operation_id)
         complaint = None
 
@@ -783,9 +1625,35 @@ class FlowClient:
             if not media_id:
                 return _as_pending_operation(operation_id, error=complaint)
             self._operation_media[operation_id] = media_id
+            self._remember_media(media_id)
+            self._save_r2v_ops()
 
-        urls = await self._batch_media_urls(media_id)
-        if not urls.video:
+        try:
+            urls = await self._batch_media_urls(media_id)
+        except Exception as e:
+            # as29s [5] on a queued r2v id is "not written yet", not a
+            # dead job. Keep the id so the next round does not forget it.
+            complaint = str(e)
+            urls = None
+
+        if (urls is None or not urls.video) and operation_id in self._operation_chat_sessions:
+            # Transcript can stay at "queued" for minutes, then grow a
+            # /video/ url or a new media_id. Re-read it when as29s misses.
+            refreshed = await self._media_id_from_chat_session(
+                operation_id, self._operation_projects.get(operation_id),
+            )
+            if refreshed:
+                media_id = refreshed
+                self._operation_media[operation_id] = media_id
+                self._remember_media(media_id)
+                self._save_r2v_ops()
+            try:
+                urls = await self._batch_media_urls(media_id)
+            except Exception as e:
+                return _as_pending_operation(
+                    operation_id, error=str(e), media_id=media_id)
+
+        if not urls or not urls.video:
             # The id landed but the clip is still being written; downloading
             # now would save the poster still instead of the video.
             return _as_pending_operation(operation_id, error=complaint, media_id=media_id)
@@ -833,13 +1701,28 @@ class FlowClient:
                          operation_id[:20], e)
             worth_looking = True
 
+        if operation_id in self._operation_chat_sessions:
+            # Chat-message uuids are not operation rows. GetSession is how
+            # the clip media_id shows up, including while it is still queued.
+            worth_looking = True
         if not worth_looking:
             return None, complaint
         if not project_id:
             return None, "no project id for the listing lookup"
-        media_id = await self._media_id_for(operation_id, project_id)
-        if media_id:
-            return media_id, complaint
+        # r2v: the submit uuid is a chat-message id. GetSession names the
+        # clip as generate_video_with_references.media_id (often queued,
+        # before a /video/ url or CAE listing row exists).
+        if operation_id in self._operation_chat_sessions:
+            media_id = await self._media_id_from_chat_session(operation_id, project_id)
+            if media_id:
+                return media_id, complaint
+            media_id = await self._media_id_from_r2v_listing(operation_id, project_id)
+            if media_id:
+                return media_id, complaint
+        else:
+            media_id = await self._media_id_for(operation_id, project_id)
+            if media_id:
+                return media_id, complaint
         # StreamChat r2v keys the listing row by the media id. i2v
         # slot-matching misses that shape; as29s on the id still serves it.
         try:
@@ -849,6 +1732,154 @@ class FlowClient:
         except Exception:
             pass
         return None, complaint
+
+    async def _media_id_from_chat_session(
+        self, operation_id: str, project_id: str | None,
+    ) -> str | None:
+        """Resolve r2v media from GetSession (GN0Bre) on the bound conversation.
+
+        Only used for operations StreamChat submitted — t2v/i2v listing rows
+        are keyed by the operation id, and GetSession would otherwise attach
+        an unrelated Ingredients clip.
+
+        The transcript names the clip as ``media_id`` while status is still
+        ``queued``. The listing row is keyed by workflow_id, not the
+        chat-message uuid, so waiting for a CAE match or a ``/video/`` url
+        here never binds it. Return that id; the poller as29s until the
+        CDN path appears.
+        """
+        session = self._operation_chat_sessions.get(operation_id)
+        if not session or session == fb.CHAT_SESSION_SLOT:
+            return None
+        try:
+            result = await self.batch_rpc(
+                fb.RPC_CHAT_SESSION, fb.get_session_request(session), timeout=60,
+            )
+            if result.get("error"):
+                raise fb.FlowBatchError(str(result["error"]))
+            raw = result.get("data") or ""
+            if not os.environ.get("PYTEST_CURRENT_TEST"):
+                try:
+                    _GETSESSION_DUMP.parent.mkdir(parents=True, exist_ok=True)
+                    _GETSESSION_DUMP.write_text(raw[:200000], encoding="utf-8")
+                except OSError:
+                    pass
+            try:
+                blobs: list = fb.payloads(raw)
+            except fb.FlowBatchError as exc:
+                logger.warning("GetSession parse failed: %s raw_len=%d", exc, len(raw))
+                blobs = []
+        except Exception as exc:
+            logger.warning("GetSession %s failed: %s", session[:12], exc)
+            return None
+
+        exclude = {
+            operation_id, session, project_id or "",
+            *self._operation_ref_ids.get(operation_id, ()),
+        }
+        skip = {item.lower() for item in exclude if item}
+        video_in_raw = "/video/" in raw.replace("\\/", "/")
+        video_ids = fb.find_video_media_ids(blobs, exclude=exclude)
+        if not video_ids:
+            video_ids = [
+                mid for mid in fb.video_media_ids_in_text(raw)
+                if mid.lower() not in skip
+            ]
+        if video_ids:
+            chosen = video_ids[-1]
+            logger.info("r2v GetSession video %s for op %s", chosen[:12], operation_id[:12])
+            self._operation_media[operation_id] = chosen
+            self._save_r2v_ops()
+            return chosen
+        session_media = fb.find_r2v_session_media_ids(blobs, exclude=exclude)
+        if not session_media:
+            session_media = fb.find_r2v_session_media_ids(raw, exclude=exclude)
+        if session_media:
+            chosen = session_media[-1]
+            logger.info("r2v GetSession media_id %s for op %s",
+                        chosen[:12], operation_id[:12])
+            self._operation_media[operation_id] = chosen
+            self._save_r2v_ops()
+            return chosen
+        leftover = fb.collect_uuids([blobs, raw], exclude=exclude)
+        candidates = fb.find_stream_chat_media_ids(blobs, exclude=exclude)[:_R2V_AS29S_CAP]
+        for media_id in candidates:
+            try:
+                urls = await self._batch_media_urls(media_id)
+            except Exception:
+                continue
+            if urls.video:
+                logger.info("r2v GetSession media %s for op %s", media_id[:12], operation_id[:12])
+                self._operation_media[operation_id] = media_id
+                self._save_r2v_ops()
+                return media_id
+        logger.warning(
+            "GetSession %s no r2v media for %s raw_len=%d video_in_raw=%s "
+            "uuids=%d candidates=%d",
+            session[:12], operation_id[:12], len(raw), video_in_raw,
+            len(leftover), len(candidates),
+        )
+        return None
+
+    async def _media_id_from_r2v_listing(
+        self, operation_id: str, project_id: str,
+    ) -> str | None:
+        """Find the StreamChat clip in the project listing.
+
+        Do not window around the chat-message uuid — that string is not in
+        the row. The row is ``[mediaId, projectId, sceneId, "CAE"]``. t2v/i2v
+        listing entries use a different shape, so CAE rows here are r2v.
+        """
+        result = await self.batch_rpc(
+            fb.RPC_PROJECT_MEDIA, fb.project_media_request(project_id),
+            timeout=120,
+        )
+        if result.get("error"):
+            logger.warning("r2v listing: %s", result["error"])
+            return None
+        raw = result.get("data") or ""
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            try:
+                _LISTING_DUMP.parent.mkdir(parents=True, exist_ok=True)
+                _LISTING_DUMP.write_text(
+                    f"len={len(raw)}\n" + raw[:4000] + "\n---tail---\n" + raw[-4000:],
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        skip = {
+            operation_id, project_id,
+            self._operation_chat_sessions.get(operation_id) or "",
+            *self._operation_ref_ids.get(operation_id, ()),
+            *self._operation_media.values(),
+        }
+        candidates = fb.find_r2v_media_ids_in_text(
+            raw, project_id, operation_id=operation_id, exclude=skip)
+        if not candidates:
+            try:
+                blobs = fb.payloads(raw)
+            except fb.FlowBatchError:
+                blobs = []
+            # Parsed CAE rows still have to name this chat/operation in slot 2.
+            for media_id in fb.find_stream_chat_media_ids(blobs, exclude=skip):
+                if media_id.lower() == operation_id.lower():
+                    candidates.append(media_id)
+        logger.info(
+            "r2v listing op=%s raw_len=%d cae=%d",
+            operation_id[:12], len(raw), len(candidates),
+        )
+        for media_id in reversed(candidates[-_R2V_AS29S_CAP:]):
+            try:
+                urls = await self._batch_media_urls(media_id)
+            except Exception:
+                continue
+            if urls.video:
+                logger.info(
+                    "r2v listing media %s for op %s", media_id[:12], operation_id[:12])
+                self._operation_media[operation_id] = media_id
+                self._save_r2v_ops()
+                return media_id
+        return None
 
     async def _media_id_for(self, operation_id: str, project_id: str) -> str | None:
         """Find an operation's media id in the project listing.
@@ -905,35 +1936,91 @@ class FlowClient:
         """Fetch a media record, which is where a fresh signed url lives."""
         if not USE_BATCH_RPC:
             return await self._legacy_get_media(media_id)
-        try:
+        async def run(_pid: str):
             urls = await self._batch_media_urls(media_id)
+            if not urls.video and not urls.image:
+                return {"status": 404, "error": f"No urls for media {media_id}"}
+            data: dict = {}
+            if urls.video:
+                data["video"] = {"fifeUrl": urls.video}
+            if urls.image:
+                data["image"] = {"fifeUrl": urls.image}
+            return {"status": 200, "data": data}
+
+        try:
+            return await self._run_on_profile(
+                run, "", media_ids=[media_id], allow_failover=False)
         except Exception as e:
             return _batch_error(e)
-        if not urls.video and not urls.image:
-            return {"status": 404, "error": f"No urls for media {media_id}"}
-        data: dict = {}
-        if urls.video:
-            data["video"] = {"fifeUrl": urls.video}
-        if urls.image:
-            data["image"] = {"fifeUrl": urls.image}
-        return {"status": 200, "data": data}
 
     async def upload_image(self, image_base64: str, mime_type: str = "image/jpeg",
                             project_id: str = "", file_name: str = "image.jpg") -> dict:
         """Upload an image into the project so it can be used as a reference."""
         if not USE_BATCH_RPC:
             return await self._legacy_upload_image(image_base64, mime_type, project_id, file_name)
-        try:
-            pid = self._batch_project_id(project_id)
+        async def run(pid: str):
             payload = await self._batch_payload(
                 fb.RPC_UPLOAD_IMAGE,
                 fb.upload_request(image_base64, pid, mime_type, file_name),
                 fb.CAPTCHA_IMAGE, timeout=120,
             )
             media_id = fb.read_uploaded_media_id(payload)
+            self._remember_media(media_id)
+            return {"status": 200, "data": {"media": {"name": media_id}}, "_mediaId": media_id}
+
+        try:
+            return await self._run_on_profile(
+                run, project_id, allow_failover=True)
         except Exception as e:
             return _batch_error(e)
-        return {"status": 200, "data": {"media": {"name": media_id}}, "_mediaId": media_id}
+
+    async def vision_analyze(
+        self,
+        prompt: str,
+        images: list[tuple[str, str]] | list[str] | str | None = None,
+        system_instruction: str = "",
+        session_uuid: str | None = None,
+        project_id: str = "",
+        timeout: float = 120.0,
+    ) -> dict:
+        """Call Gemini 3 Flash Vision via Google Flow's internal RPC agJzFb.
+
+        Zero-cost multimodal analysis and scriptwriting using Flow's signed-in session.
+        """
+        async def run(pid: str):
+            chosen_session = session_uuid or self._chat_session_for_route()
+            if not chosen_session:
+                chosen_session = fb.CHAT_SESSION_SLOT
+            freq = fb.vision_analyze_request(
+                prompt=prompt,
+                images=images,
+                system_instruction=system_instruction,
+                session_uuid=chosen_session,
+            )
+            try:
+                from pathlib import Path
+                Path("/home/pc/flowkit/.scratch").mkdir(parents=True, exist_ok=True)
+                Path("/home/pc/flowkit/.scratch/agjzfb_freq.json").write_text(freq, encoding="utf-8")
+            except Exception:
+                pass
+            path = f"/_/AiSandboxAngularFrontend/data/batchexecute?rpcids={fb.RPC_VISION_ANALYZE}"
+            if pid:
+                path += f"&source-path=%2Fproject%2F{pid}"
+            payload = await self._batch_payload(
+                fb.RPC_VISION_ANALYZE, freq,
+                captcha_action=fb.CAPTCHA_CHAT,
+                timeout=timeout,
+                path=path,
+            )
+            analysis = fb.read_vision_analysis(payload)
+            return {"status": 200, "data": analysis}
+
+        try:
+            return await self._run_on_profile(
+                run, project_id, allow_failover=True,
+            )
+        except Exception as e:
+            return _batch_error(e)
 
     # ─── Legacy REST methods (aisandbox-pa, pre-migration) ───
 
@@ -1246,6 +2333,34 @@ class FlowClient:
 
         return result
 
+    async def test_recaptcha_token(self, worker_id: str = "nick-a", action: str = "FLOW_PROBE") -> dict:
+        """Test minting 1 live reCAPTCHA Enterprise token through Chrome extension on worker_id."""
+        pin, candidates = self._profile_candidates(profile_id=worker_id)
+        if not candidates:
+            return {"ok": False, "error": f"Worker {worker_id} not connected"}
+        route = candidates[0]
+        token_route = _current_route.set(route)
+        try:
+            res = await self._send("solve_captcha", {"captchaAction": action}, timeout=20)
+            data = res.get("result") or res
+            tok = data.get("token")
+            if tok:
+                return {
+                    "ok": True,
+                    "worker_id": worker_id,
+                    "action": action,
+                    "token_preview": f"{tok[:25]}...{tok[-15:]}",
+                    "token_length": len(tok)
+                }
+            return {
+                "ok": False,
+                "worker_id": worker_id,
+                "action": action,
+                "error": data.get("error", "No token returned")
+            }
+        finally:
+            _current_route.reset(token_route)
+
 # ─── Response shaping ────────────────────────────────────────
 #
 # The batch path answers in Flow's positional arrays; everything downstream
@@ -1267,6 +2382,7 @@ def _unsupported(feature: str, why: str) -> str:
 
 def _batch_error(exc: Exception) -> dict:
     """An exception from the batch path, in the error shape callers expect."""
+    logger.error("Batch RPC error: %s: %s", type(exc).__name__, exc, exc_info=True)
     return {"status": 502, "error": f"{type(exc).__name__}: {exc}"}
 
 

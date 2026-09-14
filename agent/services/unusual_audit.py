@@ -1,0 +1,442 @@
+"""Unusual Activity Audit Logging & Forensic Diagnostic System for Google Flow.
+
+Tracks, correlates, and analyzes occurrences of `PUBLIC_ERROR_UNUSUAL_ACTIVITY`
+and related RPC errors (7, 13, 403, 429) across FlowKit workers and proxies.
+Provides persistent JSONL audit trails, real-time metrics, sliding-window burst
+trackers, and automated heuristic root-cause analysis.
+"""
+from __future__ import annotations
+
+import collections
+import datetime
+import json
+import logging
+import os
+import re
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from agent.config import BASE_DIR
+from agent.services.accounts import get_account, load_accounts
+from agent.services.chrome_nicks import get_bridge
+from agent.services.proxy_url import parse_proxy_url
+
+logger = logging.getLogger(__name__)
+
+# Dedicated audit log file location
+AUDIT_LOG_DIR = BASE_DIR / "logs"
+AUDIT_LOG_FILE = AUDIT_LOG_DIR / "unusual_activity_audit.jsonl"
+MAX_LOG_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB before rotation
+
+
+# RPC Action human-readable mapping
+RPC_ACTION_NAMES = {
+    "agJzFb": "Gemini 3 Flash Vision / OCR / Scripting",
+    "ogiZ0b": "Banana Pro 2 Keyframe Image Generation",
+    "eb1hJf": "Veo 3.1 Keyframe to Video (i2v)",
+    "YhhmEf": "Veo 3.1 Text to Video (t2v)",
+    "k42Yye": "Asset / Media Upload",
+    "o30O0e": "Project Listing",
+    "GN0Bre": "Chat / Stream Session Bind",
+    "maseQ": "Flow Session Sync",
+    "nzlxg": "Flow Tab Ping",
+    "UpteDb": "Project Metadata Query",
+    "pDU0ue": "Project Create / Update",
+}
+
+
+def _now_vn_str(ts: Optional[float] = None) -> str:
+    """Format timestamp into local Vietnam time string (GMT+7)."""
+    t = ts if ts is not None else time.time()
+    dt = datetime.datetime.fromtimestamp(t, tz=datetime.timezone(datetime.timedelta(hours=7)))
+    return dt.strftime("%Y-%m-%d %H:%M:%S GMT+7")
+
+
+def _now_iso(ts: Optional[float] = None) -> str:
+    """Format timestamp into ISO 8601 UTC string."""
+    t = ts if ts is not None else time.time()
+    dt = datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc)
+    return dt.isoformat()
+
+
+class ProxyHealthRecord:
+    """Tracks lifetime performance and error history for an upstream proxy IP."""
+
+    def __init__(self, proxy_url: str):
+        self.proxy_url = proxy_url
+        parsed = parse_proxy_url(proxy_url)
+        self.redacted = parsed.redacted
+        self.ip = parsed.host
+        self.port = parsed.port
+        self.assigned_at = time.time()
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.consecutive_successes = 0
+        self.consecutive_errors = 0
+        self.last_error_reason: Optional[str] = None
+        self.last_used_at: Optional[float] = None
+
+    def record_success(self) -> None:
+        self.total_requests += 1
+        self.successful_requests += 1
+        self.consecutive_successes += 1
+        self.consecutive_errors = 0
+        self.last_used_at = time.time()
+
+    def record_error(self, reason: str = "PUBLIC_ERROR_UNUSUAL_ACTIVITY") -> None:
+        self.total_requests += 1
+        self.failed_requests += 1
+        self.consecutive_errors += 1
+        self.consecutive_successes = 0
+        self.last_error_reason = reason
+        self.last_used_at = time.time()
+
+    def to_dict(self) -> dict:
+        return {
+            "ip": self.ip,
+            "port": self.port,
+            "proxy": self.redacted,
+            "total_requests": self.total_requests,
+            "successful_requests": self.successful_requests,
+            "failed_requests": self.failed_requests,
+            "success_rate": round(
+                (self.successful_requests / self.total_requests * 100)
+                if self.total_requests > 0
+                else 0.0,
+                1,
+            ),
+            "consecutive_successes": self.consecutive_successes,
+            "consecutive_errors": self.consecutive_errors,
+            "last_error_reason": self.last_error_reason,
+            "last_used_vn": _now_vn_str(self.last_used_at) if self.last_used_at else None,
+        }
+
+
+class UnusualAuditManager:
+    """Singleton engine managing sliding-window metrics, persistent audit trails,
+
+    and heuristic diagnostic insights.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # In-memory ring buffer of recent unusual events
+        self._recent_events: collections.deque = collections.deque(maxlen=250)
+        # Proxy tracking: keyed by proxy redacted or proxy host:port
+        self._proxy_records: Dict[str, ProxyHealthRecord] = {}
+        # Sliding window timestamp tracker for rate bursts: worker_id -> list of float timestamps
+        self._worker_request_timestamps: Dict[str, collections.deque] = collections.defaultdict(
+            lambda: collections.deque(maxlen=300)
+        )
+        self._last_worker_request_time: Dict[str, float] = {}
+        # Global burst tracker
+        self._global_request_timestamps: collections.deque = collections.deque(maxlen=1000)
+
+        # Ensure audit log directory exists
+        try:
+            AUDIT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("Could not create audit log dir %s: %s", AUDIT_LOG_DIR, exc)
+
+        # Load recent events from disk on startup if log exists
+        self._hydrate_from_disk()
+
+    def _hydrate_from_disk(self) -> None:
+        """Hydrate recent events from existing audit log file."""
+        if not AUDIT_LOG_FILE.exists():
+            return
+        try:
+            lines = AUDIT_LOG_FILE.read_text(encoding="utf-8").splitlines()
+            for line in lines[-250:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    self._recent_events.append(record)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("Could not read existing audit log: %s", exc)
+
+    def _get_or_create_proxy_record(self, proxy_url: str) -> ProxyHealthRecord:
+        key = proxy_url.strip()
+        if key not in self._proxy_records:
+            self._proxy_records[key] = ProxyHealthRecord(proxy_url)
+        return self._proxy_records[key]
+
+    def record_request_dispatched(self, worker_id: str, proxy_url: str = "") -> dict:
+        """Call when an RPC request is about to be sent. Returns current burst metrics."""
+        now = time.time()
+        with self._lock:
+            last_time = self._last_worker_request_time.get(worker_id)
+            gap_seconds = round(now - last_time, 2) if last_time is not None else 999.0
+            self._last_worker_request_time[worker_id] = now
+
+            worker_window = self._worker_request_timestamps[worker_id]
+            worker_window.append(now)
+            self._global_request_timestamps.append(now)
+
+            # Calculate bursts
+            burst_10s = sum(1 for t in worker_window if now - t <= 10.0)
+            burst_30s = sum(1 for t in worker_window if now - t <= 30.0)
+            burst_60s = sum(1 for t in worker_window if now - t <= 60.0)
+            global_10s = sum(1 for t in self._global_request_timestamps if now - t <= 10.0)
+
+            return {
+                "gap_seconds": gap_seconds,
+                "burst_10s": burst_10s,
+                "burst_30s": burst_30s,
+                "burst_60s": burst_60s,
+                "global_burst_10s": global_10s,
+            }
+
+    def record_request_success(self, worker_id: str, proxy_url: str = "") -> None:
+        """Record successful RPC execution on this worker's proxy."""
+        with self._lock:
+            if proxy_url:
+                rec = self._get_or_create_proxy_record(proxy_url)
+                rec.record_success()
+
+    def diagnose_root_cause(
+        self,
+        rpc_id: str,
+        burst_metrics: dict,
+        proxy_record: Optional[ProxyHealthRecord],
+        raw_error: str,
+        rotation_result: Optional[dict] = None,
+    ) -> dict:
+        """Synthesizes all forensic clues to determine the most probable root cause."""
+        reasons: List[str] = []
+        severity = "HIGH"
+        gap = burst_metrics.get("gap_seconds", 999.0)
+        burst_10s = burst_metrics.get("burst_10s", 1)
+
+        # 1. Burst Rate Check
+        if gap < 1.2 or burst_10s >= 3:
+            reasons.append(
+                f"RATE_BURST: Tần suất gửi request quá dồn dập (khoảng cách {gap}s, {burst_10s} req/10s). "
+                "Google reCAPTCHA Enterprise kích hoạt cờ chống bot do lưu lượng đột biến."
+            )
+
+        # 2. Datacenter IP / Burned IP Check
+        if proxy_record:
+            if proxy_record.total_requests <= 2 and proxy_record.successful_requests == 0:
+                reasons.append(
+                    f"BURNED_PROXY_IP: Proxy {proxy_record.ip} bị Google chặn ngay từ request đầu tiên. "
+                    "Khả năng cao dải IP này thuộc Datacenter hoặc đã bị Google blacklist từ trước."
+                )
+            elif proxy_record.consecutive_errors >= 2:
+                reasons.append(
+                    f"DEAD_PROXY_SUBNET: Proxy {proxy_record.ip} bị chặn liên tiếp {proxy_record.consecutive_errors} lần. "
+                    "Proxy này đã mất độ tin cậy, cần xoay vòng sang IP khác."
+                )
+            elif proxy_record.consecutive_successes >= 25:
+                reasons.append(
+                    f"IP_FATIGUE: Proxy {proxy_record.ip} đã xử lý tốt {proxy_record.consecutive_successes} request "
+                    "trước khi bị cờ. Đây là giới hạn quota/phiên thông thường của Google."
+                )
+
+        # 3. RPC Specific Clues
+        if rpc_id == "agJzFb":
+            reasons.append(
+                "VISION_RPC_RULE: agJzFb (Gemini Vision) yêu cầu phiên Flow chat session hợp lệ. "
+                "Nếu trang Flow chưa tải xong hoặc session bị ngắt kết nối, Google sẽ trả về UNUSUAL_ACTIVITY."
+            )
+        elif rpc_id in ("ogiZ0b", "eb1hJf"):
+            if "reCAPTCHA" in raw_error or "7," in raw_error:
+                reasons.append(
+                    "CAPTCHA_EVALUATION_FAILED: Token reCAPTCHA Enterprise trên trang Flow bị điểm tin cậy thấp (score < threshold)."
+                )
+
+        # 4. Rotation Outcome Clue
+        if rotation_result and rotation_result.get("retry_success"):
+            reasons.append(
+                f"CONFIRMED_IP_REPUTATION: Đổi sang proxy mới ({rotation_result.get('new_proxy_ip')}) và retry THÀNH CÔNG ngay lập tức. "
+                "Xác nhận 100% nguyên nhân là do IP proxy cũ bị Google chặn."
+            )
+        elif rotation_result and rotation_result.get("retry_attempted") and not rotation_result.get("retry_success"):
+            reasons.append(
+                "POOL_CONTAMINATION_OR_COOKIE: Đổi sang proxy mới nhưng retry vẫn bị lỗi. "
+                "Khả năng cookie phiên Google trong Chrome profile đã hết hạn hoặc toàn bộ dải proxy pool đang bị theo dõi."
+            )
+
+        if not reasons:
+            reasons.append(
+                "UNSPECIFIED_GOOGLE_SECURITY_FLAG: Google AI Sandbox trả về PUBLIC_ERROR_UNUSUAL_ACTIVITY. "
+                "Nguyên nhân phổ biến: IP proxy datacenter, cookie phiên Google cũ, hoặc reCAPTCHA score thấp."
+            )
+
+        summary_text = " | ".join(reasons)
+        return {
+            "primary_cause": reasons[0].split(":")[0],
+            "severity": severity,
+            "explanation": summary_text,
+            "reasons": reasons,
+        }
+
+    def record_unusual_event(
+        self,
+        worker_id: str,
+        rpc_id: str,
+        raw_error: str,
+        burst_metrics: dict,
+        call_duration_ms: int = 0,
+        payload_summary: Optional[dict] = None,
+        rotation_info: Optional[dict] = None,
+    ) -> dict:
+        """Constructs, logs, and persists a complete diagnostic audit record."""
+        now = time.time()
+        event_id = f"unusual_{int(now * 1000)}_{worker_id}"
+
+        # Resolve active proxy for this worker
+        proxy_url = ""
+        try:
+            account = get_account(worker_id)
+            if account and account.get("proxy_url"):
+                proxy_url = account["proxy_url"]
+        except Exception:
+            pass
+
+        proxy_record: Optional[ProxyHealthRecord] = None
+        if proxy_url:
+            with self._lock:
+                proxy_record = self._get_or_create_proxy_record(proxy_url)
+                proxy_record.record_error("PUBLIC_ERROR_UNUSUAL_ACTIVITY")
+
+        parsed_proxy = parse_proxy_url(proxy_url) if proxy_url else None
+        proxy_ip = parsed_proxy.host if parsed_proxy else "unknown"
+        proxy_port = parsed_proxy.port if parsed_proxy else 0
+
+        # Heuristic diagnosis
+        diag = self.diagnose_root_cause(
+            rpc_id=rpc_id,
+            burst_metrics=burst_metrics,
+            proxy_record=proxy_record,
+            raw_error=raw_error,
+            rotation_result=rotation_info,
+        )
+
+        event_entry: Dict[str, Any] = {
+            "id": event_id,
+            "timestamp_utc": _now_iso(now),
+            "timestamp_vn": _now_vn_str(now),
+            "worker_id": worker_id,
+            "rpc_id": rpc_id,
+            "action_name": RPC_ACTION_NAMES.get(rpc_id, f"Google Flow RPC ({rpc_id})"),
+            "proxy": {
+                "url": parsed_proxy.redacted if parsed_proxy else "none",
+                "ip": proxy_ip,
+                "port": proxy_port,
+                "lifetime_requests": proxy_record.total_requests if proxy_record else 0,
+                "consecutive_errors": proxy_record.consecutive_errors if proxy_record else 1,
+            },
+            "timing": {
+                "duration_ms": call_duration_ms,
+                "gap_seconds_since_last_req": burst_metrics.get("gap_seconds", 0.0),
+                "burst_in_last_10s": burst_metrics.get("burst_10s", 1),
+                "burst_in_last_30s": burst_metrics.get("burst_30s", 1),
+                "burst_in_last_60s": burst_metrics.get("burst_60s", 1),
+                "global_burst_10s": burst_metrics.get("global_burst_10s", 1),
+            },
+            "payload_summary": payload_summary or {},
+            "raw_error": str(raw_error)[:800],
+            "diagnosis": diag,
+            "recovery": rotation_info or {},
+        }
+
+        # Save to memory buffer
+        with self._lock:
+            self._recent_events.append(event_entry)
+
+        # Write to JSONL log on disk
+        self._append_to_disk(event_entry)
+
+        logger.warning(
+            "🚨 [UNUSUAL_ACTIVITY AUDIT] %s | Worker: %s | Proxy: %s | RPC: %s (%s) | Cause: %s",
+            event_entry["timestamp_vn"],
+            worker_id,
+            proxy_ip,
+            rpc_id,
+            event_entry["action_name"],
+            diag["primary_cause"],
+        )
+        return event_entry
+
+    def _append_to_disk(self, record: dict) -> None:
+        """Safely append the record to the persistent JSONL audit log with size-rotation."""
+        try:
+            AUDIT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            if AUDIT_LOG_FILE.exists() and AUDIT_LOG_FILE.stat().st_size > MAX_LOG_SIZE_BYTES:
+                # Rotate log
+                backup_file = AUDIT_LOG_DIR / f"unusual_activity_audit.{int(time.time())}.bak"
+                AUDIT_LOG_FILE.rename(backup_file)
+                logger.info("Rotated audit log to %s", backup_file)
+
+            with AUDIT_LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.error("Failed to append audit record to disk: %s", exc)
+
+    def get_recent_events(self, limit: int = 50) -> List[dict]:
+        """Return the most recent audit events."""
+        with self._lock:
+            events = list(self._recent_events)
+        return list(reversed(events[-limit:]))
+
+    def get_audit_summary(self) -> dict:
+        """Compute aggregated diagnostic statistics from audit history."""
+        with self._lock:
+            events = list(self._recent_events)
+            proxies = [rec.to_dict() for rec in self._proxy_records.values()]
+
+        total_events = len(events)
+        now = time.time()
+        last_24h_events = [e for e in events if now - datetime.datetime.fromisoformat(e["timestamp_utc"].replace("Z", "+00:00")).timestamp() <= 86400]
+
+        # Breakdowns
+        by_proxy: Dict[str, int] = collections.defaultdict(int)
+        by_rpc: Dict[str, int] = collections.defaultdict(int)
+        by_worker: Dict[str, int] = collections.defaultdict(int)
+        by_cause: Dict[str, int] = collections.defaultdict(int)
+
+        for e in last_24h_events:
+            p_ip = e.get("proxy", {}).get("ip", "unknown")
+            by_proxy[p_ip] += 1
+            r_id = e.get("rpc_id", "unknown")
+            by_rpc[r_id] += 1
+            w_id = e.get("worker_id", "unknown")
+            by_worker[w_id] += 1
+            cause = e.get("diagnosis", {}).get("primary_cause", "UNKNOWN")
+            by_cause[cause] += 1
+
+        return {
+            "total_incidents_recorded": total_events,
+            "incidents_last_24h": len(last_24h_events),
+            "breakdown_by_proxy_ip_24h": dict(sorted(by_proxy.items(), key=lambda x: -x[1])),
+            "breakdown_by_rpc_24h": dict(sorted(by_rpc.items(), key=lambda x: -x[1])),
+            "breakdown_by_worker_24h": dict(sorted(by_worker.items(), key=lambda x: -x[1])),
+            "breakdown_by_cause_24h": dict(sorted(by_cause.items(), key=lambda x: -x[1])),
+            "proxy_pool_health": proxies,
+            "log_file_path": str(AUDIT_LOG_FILE),
+            "log_file_size_bytes": AUDIT_LOG_FILE.stat().st_size if AUDIT_LOG_FILE.exists() else 0,
+        }
+
+    def clear_in_memory_records(self) -> None:
+        """Clear in-memory ring buffer (for tests or resets)."""
+        with self._lock:
+            self._recent_events.clear()
+
+
+# Global audit singleton
+_audit_manager: Optional[UnusualAuditManager] = None
+
+
+def get_unusual_audit() -> UnusualAuditManager:
+    global _audit_manager
+    if _audit_manager is None:
+        _audit_manager = UnusualAuditManager()
+    return _audit_manager

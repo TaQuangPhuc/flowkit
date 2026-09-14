@@ -1,0 +1,533 @@
+"""Launch vanilla Chrome per nick, with a local auth-injecting proxy bridge."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import time
+from pathlib import Path
+from typing import Optional
+
+import aiohttp
+
+from agent.config import BASE_DIR
+from agent.services.accounts import get_account
+from agent.services.proxy_forward import LocalProxyBridge
+from agent.services.proxy_url import ParsedProxy, ProxyURLError, parse_proxy_url, resolve_known_proxy
+
+
+logger = logging.getLogger(__name__)
+
+_bridges: dict[str, LocalProxyBridge] = {}
+_procs: dict[str, subprocess.Popen] = {}
+
+# ManifestLocation::kUnpacked. Chrome 137+ (Google Chrome 152 here) hard-ignores
+# --load-extension; persisting an unpacked install in Preferences is how a
+# Load unpacked on chrome://extensions survives restarts.
+_UNPACKED_LOCATION = 4
+_CREATION_FLAGS = 38  # REQUIRE_MODERN_MANIFEST_VERSION | ALLOW_FILE_ACCESS | FOLLOW_SYMLINKS
+_WINDOWS_EPOCH_US = 11_644_473_600_000_000
+
+
+def extension_dir() -> Path:
+    return BASE_DIR / "extension"
+
+
+def nick_extension_dir(user_data_dir: Path | str) -> Path:
+    return Path(user_data_dir) / "FlowKitExtension"
+
+
+def _strip_dnr_from_copy(dst: Path) -> None:
+    """Drop static DNR from a nick copy.
+
+    Chrome 152 indexes `declarative_net_request` into `_metadata` only when
+    the user clicks Load unpacked. A seeded copy never gets that file, so
+    chrome://extensions warns: "failed to load properly… intercept network
+    requests." Batch transport signs RPCs in the Flow tab and uses
+    webRequest; the DNR ruleset only rewrites legacy aisandbox-pa headers.
+    """
+    manifest_path = dst / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    changed = False
+    if "declarative_net_request" in manifest:
+        manifest.pop("declarative_net_request", None)
+        changed = True
+    perms = [p for p in (manifest.get("permissions") or []) if p != "declarativeNetRequest"]
+    if perms != list(manifest.get("permissions") or []):
+        manifest["permissions"] = perms
+        changed = True
+    if changed:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    rules = dst / "rules.json"
+    if rules.exists():
+        rules.unlink()
+
+
+def sync_extension_copy(
+    user_data_dir: Path | str, profile_id: str | None = None,
+) -> Path:
+    """Per-nick copy so two Chromes do not share unpacked `_metadata`.
+
+    Profile 1 and nick-a both loading `/home/pc/flowkit/extension` makes
+    Chrome fail DNR indexing: "failed to load properly… intercept network
+    requests."
+    """
+    src = extension_dir().resolve()
+    dst = nick_extension_dir(user_data_dir)
+    if dst.exists():
+        shutil.rmtree(dst)
+
+    def ignore(directory: str, names: list[str]) -> list[str]:
+        return [n for n in names if n in {"_metadata", "__pycache__", ".git"}]
+
+    shutil.copytree(src, dst, ignore=ignore)
+    _strip_dnr_from_copy(dst)
+    if profile_id:
+        (dst / "profile.json").write_text(
+            json.dumps({"profileId": profile_id}) + "\n", encoding="utf-8",
+        )
+        bg = dst / "background.js"
+        if bg.exists():
+            baked = json.dumps(profile_id)
+            text = bg.read_text(encoding="utf-8")
+            updated = text.replace(
+                "const BAKED_PROFILE_ID = null;",
+                f"const BAKED_PROFILE_ID = {baked};",
+                1,
+            )
+            if updated != text:
+                bg.write_text(updated, encoding="utf-8")
+    _bump_copy_version(dst)
+    return dst.resolve()
+
+
+def _bump_copy_version(dst: Path) -> None:
+    """Change unpacked version so Chrome drops a stale service-worker cache.
+
+    Same path + same manifest version keeps the old background.js in
+    ScriptCache even after we overwrite the files on disk.
+    """
+    manifest_path = dst / "manifest.json"
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload = b""
+    for name in ("background.js", "injected.js", "content.js", "profile.json"):
+        path = dst / name
+        if path.exists():
+            payload += path.read_bytes()
+    n = int(hashlib.sha256(payload or b"0").hexdigest()[:7], 16) % 100000
+    base = str(manifest.get("version") or "0.3.0").split(".")
+    major, minor = (base + ["0", "0"])[:2]
+    manifest["version"] = f"{major}.{minor}.{n}"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def unpacked_extension_id(path: Path | str) -> str:
+    """Chrome's path-based ID for an unpacked extension with no manifest key."""
+    digest = hashlib.sha256(str(path).encode("utf-8")).digest()[:16]
+    return "".join(chr(ord("a") + (b >> 4)) + chr(ord("a") + (b & 0xF)) for b in digest)
+
+
+def _chrome_now() -> str:
+    return str(int(time.time() * 1_000_000) + _WINDOWS_EPOCH_US)
+
+
+def _permissions_from_manifest(manifest: dict) -> dict:
+    scriptable = []
+    for cs in manifest.get("content_scripts") or []:
+        scriptable.extend(cs.get("matches") or [])
+    return {
+        "api": list(manifest.get("permissions") or []),
+        "explicit_host": list(manifest.get("host_permissions") or []),
+        "manifest_permissions": [],
+        "scriptable_host": scriptable,
+    }
+
+
+def seed_unpacked_extension(user_data_dir: Path | str, ext_dir: Path | str | None = None) -> str:
+    """Write an unpacked Flow Kit install into a Chrome user-data-dir.
+
+    Google Chrome 152 prints `--load-extension is not allowed` and skips the
+    flag. The same unpacked entry Profile 1 already has (location=4 + path)
+    is what actually loads.
+    """
+    root = Path(user_data_dir)
+    ext = Path(ext_dir) if ext_dir is not None else extension_dir()
+    ext = ext.resolve()
+    manifest_path = ext / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ext_id = unpacked_extension_id(ext)
+    perms = _permissions_from_manifest(manifest)
+    now = _chrome_now()
+    prefs_path = root / "Default" / "Preferences"
+    prefs_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        prefs = json.loads(prefs_path.read_text(encoding="utf-8")) if prefs_path.exists() else {}
+    except json.JSONDecodeError:
+        prefs = {}
+    if not isinstance(prefs, dict):
+        prefs = {}
+    extensions = prefs.setdefault("extensions", {})
+    if not isinstance(extensions, dict):
+        extensions = {}
+        prefs["extensions"] = extensions
+    ui = extensions.setdefault("ui", {})
+    if not isinstance(ui, dict):
+        ui = {}
+        extensions["ui"] = ui
+    ui["developer_mode"] = True
+    settings = extensions.setdefault("settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+        extensions["settings"] = settings
+    shared = str(extension_dir().resolve())
+    for eid, row in list(settings.items()):
+        if eid == ext_id or not isinstance(row, dict):
+            continue
+        path = str(row.get("path") or "")
+        if path == shared or path.rstrip("/").endswith("/flowkit/extension"):
+            settings.pop(eid, None)
+    existing = settings.get(ext_id) if isinstance(settings.get(ext_id), dict) else {}
+    if "declarativeNetRequest" not in (perms.get("api") or []):
+        existing.pop("dnr_static_ruleset", None)
+    existing.pop("service_worker_registration_info", None)
+    settings[ext_id] = {
+        **existing,
+        "active_permissions": perms,
+        "granted_permissions": perms,
+        "creation_flags": _CREATION_FLAGS,
+        "from_webstore": False,
+        "location": _UNPACKED_LOCATION,
+        "path": str(ext),
+        "was_installed_by_default": False,
+        "was_installed_by_oem": False,
+        "was_pinned_by_default": False,
+        "withholding_permissions": False,
+        "newAllowFileAccess": True,
+        "first_install_time": existing.get("first_install_time") or now,
+        "last_update_time": now,
+        "commands": {"_execute_action": {"was_assigned": True}},
+        "service_worker_registration_info": {
+            "version": str(manifest.get("version") or "0.3.0"),
+        },
+    }
+    _drop_extension_sw_cache(root)
+    tmp = prefs_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(prefs) + "\n", encoding="utf-8")
+    tmp.replace(prefs_path)
+    logger.info("seeded unpacked extension id=%s path=%s profile=%s", ext_id, ext, root)
+    return ext_id
+
+
+def _drop_extension_sw_cache(user_data_dir: Path | str) -> None:
+    """Drop compiled SW so a rewritten background.js actually runs.
+
+    ScriptCache without Database leaves Chrome at DidStartWorkerFail : 5
+    (kErrorExists). Wipe both.
+    """
+    sw = Path(user_data_dir) / "Default" / "Service Worker"
+    if sw.exists():
+        shutil.rmtree(sw, ignore_errors=True)
+
+
+def _chrome_bin() -> str:
+    for name in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "google-chrome-unstable",
+    ):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise RuntimeError("no Chrome/Chromium binary on PATH")
+
+
+def chrome_data_dir(nick_id: str) -> Path:
+    root = Path(os.environ.get("FLOW_CHROME_DIR", Path.home() / ".flowkit" / "chrome"))
+    return root / nick_id
+
+
+def chrome_running(nick_id: str) -> bool:
+    proc = _procs.get(nick_id)
+    if proc is None:
+        return False
+    code = proc.poll()
+    if code is None:
+        return True
+    _procs.pop(nick_id, None)
+    return False
+
+
+def running_chrome_proxy_port(nick_id: str) -> Optional[int]:
+    import re
+    data = str(chrome_data_dir(nick_id))
+    try:
+        out = subprocess.check_output(["pgrep", "-af", "chrome"], text=True)
+        for line in out.splitlines():
+            if data in line and "--proxy-server=http://127.0.0.1:" in line:
+                m = re.search(r"--proxy-server=http://127\.0\.0\.1:(\d+)", line)
+                if m:
+                    return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+async def ensure_bridge(nick_id: str, parsed: ParsedProxy, port: int = 0) -> LocalProxyBridge:
+    existing = _bridges.get(nick_id)
+    if existing and existing.upstream == parsed and existing.port:
+        return existing
+    if existing:
+        await existing.stop()
+        _bridges.pop(nick_id, None)
+    if not port:
+        port = running_chrome_proxy_port(nick_id) or 0
+    bridge = LocalProxyBridge(parsed, port=port)
+    await bridge.start()
+    _bridges[nick_id] = bridge
+    return bridge
+
+
+async def stop_bridge(nick_id: str) -> None:
+    bridge = _bridges.pop(nick_id, None)
+    if bridge:
+        await bridge.stop()
+
+
+
+def get_bridge(nick_id: str) -> Optional[LocalProxyBridge]:
+    return _bridges.get(nick_id)
+
+
+async def check_proxy(proxy_url: str) -> dict:
+    resolved = resolve_known_proxy(proxy_url)
+    parsed = parse_proxy_url(resolved)
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://api.ipify.org", proxy=parsed.raw.rstrip("/")) as resp:
+                body = (await resp.text()).strip()
+                if resp.status != 200 or not body:
+                    return {
+                        "ok": False,
+                        "proxy": parsed.redacted,
+                        "error": f"ip lookup HTTP {resp.status}: {body[:200]}",
+                    }
+                return {"ok": True, "proxy": parsed.redacted, "egress_ip": body}
+    except Exception as exc:
+        return {"ok": False, "proxy": parsed.redacted, "error": str(exc)}
+
+
+def _launch_args(
+    nick_id: str,
+    proxy_server: Optional[str],
+    *,
+    local_bridge: bool = False,
+    extension: Optional[str] = None,
+) -> list[str]:
+    data = chrome_data_dir(nick_id)
+    data.mkdir(parents=True, exist_ok=True)
+    extension = extension or str(extension_dir().resolve())
+    args = [
+        _chrome_bin(),
+        f"--user-data-dir={data}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        # Harmless on Google Chrome 152 (it logs "not allowed" and ignores).
+        # Still the right flag for Chromium builds.
+        "--enable-unsafe-extension-debugging",
+        "--disable-features=DisableLoadExtensionCommandLineSwitch",
+        f"--load-extension={extension}",
+        "https://flow.google.com/",
+    ]
+    if proxy_server:
+        extra = [f"--proxy-server={proxy_server}"]
+        # Do NOT add <-loopback>. Chrome already bypasses 127.0.0.1, so the
+        # extension can POST :8100 / WS :9222 in origin-form. Forcing those
+        # through the bridge made uvicorn see `POST http://127.0.0.1:8100/...`
+        # and 404 the netlog that pins r2v.
+        args[1:1] = extra
+    return args
+
+
+async def launch_nick(nick_id: str) -> dict:
+    account = get_account(nick_id)
+    if account is None:
+        raise KeyError(nick_id)
+    if chrome_running(nick_id):
+        return {
+            "ok": True,
+            "id": nick_id,
+            "already_running": True,
+            "pid": _procs[nick_id].pid,
+            "data_dir": str(chrome_data_dir(nick_id)),
+        }
+
+    proxy_server = None
+    proxy_display = ""
+    local_bridge = False
+    if not account.get("proxy_url"):
+        try:
+            from agent.services.proxy_pool import get_next_proxy_for_nick
+            auto_proxy = get_next_proxy_for_nick(nick_id)
+            if auto_proxy:
+                account["proxy_url"] = auto_proxy
+                from agent.services.accounts import upsert_account
+                upsert_account(account)
+                logger.info("Auto-assigned proxy on launch for %s: %s", nick_id, auto_proxy)
+        except Exception as exc:
+            logger.warning("Could not auto-assign proxy on launch for %s: %s", nick_id, exc)
+
+    if account.get("proxy_url"):
+        parsed = parse_proxy_url(account["proxy_url"])
+        proxy_display = parsed.redacted
+        if parsed.has_auth:
+            if parsed.scheme.startswith("socks"):
+                raise ProxyURLError(
+                    "Chrome cannot send SOCKS5 user:pass; use an HTTP proxy "
+                    "like http://user:pass@host:port"
+                )
+            bridge = await ensure_bridge(nick_id, parsed)
+            proxy_server = bridge.listen_url
+            local_bridge = True
+        else:
+            proxy_server = parsed.chrome_server()
+
+    data = chrome_data_dir(nick_id)
+    drop_stale_chrome_lock(data)
+    ext_copy = sync_extension_copy(data, profile_id=nick_id)
+    seed_unpacked_extension(data, ext_copy)
+    args = _launch_args(
+        nick_id,
+        proxy_server,
+        local_bridge=local_bridge,
+        extension=str(ext_copy),
+    )
+    env = os.environ.copy()
+    if not env.get("DISPLAY"):
+        env["DISPLAY"] = ":0"
+    if not env.get("WAYLAND_DISPLAY") and os.path.exists(f"/run/user/{os.getuid()}/wayland-0"):
+        env["WAYLAND_DISPLAY"] = "wayland-0"
+    if not env.get("XDG_RUNTIME_DIR"):
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+    err_path = chrome_data_dir(nick_id) / "chrome.stderr.log"
+    err_f = open(err_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=err_f,
+            start_new_session=True,
+            env=env,
+        )
+    finally:
+        err_f.close()
+    _procs[nick_id] = proc
+    logger.info(
+        "launched Chrome nick=%s pid=%s proxy=%s",
+        nick_id, proc.pid, proxy_display or "none",
+    )
+    await asyncio.sleep(0.4)
+    if proc.poll() is not None:
+        raise RuntimeError(
+            f"Chrome exited immediately (code {proc.returncode}). "
+            "Is a display available?"
+        )
+    return {
+        "ok": True,
+        "id": nick_id,
+        "already_running": False,
+        "pid": proc.pid,
+        "data_dir": str(chrome_data_dir(nick_id)),
+        "proxy": proxy_display,
+        "chrome_proxy": proxy_server,
+    }
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError, OSError):
+        return False
+    comm_end = stat.rfind(")")
+    state = stat[comm_end + 2] if comm_end != -1 and comm_end + 2 < len(stat) else ""
+    return state not in {"", "Z"}
+
+
+def drop_stale_chrome_lock(user_data_dir: Path | str) -> bool:
+    """Remove SingletonLock if its pid is gone or a zombie.
+
+    Chrome treats the lock as 'profile in use'. After Stop, an unreaped
+    child stays a zombie so kill(pid,0) still succeeds and Launch bounces.
+    """
+    data = Path(user_data_dir)
+    lock = data / "SingletonLock"
+    if not lock.exists() and not lock.is_symlink():
+        return False
+    live = False
+    try:
+        target = os.readlink(lock)
+        pid = int(target.rsplit("-", 1)[-1])
+        live = _pid_is_live(pid)
+    except (OSError, ValueError):
+        live = False
+    if live:
+        return False
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            (data / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("could not remove %s", data / name)
+    return True
+
+
+async def stop_nick(nick_id: str) -> bool:
+    proc = _procs.pop(nick_id, None)
+    stopped = False
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.terminate()
+        stopped = True
+        for _ in range(40):
+            if proc.poll() is not None:
+                break
+            await asyncio.sleep(0.1)
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            await asyncio.sleep(0.2)
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    drop_stale_chrome_lock(chrome_data_dir(nick_id))
+    await stop_bridge(nick_id)
+    return stopped
+
+
+def launch_status(nick_id: str) -> dict:
+    proc = _procs.get(nick_id)
+    running = chrome_running(nick_id)
+    bridge = _bridges.get(nick_id)
+    return {
+        "chrome_running": running,
+        "pid": proc.pid if running and proc is not None else None,
+        "data_dir": str(chrome_data_dir(nick_id)),
+        "bridge_port": bridge.port if bridge else None,
+    }

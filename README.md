@@ -170,20 +170,24 @@ A local React dashboard (`dashboard/`) for monitoring and driving the pipeline �
 
 ```
 ┌──────────────────┐     WebSocket      ┌──────────────────────┐     ┌──────────────────┐
-│  Python Agent    │◄──────────────────►│  Chrome Extension     │────►│  flow.google.com │
-│  (FastAPI+SQLite)│    localhost:9222  │  (MV3 Service Worker) │     │  (signed-in tab) │
-│                  │                    │                       │     │                  │
+│  Python Agent    │◄──────────────────►│  Chrome A / nick-a    │────►│  flow.google.com │
+│  (FastAPI+SQLite)│    localhost:9222  │  Chrome B / nick-b    │     │  (one tab each)  │
+│                  │                    │  Chrome C / nick-c    │     │                  │
 │  - REST API :8100│  ── envelopes ──►  │  - reCAPTCHA mint     │     │  batchexecute    │
 │  - Queue worker  │  ◄── responses ──  │  - runs the RPC in    │     │  cookie + `at`   │
-│  - Post-process  │                    │    the page's world   │     │                  │
-│  - SQLite DB     │                    │                       │     │                  │
+│  - nick router   │                    │    that nick's page   │     │                  │
 └──────────────────┘                    └──────────────────────┘     └──────────────────┘
 ```
+
+Callers (Nova included) still hit **one** URL on `:8100`. Behind it the agent
+picks the least-busy Chrome nick, rewrites the RPC onto **that nick's** Flow
+project, and pins poll / get_media / i2v-after-upload to the nick that created
+the media. Failover across nicks is unpinned-only.
 
 Flow signs every call with the session cookie plus a per-page `at` token, and a
 generate also carries a single-use reCAPTCHA. None of that can be replayed from
 outside the browser, so the agent builds the request and the **page** issues it.
-One signed-in Flow tab has to stay open; nothing here works headless.
+Each nick needs a signed-in Flow tab; nothing here works headless.
 
 > **September 2026 — Flow moved.** It now lives at `flow.google.com` and the old
 > `aisandbox-pa.googleapis.com` REST API has no caller: the `Bearer ya29.…` it
@@ -239,10 +243,30 @@ You can also pass `flow_project_id` per project on `POST /api/projects`.
 
 | Env var | Default | What it does |
 |---------|---------|--------------|
-| `FLOW_PROJECT_ID` | — | The Flow project every RPC is scoped to. Required. |
+| `FLOW_PROJECT_ID` | — | Fallback Flow project when a nick has not reported one. Required for single-nick. |
 | `USE_BATCH_RPC` | `1` | `0` falls back to the pre-migration REST path (dead auth). |
 | `FLOW_ALLOW_DEGRADED` | `0` | `1` lets scene chaining and r2v fall back to plain i2v instead of failing. |
 | `DEFAULT_PAYGATE_TIER` | `PAYGATE_TIER_TWO` | Carried for the DB and dashboard; no longer selects a model. |
+| `PROFILE_MAX_CONCURRENT` | `2` | In-flight RPCs allowed per Chrome nick. |
+| `FLOW_PROFILES_FILE` | `agent/profiles.json` | Nick id → Flow `project_id` pins. Empty `project_id` is learned from the tab URL. |
+
+### Three Chrome nicks (one API)
+
+Nova and the pipeline keep calling `http://127.0.0.1:8100`. To run three Google accounts at once:
+
+1. Put each nick in `agent/profiles.json` (`nick-a` / `nick-b` / `nick-c`) and paste that account's Flow project uuid, or leave it blank and open `/project/<uuid>` in that Chrome.
+2. Launch one vanilla Chrome per nick, each with its own sticky residential proxy (same country as the account; do not rotate):
+
+```bash
+scripts/flow-chrome.sh nick-a socks5://USER:PASS@HOST1:PORT
+scripts/flow-chrome.sh nick-b socks5://USER:PASS@HOST2:PORT
+scripts/flow-chrome.sh nick-c socks5://USER:PASS@HOST3:PORT
+```
+
+3. In each Chrome: load the unpacked `extension/`, set **Nick** in the popup to `nick-a` / `nick-b` / `nick-c`, sign in to Flow, leave the project tab open.
+4. `curl http://127.0.0.1:8100/health` should list three `workers`. `flow_key_present: false` is still expected.
+
+Do not bind `:8100` on a public interface. Each nick's Chrome must be able to reach `127.0.0.1:8100` and `:9222` (`--proxy-bypass-list=<-loopback>` is already in the launcher).
 
 ### What does not work on the new API yet
 
@@ -256,6 +280,8 @@ Three capabilities have no captured payload, so they fail with
 | Omni Flash (`model_family=omni_flash`) | unported | use `model_family=veo` |
 
 Reference-to-video (r2v) is ported: `POST /api/flow/generate-video-refs` goes through Flow's StreamChat path with recaptcha action `CHAT_GENERATION`.
+
+Text-to-video (t2v) is ported: `POST /api/flow/generate-video` without `start_image_media_id` uses rpcid `YhhmEf` (`veo_3_1_t2v_lite_low_priority`). Passing a start image still runs i2v (`eb1hJf`).
 
 Restoring one starts with a capture, not a guess: [`docs/CAPTURE.md`](docs/CAPTURE.md).
 
@@ -604,6 +630,7 @@ Or just run `/fk-change-provider` for an interactive picker. Full details in `sk
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health` | Server + extension status |
+| Nova adapter | [`docs/NOVA_INTEGRATION.md`](docs/NOVA_INTEGRATION.md) — one-URL gate (`image` / t2v / i2v / r2v). Do not copy this repo into Nova. |
 | `GET /api/flow/status` | Extension connection details |
 | `GET /api/flow/credits` | User credits + tier |
 | `GET /api/requests/pending` | Pending request queue |
@@ -665,6 +692,8 @@ Materials control both entity `image_prompt` style and scene `scene_prefix`. Exa
 | `MAX_RETRIES` | `5` | Max retries per request |
 | `VIDEO_POLL_TIMEOUT` | `420` | Video gen poll timeout (seconds) |
 | `API_COOLDOWN` | `10` | Seconds between API calls (anti-spam) |
+| `PROFILE_MAX_CONCURRENT` | `2` | Max in-flight RPCs per Chrome nick |
+| `FLOW_PROFILES_FILE` | `agent/profiles.json` | Multi-nick id → Flow project pins |
 
 ## Architecture
 

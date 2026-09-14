@@ -1,5 +1,7 @@
 # Flow Kit
 
+> **Handoff Guide**: Đọc tài liệu bàn giao kỹ thuật & kiến trúc tại [docs/PROJECT_HANDOFF.md](docs/PROJECT_HANDOFF.md).
+
 Base URL: `http://127.0.0.1:8100`
 
 ## Pre-flight
@@ -12,8 +14,13 @@ curl -s http://127.0.0.1:8100/api/flow/status
 # Must return: {"transport": "batch", "flow_project_id": "<uuid>", ...}
 ```
 
-Also needed: **one signed-in `https://flow.google.com/` tab left open**. Only the
-page can sign a Flow request, so nothing works headless.
+Also needed: **one signed-in `https://flow.google.com/` tab left open** per
+Chrome nick. Only the page can sign a Flow request, so nothing works headless.
+
+Three nicks share this same `:8100` URL. The agent picks the least-busy Chrome,
+rewrites the RPC onto **that nick's** Flow project, and pins poll/get_media/i2v
+to the nick that created the operation. Set `agent/profiles.json` and launch
+with `scripts/flow-chrome.sh <nick> [socks5://…]`. `/health` lists `workers`.
 
 ## How to work
 
@@ -34,7 +41,9 @@ that change how you work:
   4K upscale, start+end-frame chaining, and Omni Flash. They fail with
   `UNSUPPORTED_ON_BATCH_API` rather than silently producing the wrong thing.
   `FLOW_ALLOW_DEGRADED=1` drops chaining to plain i2v; upscale has no
-  fallback. r2v is ported (StreamChat + `CHAT_GENERATION`). To restore an
+  fallback. r2v is ported (StreamChat + `CHAT_GENERATION`). t2v is ported
+  (`YhhmEf`; omit `start_image_media_id` on `POST /api/flow/generate-video`).
+  To restore an
   unported call properly, see `docs/CAPTURE.md`.
 - **A poll saying "Media not found." is not a failure.** Finished jobs report it.
 

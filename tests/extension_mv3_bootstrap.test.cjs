@@ -64,9 +64,13 @@ const chrome = {
     query: async () => [],
     sendMessage: async () => {},
     update: async () => {},
+    onUpdated: event(),
   },
   webRequest: {
     onBeforeSendHeaders: event(),
+    onBeforeRequest: event(),
+    onCompleted: event(),
+    onErrorOccurred: event(),
   },
 };
 

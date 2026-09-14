@@ -236,7 +236,7 @@ VOICE_PROFILES = {
         "id": "female_north",
         "label": "Nữ Miền Bắc",
         "badge": "👩 Nữ Miền Bắc (Thanh lịch)",
-        "tone_desc": "Giọng nữ miền Bắc chuẩn phát thanh, thanh lịch, nhẹ nhàng, tự nhiên (dùng từ: 'nhé', 'ạ', 'chị em ơi', 'cực kỳ').",
+        "tone_desc": "Giọng nữ miền Bắc chuẩn phát thanh, thanh lịch, nhẹ nhàng, tự nhiên (dùng từ: 'nhé', 'ạ', 'mọi người ơi', 'chị em ơi', 'cực kỳ').",
         "veo_prompt": "natural Vietnamese female Northern accent, clear sweet articulating voice",
         "edge_voice": "vi-VN-HoaiMyNeural",
         "rate": "+0%"
@@ -245,7 +245,7 @@ VOICE_PROFILES = {
         "id": "female_south",
         "label": "Nữ Miền Nam",
         "badge": "👩 Nữ Miền Nam (Ngọt ngào)",
-        "tone_desc": "Giọng nữ miền Nam ngọt ngào, gần gũi, duyên dáng, thân thiện chuẩn reviewer TikTok (dùng từ: 'nè', 'nghen', 'thiệt sự luôn á', 'mấy bà ơi', 'mê xỉu').",
+        "tone_desc": "Giọng nữ miền Nam ngọt ngào, gần gũi, duyên dáng, thân thiện chuẩn reviewer TikTok (dùng từ: 'nè', 'nghen', 'thiệt sự luôn á', 'cả nhà ơi', 'mọi người ơi').",
         "veo_prompt": "natural Vietnamese female Southern accent, lively sweet warm friendly voice",
         "edge_voice": "vi-VN-HoaiMyNeural",
         "rate": "+5%"
@@ -254,7 +254,7 @@ VOICE_PROFILES = {
         "id": "male_north",
         "label": "Nam Miền Bắc",
         "badge": "👨 Nam Miền Bắc (Trầm ấm)",
-        "tone_desc": "Giọng nam miền Bắc trầm ấm, uy tín, chững chạc, dứt khoát (dùng từ: 'nhé', 'chắc chắn', 'anh em', 'chuẩn xác').",
+        "tone_desc": "Giọng nam miền Bắc trầm ấm, uy tín, chững chạc, dứt khoát (dùng từ: 'nhé', 'anh em ơi', 'các bác ơi', 'chuẩn xác', 'cực kỳ').",
         "veo_prompt": "natural Vietnamese male Northern accent, confident deep warm authoritative voice",
         "edge_voice": "vi-VN-NamMinhNeural",
         "rate": "+0%"
@@ -263,7 +263,7 @@ VOICE_PROFILES = {
         "id": "male_south",
         "label": "Nam Miền Nam",
         "badge": "👨 Nam Miền Nam (Hào sảng)",
-        "tone_desc": "Giọng nam miền Nam hào sảng, phóng khoáng, thân thiện, năng động chuẩn reviewer (dùng từ: 'nè', 'nha anh em', 'thiệt tình', 'siêu êm').",
+        "tone_desc": "Giọng nam miền Nam hào sảng, phóng khoáng, thân thiện, năng động chuẩn reviewer (dùng từ: 'nè', 'anh em ơi', 'cả nhà ơi', 'thiệt tình', 'siêu êm').",
         "veo_prompt": "natural Vietnamese male Southern accent, dynamic friendly enthusiastic voice",
         "edge_voice": "vi-VN-NamMinhNeural",
         "rate": "+5%"
@@ -307,29 +307,62 @@ def generate_edge_tts(text: str, output_path: Path, voice: str = "vi-VN-HoaiMyNe
         print(f"Edge-TTS synthesis error: {e}")
         return False
 
-def mux_tts_to_video(video_path: Path, tts_path: Path, output_path: Path = None) -> bool:
-    """Mux Edge-TTS audio track with video clip into an MP4 container."""
+def get_media_duration(path: Path) -> float:
+    """Get exact duration of video or audio file using ffprobe."""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+        out = subprocess.check_output(cmd, timeout=10).decode().strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+def mux_tts_to_video(video_path: Path, tts_path: Path, output_path: Path = None, target_duration: float = None) -> bool:
+    """Mux Edge-TTS audio track with video clip into an MP4 container, replacing any existing audio.
+    Synchronizes audio tempo to fit within video duration with a clean buffer (>=0.7s) before scene transition,
+    adds natural lead-in delay, and pads audio so video is never truncated."""
     if not video_path.exists() or not tts_path.exists():
         return False
     dest = output_path or video_path
     tmp_out = video_path.parent / f"tmp_mux_{video_path.name}"
     try:
+        vid_dur = get_media_duration(video_path)
+        if vid_dur <= 0.0:
+            vid_dur = float(target_duration or 8.0)
+        tts_dur = get_media_duration(tts_path)
+
+        # Natural lead-in delay (120ms) so creator speech does not start abruptly on frame 0 during visual transition
+        lead_in_s = 0.12
+        lead_in_ms = int(lead_in_s * 1000)
+
+        # Video crossfade in smart_concat_videos starts at (vid_dur - 0.50s).
+        # We ensure dialogue finishes comfortably at least 0.20s before crossfade starts (total buffer: 0.70s + lead_in).
+        target_speech_dur = max(1.0, vid_dur - 0.70 - lead_in_s)
+        if tts_dur > target_speech_dur:
+            speed_factor = min(1.45, max(1.0, tts_dur / target_speech_dur))
+            afilter = f"adelay={lead_in_ms}|{lead_in_ms},atempo={speed_factor:.4f},apad"
+        else:
+            afilter = f"adelay={lead_in_ms}|{lead_in_ms},apad"
+
+        # Explicitly map video from 0:v:0 and audio from [aout] (from input 1, stripping any original video audio)
         cmd = [
             "ffmpeg", "-y",
             "-i", str(video_path),
             "-i", str(tts_path),
+            "-filter_complex", f"[1:a]{afilter}[aout]",
+            "-map", "0:v:0",
+            "-map", "[aout]",
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "192k",
-            "-shortest",
+            "-t", f"{vid_dur:.3f}",
             str(tmp_out)
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if res.returncode == 0 and tmp_out.exists() and tmp_out.stat().st_size > 1000:
             tmp_out.replace(dest)
             return True
         else:
-            print(f"[TVC MUX] Warning muxing TTS: {res.stderr[:200]}")
+            print(f"[TVC MUX] Warning muxing TTS: {res.stderr[:250]}")
     except Exception as e:
         print(f"[TVC MUX] Error muxing TTS to video: {e}")
     finally:
@@ -339,6 +372,212 @@ def mux_tts_to_video(video_path: Path, tts_path: Path, output_path: Path = None)
             except Exception:
                 pass
     return False
+
+def determine_product_persona(
+    product_name: str,
+    product_category: str = "",
+    highlights: str = "",
+    voice_key: str = "female_north",
+    model_gender: str = ""
+) -> dict:
+    """Analyze product details and voice persona to determine target demographic,
+    appropriate conversational opening hooks, strict forbidden words, and semantic replacements."""
+    combined_text = f"{product_name} {product_category} {highlights}".lower()
+
+    # Detect unisex / dual-gender keywords
+    unisex_keywords = [
+        "unisex", "nam nữ", "nam va nu", "nam và nữ", "cặp đôi", "cho cả nam",
+        "đôi nam nữ", "thích hợp cho cả nam", "phù hợp cho cả nam", "cả nam lẫn nữ"
+    ]
+    is_unisex_product = any(k in combined_text for k in unisex_keywords)
+
+    # Strictly male grooming tools (even if title adds 'cho nam nữ')
+    male_grooming_keywords = [
+        "cạo râu", "dao cạo", "bàn cạo râu", "máy cạo râu", "lưỡi cạo", "tông đơ",
+        "kem cạo râu", "bọt cạo râu", "dung dịch vệ sinh nam", "bọt vệ sinh nam",
+        "quần sịp", "quần lót nam", "pomade"
+    ]
+    is_strictly_male_groom = any(k in combined_text for k in male_grooming_keywords)
+
+    # General male-targeted keywords
+    male_keywords = [
+        "sáp vuốt tóc", "wax vuốt tóc", "gel vuốt tóc", "nước hoa nam",
+        "áo thun nam", "sơ mi nam", "quần âu nam", "thắt lưng nam", "ví nam", "cà vạt",
+        "ví da nam", "giày da nam", "vest nam", "cho nam giới", "dành cho nam", "nam giới", "phái mạnh"
+    ]
+
+    # Detect female-targeted product
+    female_keywords = [
+        "son môi", "son dưỡng", "kem nền", "cushion", "chì kẻ mày", "mascara",
+        "nước tẩy trang", "kem chống nắng", "serum dưỡng trắng", "mặt nạ dưỡng da",
+        "băng vệ sinh", "dung dịch vệ sinh phụ nữ", "nước hoa nữ", "váy", "đầm", "chân váy",
+        "áo ngực", "bra", "quần lót nữ", "túi xách nữ", "guốc", "giày cao gót",
+        "dành cho nữ", "phụ nữ", "chị em", "bạn nữ"
+    ]
+
+    is_male_product = is_strictly_male_groom or (any(k in combined_text for k in male_keywords) and not is_unisex_product)
+    is_female_product = any(k in combined_text for k in female_keywords) and not is_male_product and not is_unisex_product
+
+    # Speaker voice characteristics
+    is_male_voice = voice_key.startswith("male_") or (model_gender and model_gender.lower() == "male")
+    is_northern = "north" in voice_key
+    is_southern = "south" in voice_key
+
+    forbidden_words = []
+    recommended_openers = []
+    guidance_lines = []
+    replacements = {}
+
+    if is_male_voice:
+        target_persona = "male_speaker"
+        recommended_openers = ["Anh em ơi", "Các bác ơi", "Mọi người ơi", "Cả nhà ơi", "Chào anh em nha"]
+        forbidden_words = ["mấy bà ơi", "mấy bà nè", "mấy bà", "chị em ơi", "bà nào", "mê xỉu", "cưng xỉu"]
+        replacements = {
+            "mấy bà ơi": "Anh em ơi",
+            "mấy bà nè": "Anh em nè",
+            "mấy bà": "anh em",
+            "chị em ơi": "Anh em ơi",
+            "chị em": "anh em",
+            "bà nào": "bác nào",
+            "mê xỉu": "mê ly",
+            "cưng xỉu": "quá ưng",
+            "xỉu up xỉu down": "cực kỳ ưng ý",
+        }
+        guidance_lines.append("NGƯỜI NÓI LÀ NAM GIỚI: Phong thái nam tính, chững chạc, uy tín, tự nhiên.")
+        guidance_lines.append("TUYỆT ĐỐI KHÔNG DÙNG CÁC TỪ NỮ TÍNH: 'mấy bà ơi', 'chị em ơi', 'mê xỉu', 'cưng xỉu'!")
+        guidance_lines.append("BẮT BUỘC MỞ ĐẦU BẰNG: 'Anh em ơi', 'Các bác ơi', 'Mọi người ơi', hoặc 'Cả nhà ơi'.")
+    elif is_male_product:
+        target_persona = "female_speaking_male_product"
+        if is_northern:
+            recommended_openers = [
+                "Mọi người ơi", "Anh em ơi", "Các bác ơi", "Cả nhà ơi",
+                "Chị em nào đang tìm quà cho người yêu hay chồng thì xem ngay nhé"
+            ]
+            forbidden_words = ["mấy bà ơi", "mấy bà nè", "mấy bà", "bà nào", "mê xỉu", "cưng xỉu", "nghen", "thiệt sự luôn á"]
+            replacements = {
+                "mấy bà ơi": "Mọi người ơi",
+                "mấy bà nè": "Cả nhà nè",
+                "mấy bà": "mọi người",
+                "bà nào": "ai",
+                "mê xỉu": "thích mê",
+                "cưng xỉu": "siêu ưng",
+                "nghen": "nhé",
+                "thiệt sự luôn á": "thực sự luôn nhé",
+                "thiệt tình": "thực sự",
+            }
+            guidance_lines.append("SẢN PHẨM DÀNH CHO NAM GIỚI (hoặc chăm sóc cá nhân cho nam): Người nói là Nữ Miền Bắc.")
+            guidance_lines.append("TUYỆT ĐỐI KHÔNG DÙNG 'mấy bà ơi' (đây là sản phẩm nam, xưng hô 'mấy bà ơi' gây sai lệch hoàn toàn đối tượng sử dụng)!")
+            guidance_lines.append("TUYỆT ĐỐI KHÔNG DÙNG từ lóng miền Nam: 'mấy bà ơi', 'mê xỉu', 'nghen', 'thiệt sự luôn á'.")
+            guidance_lines.append("MỞ ĐẦU PHÙ HỢP: 'Mọi người ơi', 'Anh em ơi', 'Các bác ơi', hoặc góc nhìn quà tặng: 'Chị em nào đang tìm quà cho người yêu hay chồng thì xem ngay nhé'.")
+        else: # southern
+            recommended_openers = [
+                "Mọi người ơi", "Anh em ơi", "Cả nhà ơi",
+                "Chị em nào đang tìm quà cho bạn trai hay ông xã thì xem ngay nha"
+            ]
+            forbidden_words = ["mấy bà ơi", "mấy bà nè", "mấy bà", "bà nào"]
+            replacements = {
+                "mấy bà ơi": "Mọi người ơi",
+                "mấy bà nè": "Cả nhà nè",
+                "mấy bà": "mọi người",
+                "bà nào": "ai",
+                "mê xỉu": "mê lắm nha",
+                "cưng xỉu": "cưng lắm nha",
+            }
+            guidance_lines.append("SẢN PHẨM DÀNH CHO NAM GIỚI: Người nói là Nữ Miền Nam.")
+            guidance_lines.append("TUYỆT ĐỐI KHÔNG DÙNG 'mấy bà ơi'!")
+            guidance_lines.append("MỞ ĐẦU PHÙ HỢP: 'Mọi người ơi', 'Anh em ơi', 'Cả nhà ơi', hoặc 'Chị em nào đang tìm quà tặng bạn trai hay ông xã thì xem ngay nha'.")
+    elif is_female_product:
+        target_persona = "female_speaking_female_product"
+        if is_northern:
+            recommended_openers = ["Chị em ơi", "Mọi người ơi", "Các bác ơi", "Cả nhà ơi"]
+            forbidden_words = ["mấy bà ơi", "mấy bà nè", "mấy bà", "nghen", "thiệt sự luôn á"]
+            replacements = {
+                "mấy bà ơi": "Chị em ơi",
+                "mấy bà nè": "Chị em nè",
+                "mấy bà": "chị em",
+                "nghen": "nhé",
+                "thiệt sự luôn á": "thực sự luôn nhé",
+            }
+            guidance_lines.append("SẢN PHẨM DÀNH CHO NỮ GIỚI: Người nói là Nữ Miền Bắc thanh lịch.")
+            guidance_lines.append("TUYỆT ĐỐI KHÔNG DÙNG tiếng lóng miền Nam: 'mấy bà ơi', 'nghen', 'thiệt sự luôn á'.")
+            guidance_lines.append("MỞ ĐẦU PHÙ HỢP: 'Chị em ơi', 'Mọi người ơi', 'Các bác ơi', 'Cả nhà ơi'.")
+        else:
+            recommended_openers = ["Mọi người ơi", "Cả nhà ơi", "Chị em ơi", "Mấy bà ơi"]
+            forbidden_words = []
+            replacements = {}
+            guidance_lines.append("SẢN PHẨM DÀNH CHO NỮ GIỚI: Người nói là Nữ Miền Nam ngọt ngào.")
+            guidance_lines.append("MỞ ĐẦU PHÙ HỢP: 'Mọi người ơi', 'Cả nhà ơi', 'Chị em ơi', hoặc 'Mấy bà ơi'.")
+    else: # unisex / general
+        target_persona = "general_product"
+        if is_northern:
+            recommended_openers = ["Mọi người ơi", "Cả nhà ơi", "Các bác ơi", "Các bạn ơi"]
+            forbidden_words = ["mấy bà ơi", "mấy bà nè", "mấy bà", "nghen", "thiệt sự luôn á"]
+            replacements = {
+                "mấy bà ơi": "Mọi người ơi",
+                "mấy bà nè": "Mọi người nè",
+                "mấy bà": "mọi người",
+                "bà nào": "ai",
+                "nghen": "nhé",
+                "thiệt sự luôn á": "thực sự luôn nhé",
+            }
+            guidance_lines.append("SẢN PHẨM ĐA DỤNG / TIỆN ÍCH CHUNG: Người nói là Nữ Miền Bắc.")
+            guidance_lines.append("TUYỆT ĐỐI KHÔNG DÙNG: 'mấy bà ơi', 'nghen', 'thiệt sự luôn á'.")
+            guidance_lines.append("MỞ ĐẦU PHÙ HỢP: 'Mọi người ơi', 'Cả nhà ơi', 'Các bác ơi', 'Các bạn ơi'.")
+        else:
+            recommended_openers = ["Mọi người ơi", "Cả nhà ơi", "Các bạn ơi"]
+            forbidden_words = ["mấy bà ơi", "mấy bà nè", "mấy bà"]
+            replacements = {
+                "mấy bà ơi": "Mọi người ơi",
+                "mấy bà nè": "Mọi người nè",
+                "mấy bà": "mọi người",
+                "bà nào": "ai",
+            }
+            guidance_lines.append("SẢN PHẨM ĐA DỤNG / TIỆN ÍCH CHUNG: Người nói là Nữ Miền Nam.")
+            guidance_lines.append("KHÔNG DÙNG 'mấy bà ơi' để tránh thu hẹp tệp khách hàng đại chúng.")
+            guidance_lines.append("MỞ ĐẦU PHÙ HỢP: 'Mọi người ơi', 'Cả nhà ơi', 'Các bạn ơi'.")
+
+    return {
+        "target_persona": target_persona,
+        "is_male_product": is_male_product,
+        "is_female_product": is_female_product,
+        "is_unisex_product": is_unisex_product,
+        "recommended_openers": recommended_openers,
+        "forbidden_words": forbidden_words,
+        "replacements": replacements,
+        "guidance": "\n".join(guidance_lines)
+    }
+
+def apply_persona_replacements(text: str, replacements: dict) -> str:
+    """Apply semantic keyword replacements according to persona rules."""
+    if not text or not replacements:
+        return text
+    result = text
+    for word, rep in replacements.items():
+        if word.lower() in result.lower():
+            pattern = re.compile(re.escape(word), re.IGNORECASE)
+            result = pattern.sub(rep, result)
+    return result
+
+def sync_dialogue_to_motion_prompt(motion_prompt: str, dialogue: str, veo_voice_prompt: str = "") -> str:
+    """Ensure the 'Say: ...' clause inside video_motion_prompt precisely matches the spoken audio dialogue,
+    locking lip synchronization between AI video rendering and Edge-TTS voiceover."""
+    if not motion_prompt:
+        return motion_prompt
+    clean_dlg = (dialogue or "").strip().replace('"', "'").replace('\\', '')
+    if not clean_dlg:
+        return motion_prompt
+
+    replacement = f'Say: \\"{clean_dlg}\\"'
+    pattern_escaped = re.compile(r'Say:\s*\\\"(.*?)\\\"', re.DOTALL | re.IGNORECASE)
+    pattern_unescaped = re.compile(r'Say:\s*\"(.*?)\"', re.DOTALL | re.IGNORECASE)
+
+    if pattern_escaped.search(motion_prompt):
+        return pattern_escaped.sub(lambda m: replacement, motion_prompt, count=1)
+    elif pattern_unescaped.search(motion_prompt):
+        return pattern_unescaped.sub(lambda m: replacement, motion_prompt, count=1)
+    else:
+        voice_clause = f" in {veo_voice_prompt}" if veo_voice_prompt else ""
+        return f'{motion_prompt.rstrip()} Say: \\"{clean_dlg}\\"{voice_clause}.'
 
 def rotate_profile_proxy(nick_id: str = "nick-a") -> dict:
     """Call FlowKit API to explicitly rotate proxy for a nick."""
@@ -464,11 +703,21 @@ def sanitize_safety_content(text: str) -> str:
     s = re.sub(r"\bthrust(?:s|ing)?\b", "move", s, flags=re.IGNORECASE)
     s = re.sub(r"\bgroan(?:s|ing)?\b|\bmoan(?:s|ing)?\b", "speak", s, flags=re.IGNORECASE)
 
-    # 3. Age & Identity Normalization (Enforce mature adult context)
+    # 3. Revealing Attire Normalization (Prevent Grok Video false-positive NSFW blocks)
+    s = re.sub(r"\b(?:halter\s+top|crop\s+top|halter\s+crop\s+top|halterneck)\b", "sporty crewneck top", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b(?:low-rise|booty|mini|short)\s+shorts?\b", "athletic shorts", s, flags=re.IGNORECASE)
+    s = re.sub(r"\blow-rise\b", "mid-rise", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b(?:bare\s+midriff|exposed\s+midriff|belly\s+button)\b", "covered midriff", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b(?:sexy|sensual|seductive|revealing)\b", "stylish", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b(?:bikini|lingerie|underwear|undergarment)\b", "casual attire", s, flags=re.IGNORECASE)
+
+    # 4. Age & Identity Normalization (Enforce mature adult context)
     s = re.sub(r"\b(?:teen(?:ager)?|teen\s+girl|schoolgirl|little\s+girl|young\s+girl|underage)\b", "young adult woman", s, flags=re.IGNORECASE)
     s = re.sub(r"\b(?:schoolboy|little\s+boy|young\s+boy)\b", "young adult man", s, flags=re.IGNORECASE)
 
-    # 4. Vietnamese Safety Normalization
+    # 5. Vietnamese Safety Normalization
+    s = re.sub(r"\b(?:siêu\s+hot|quá\s+hot|cực\s+hot|cực\s+cháy)\b", "siêu xịn", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bhot\b", "xịn", s, flags=re.IGNORECASE)
     s = re.sub(r"khóa kéo mở bung", "thiết kế mở hé lộ", s, flags=re.IGNORECASE)
     s = re.sub(r"kéo khóa", "mở túi", s, flags=re.IGNORECASE)
     s = re.sub(r"khe hở|khe xẻ", "đường viền", s, flags=re.IGNORECASE)
@@ -712,7 +961,8 @@ def batch_poll_videos_flowkit(
                     urllib.request.urlretrieve(fife, str(clip_path))
                     tts_file = job_dir / f"tts_{scene_idx}.mp3"
                     if tts_file.exists() and tts_file.stat().st_size > 500:
-                        mux_tts_to_video(clip_path, tts_file)
+                        job_dur = (JOBS.get(job_id) or {}).get("scene_duration", 8)
+                        mux_tts_to_video(clip_path, tts_file, target_duration=job_dur)
                     completed_clips[scene_idx] = clip_path
                     del active_ops[scene_idx]
                     if on_clip_done:
@@ -900,7 +1150,7 @@ def ai_fix_scene_prompt(
         "Your task is to sanitize, polish, and rewrite the prompt so it complies 100% with G-Rated Commercial Broadcast Standards while keeping the marketing appeal and product focus.\n\n"
         "CRITICAL RULES:\n"
         "1. VISUAL/MOTION: Rewrite 'fixed_motion_prompt' in concise professional English only. Avoid physical contact near chest, hips, waist, or clothes zippers. Replace with elegant commercial host gestures (e.g. 'standing upright in luxury showroom, neatly presenting product on display stage with warm welcoming smile').\n"
-        "2. DIALOGUE: Ensure 'fixed_dialogue' is in natural, polite Vietnamese matching the duration (~20-25 words), no awkward phrasing.\n"
+        "2. DIALOGUE: Ensure 'fixed_dialogue' is in natural, polite Vietnamese matching the duration (~20-24 words for 8s, ~10-12 words for 4s). Never use 'mấy bà ơi' for male products or male voices; use 'Anh em ơi', 'Mọi người ơi', 'Các bác ơi'.\n"
         "3. EXPLANATION: Provide a short, friendly 1-sentence explanation in Vietnamese explaining what you sanitized and improved.\n"
         "4. Output STRICT JSON:\n"
         "{\n"
@@ -1185,7 +1435,7 @@ def smart_concat_videos(
 
         if len(valid_clips) == 1:
             c = valid_clips[0]
-            if target_duration and target_duration < 8.0:
+            if target_duration and durations[0] > float(target_duration):
                 subprocess.run(["ffmpeg", "-y", "-i", str(c), "-t", str(target_duration), "-c", "copy", str(temp_concat)], check=True)
             else:
                 subprocess.run(["ffmpeg", "-y", "-i", str(c), "-c", "copy", str(temp_concat)], check=True)
@@ -1198,10 +1448,9 @@ def smart_concat_videos(
             filter_parts = []
             for i, dur in enumerate(durations):
                 start_t = 0.0 if i == 0 else trim_start_s
-                if target_duration and target_duration < 8.0:
-                    end_t = min(dur, start_t + target_duration)
-                else:
-                    end_t = dur if i == len(durations) - 1 else (dur - trim_end_s)
+                clip_limit = float(target_duration) if target_duration else dur
+                effective_dur = min(dur, clip_limit)
+                end_t = effective_dur if i == len(durations) - 1 else max(1.0, effective_dur - trim_end_s)
                 eff_len = max(1.0, end_t - start_t)
                 eff_lens.append(eff_len)
 
@@ -1252,7 +1501,7 @@ def smart_concat_videos(
                 "-i", str(temp_concat),
                 "-i", str(bgm_path),
                 "-filter_complex",
-                "[1:a]aloop=loop=-1:size=2e+09[bgm_loop];[bgm_loop]volume=0.12[bgm_vol];[0:a][bgm_vol]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                "[1:a]aloop=loop=-1:size=2e+09[bgm_loop];[bgm_loop]volume=0.10[bgm_vol];[0:a][bgm_vol]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-c:v", "copy",
@@ -1336,13 +1585,16 @@ def run_pipeline_worker(job_id: str):
         bgm_label=bgm_info["label"]
     )
 
-    # Word Count Rules according to duration
-    if scene_duration == 4:
-        word_count_rule = "EXACTLY between 13 to 16 Vietnamese words"
-    elif scene_duration == 6:
-        word_count_rule = "EXACTLY between 21 to 25 Vietnamese words"
-    else: # 8s
-        word_count_rule = "EXACTLY between 34 to 36 Vietnamese words"
+    # Word Count Rules according to duration (natural Vietnamese speaking speed is ~2.8-3.0 words/s)
+    # Dialogue must comfortably conclude before the scene transition window (at scene_duration - 0.7s)
+    if scene_duration <= 4:
+        word_count_rule = "EXACTLY between 8 to 10 Vietnamese words (nói vừa vặn trong ~2.8s, TUYỆT ĐỐI KHÔNG vượt quá 10 từ)"
+    elif scene_duration <= 6:
+        word_count_rule = "EXACTLY between 13 to 16 Vietnamese words (nói vừa vặn trong ~4.8s, TUYỆT ĐỐI KHÔNG vượt quá 16 từ)"
+    elif scene_duration <= 8:
+        word_count_rule = "EXACTLY between 18 to 22 Vietnamese words (nói tự nhiên vừa vặn trong ~6.5s, TUYỆT ĐỐI KHÔNG vượt quá 22 từ)"
+    else: # 10s+
+        word_count_rule = f"EXACTLY between 23 to 27 Vietnamese words (nói tự nhiên vừa vặn trong ~{scene_duration - 1.5:.1f}s, TUYỆT ĐỐI KHÔNG vượt quá 27 từ)"
 
     try:
         # ─── GIAI ĐOẠN 0: ZERO-KNOWLEDGE PROFILER (AI VISION) ────────
@@ -1589,6 +1841,28 @@ Extract exact details and return a strict JSON object with:
 
         update_job(job_id, profile=profile_data)
 
+        # Build persona rules & audience guidance
+        model_data = profile_data.get("model", {}) if isinstance(profile_data.get("model"), dict) else {}
+        model_gender = model_data.get("gender", "")
+        persona_info = determine_product_persona(
+            product_name=product_name or "",
+            product_category=profile_data.get("product", {}).get("category", ""),
+            highlights=product_highlights or "",
+            voice_key=voice_key,
+            model_gender=model_gender
+        )
+        persona_guidance = persona_info["guidance"]
+        forbidden_clause = ""
+        if persona_info["forbidden_words"]:
+            forbidden_list_str = ", ".join(f"'{w}'" for w in persona_info["forbidden_words"])
+            forbidden_clause = f"TUYỆT ĐỐI CẤM SỬ DỤNG CÁC TỪ: {forbidden_list_str} trong kịch bản!"
+        openers_str = ", ".join(f"'{o}'" for o in persona_info["recommended_openers"])
+        example_opener = persona_info["recommended_openers"][0]
+        persona_prompt_block = f"""CRITICAL TARGET AUDIENCE & PERSONA RULES:
+{persona_guidance}
+{f"- {forbidden_clause}" if forbidden_clause else ""}
+- CÂU MỞ ĐẦU SCENE 1 BẮT BUỘC CHỌN 1 TRONG CÁC CÁCH XƯNG HÔ PHÙ HỢP: {openers_str}. TUYỆT ĐỐI KHÔNG mở đầu bừa bãi hay mặc định 'Mấy bà ơi'!"""
+
         # Build exact skeleton with ALL requested scenes
         if flow_mode == "unboxing":
             skeleton_items = [
@@ -1660,9 +1934,10 @@ CRITICAL UNBOXING PRODUCTION RULES:
 9. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
 10. DIALOGUE WORD LIMIT: Each scene's "audio_dialogue" MUST contain {word_count_rule} to perfectly fit speaking in {scene_duration} seconds!
 11. VOICE STYLE & DIALECT: {voice_info['label']} — {voice_info['tone_desc']}
-12. TONE & VOCABULARY: Hào hứng đập hộp, thán phục chất lượng hoàn thiện, trầm trồ về độ tỉ mỉ ('Hôm nay cùng mình unbox siêu phẩm...', 'Vừa mở hộp ra là đã thấy mê...', 'Từng đường kim mũi chỉ/chi tiết sắc nét đến ngỡ ngàng...', 'Đúng chuẩn hàng cao cấp, nhìn là muốn rinh ngay!').
-13. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO & xAI GROK! NEVER use ambiguous tactile or suggestive words in prompts or dialogue (NO 'slit', NO 'unzip slit', NO 'pulling out of slit', NO 'rubbing', NO 'stroking'). Use clean commercial packaging terms: 'opening the presentation box', 'revealing the plush character', 'showcasing fine craftsmanship and soft texture'.
-14. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
+12. TONE & VOCABULARY: Hào hứng đập hộp, thán phục chất lượng hoàn thiện, trầm trồ về độ tỉ mỉ ('Hôm nay cùng mình unbox siêu phẩm...', '{example_opener} xem ngay em này...', 'Từng chi tiết sắc nét đến ngỡ ngàng...', 'Đúng chuẩn hàng cao cấp, nhìn là muốn rinh ngay!').
+13. {persona_prompt_block}
+14. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO & xAI GROK! NEVER use ambiguous tactile or suggestive words in prompts or dialogue (NO 'slit', NO 'unzip slit', NO 'pulling out of slit', NO 'rubbing', NO 'stroking'). Use clean commercial packaging terms: 'opening the presentation box', 'revealing the plush character', 'showcasing fine craftsmanship and soft texture'.
+15. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
 {skeleton_json}
@@ -1688,10 +1963,11 @@ CRITICAL POV PRODUCTION RULES:
 9. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
 10. DIALOGUE WORD LIMIT: Each scene's "audio_dialogue" MUST contain {word_count_rule} to perfectly fit speaking in {scene_duration} seconds!
 11. VOICE STYLE & DIALECT: {voice_info['label']} — {voice_info['tone_desc']}
-12. TONE & VOCABULARY: Thân mật, cảm xúc, khen chất liệu, đập hộp bất ngờ ('Hết hồn chưa nè...', 'Nhìn tưởng... nhưng mở ra là...', 'Sờ vô là ghiền luôn á...', 'Cưng xỉu...').
-13. NO HUMAN FACE: TUYỆT ĐỐI KHÔNG CÓ MẶT NGƯỜI TRONG KHUNG HÌNH (NO human face visible in frame).
-14. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO & xAI GROK! NEVER use ambiguous tactile or suggestive words in prompts or dialogue (NO 'slit', NO 'unzip slit', NO 'pulling out of slit', NO 'rubbing', NO 'stroking', NO 'penetrate'). For zippered pouches or plush toys: describe as 'gently opening the pouch to reveal the cute character', 'softly pressing the plush toy', 'displaying the adorable character upright'.
-15. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
+12. TONE & VOCABULARY: Thân mật, cảm xúc, khen chất liệu, đập hộp bất ngờ ('Bất ngờ chưa mọi người...', 'Nhìn tưởng... nhưng mở ra là...', 'Cầm lên tay là ưng luôn...', 'Chất lượng xuất sắc thực sự').
+13. {persona_prompt_block}
+14. NO HUMAN FACE: TUYỆT ĐỐI KHÔNG CÓ MẶT NGƯỜI TRONG KHUNG HÌNH (NO human face visible in frame).
+15. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO & xAI GROK! NEVER use ambiguous tactile or suggestive words in prompts or dialogue (NO 'slit', NO 'unzip slit', NO 'pulling out of slit', NO 'rubbing', NO 'stroking', NO 'penetrate'). For zippered pouches or plush toys: describe as 'gently opening the pouch to reveal the cute character', 'softly pressing the plush toy', 'displaying the adorable character upright'.
+16. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
 {skeleton_json}
@@ -1719,9 +1995,10 @@ CRITICAL PRODUCT DEMO PRODUCTION RULES:
 8. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
 9. DIALOGUE WORD LIMIT: Each scene's "audio_dialogue" MUST contain {word_count_rule} to perfectly fit speaking in {scene_duration} seconds!
 10. VOICE STYLE & DIALECT: {voice_info['label']} — {voice_info['tone_desc']}
-11. TONE & VOCABULARY: Chuyên gia hướng dẫn tận tình, thuyết phục bằng hiệu quả thực tế ('Bác nào đang gặp tình trạng... thì xem ngay nhé', 'Chỉ cần một lượng nhỏ thế này thôi...', 'Nhìn bề mặt sau khi dùng mê thực sự...', 'Bấm ngay vào giỏ hàng bên dưới để trải nghiệm nha').
-12. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO & xAI GROK! Keep all product demonstrations strictly professional, clean, and family-friendly. Use clear commercial verbs: 'applying gently', 'pressing one-touch button', 'showcasing the smooth finish'.
-13. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
+11. TONE & VOCABULARY: Chuyên gia hướng dẫn tận tình, thuyết phục bằng hiệu quả thực tế ('Bác nào đang gặp tình trạng... thì xem ngay nhé', 'Chỉ cần một lượng nhỏ thế này thôi...', 'Nhìn hiệu quả sau khi dùng mê thực sự...', 'Bấm ngay vào giỏ hàng bên dưới để trải nghiệm nha').
+12. {persona_prompt_block}
+13. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO & xAI GROK! Keep all product demonstrations strictly professional, clean, and family-friendly. Use clear commercial verbs: 'applying gently', 'pressing one-touch button', 'showcasing the smooth finish'.
+14. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
 {skeleton_json}
@@ -1744,13 +2021,14 @@ CRITICAL UGC PRODUCTION RULES:
 7. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
 8. DIALOGUE WORD LIMIT: Each scene's "audio_dialogue" MUST contain {word_count_rule} to perfectly fit speaking in {scene_duration} seconds!
 9. VOICE STYLE & DIALECT: {voice_info['label']} — {voice_info['tone_desc']}
-10. TONE & VOCABULARY: Đời thường, gần gũi, khuyên dùng thật lòng, tâm sự như bạn bè ('Mình dùng được 2 tuần nay rồi...', 'Mấy bà ơi chân ái đây rồi...', 'Nói thật lúc đầu mình cũng nghi ngờ nhưng sờ vô cái vải này...', 'Đáng đồng tiền bát gạo thiệt sự').
-11. CAMERA & ENVIRONMENT: Frontal camera / selfie close-up angle, creator sitting in personal room/desk, holding product naturally, genuine smiles, natural lighting.
-12. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
+10. TONE & VOCABULARY: Đời thường, gần gũi, khuyên dùng thật lòng, tâm sự chân thật (ví dụ: 'Mình dùng được 2 tuần nay rồi...', '{example_opener} chân ái đây rồi...', 'Nói thật lúc đầu mình cũng đắn đo nhưng cầm lên tay là mê thực sự...', 'Đáng đồng tiền bát gạo luôn nha').
+11. {persona_prompt_block}
+12. CAMERA & ENVIRONMENT: Frontal camera / selfie close-up angle, creator sitting in personal room/desk, holding product naturally, genuine smiles, natural lighting.
+13. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
     - Preserve the creator's exact outfit and appearance ({canonical_model_anchor}) with 100% consistency across all scenes.
     - NEVER use ambiguous tactile actions in prompts or dialogue (NO 'unzipping slit', NO 'smooth zipper', NO 'pulling out of slit', NO 'khóa kéo mở bung', NO 'rubbing', NO 'stroking').
     - For product interaction: keep gestures natural, gentle, and commercial: 'holding product comfortably near chest level', 'pointing gently at feature', 'gently opening the presentation pouch to reveal the cute character'.
-13. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
+14. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
 {skeleton_json}
@@ -1774,12 +2052,13 @@ CRITICAL STORE REVIEW PRODUCTION RULES:
 8. DIALOGUE WORD LIMIT: Each scene's "audio_dialogue" MUST contain {word_count_rule} to perfectly fit speaking in {scene_duration} seconds!
 9. VOICE STYLE & DIALECT: {voice_info['label']} — {voice_info['tone_desc']}
 10. TONE & VOCABULARY: Uy tín, chuyên gia, sang trọng, đánh giá phân tích chất lượng cao cấp, phong thái tự tin.
-11. CAMERA & ENVIRONMENT: Eye-level medium / medium close-up, modern commercial showroom with luxury display shelves, professional lighting.
-12. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
+11. {persona_prompt_block}
+12. CAMERA & ENVIRONMENT: Eye-level medium / medium close-up, modern commercial showroom with luxury display shelves, professional lighting.
+13. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
     - Preserve the KOL's exact outfit and appearance ({canonical_model_anchor}) with 100% consistency across all scenes.
     - NEVER use ambiguous tactile actions in prompts or dialogue (NO 'unzipping slit', NO 'smooth zipper', NO 'pulling out of slit', NO 'khóa kéo mở bung', NO 'rubbing', NO 'stroking').
     - Maintain dignified, high-end showroom presentation standard with 100% family-friendly actions and dialogue.
-13. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
+14. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
 {skeleton_json}
@@ -1883,10 +2162,19 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
             for sc in scenes_data:
                 if "image_generation_prompt" in sc:
                     sc["image_generation_prompt"] = sanitize_safety_content(sc["image_generation_prompt"])
-                if "video_motion_prompt" in sc:
-                    sc["video_motion_prompt"] = sanitize_safety_content(sc["video_motion_prompt"])
                 if "audio_dialogue" in sc:
                     sc["audio_dialogue"] = sanitize_safety_content(sc["audio_dialogue"])
+                    sc["audio_dialogue"] = apply_persona_replacements(sc["audio_dialogue"], persona_info.get("replacements", {}))
+                if "video_motion_prompt" in sc:
+                    sc["video_motion_prompt"] = sanitize_safety_content(sc["video_motion_prompt"])
+                    sc["video_motion_prompt"] = apply_persona_replacements(sc["video_motion_prompt"], persona_info.get("replacements", {}))
+                # CRITICAL: Always synchronize motion prompt's Say: clause with dialogue for lip-sync
+                if sc.get("audio_dialogue") and sc.get("video_motion_prompt"):
+                    sc["video_motion_prompt"] = sync_dialogue_to_motion_prompt(
+                        sc["video_motion_prompt"],
+                        sc["audio_dialogue"],
+                        voice_info.get("veo_prompt", "")
+                    )
             update_job(job_id, scenes=scenes_data)
 
         # ─── GIAI ĐOẠN 2: KEYFRAME ANCHORING (GOOGLE BANANA PRO 2) ──
@@ -2008,6 +2296,13 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                         break
 
                 if not kf_mid:
+                    # Chống cờ RATE_BURST: Thêm độ trễ so le nhẹ (~0.95s) giữa các luồng
+                    # Cảnh 1: 0s, Cảnh 2: ~0.95s, Cảnh 3: ~1.9s, Cảnh 4: ~2.85s...
+                    # Giúp các request đến Google giãn cách tự nhiên như người dùng thật, triệt tiêu 100% lỗi RATE_BURST
+                    stagger_s = (i - 1) * 0.95
+                    if stagger_s > 0:
+                        time.sleep(stagger_s)
+
                     sanitized_prompt = sanitize_kf_prompt(sc["image_generation_prompt"], canonical_anchor, canonical_model_anchor, mode=flow_mode)
                     kf_mid, kf_url = generate_keyframe_flowkit(sanitized_prompt, ref_ids, job_id=job_id)
                     urllib.request.urlretrieve(kf_url, str(kf_path))
@@ -2168,7 +2463,7 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
             for idx, c in enumerate(valid_clips, start=1):
                 t_f = job_dir / f"tts_{idx}.mp3"
                 if t_f.exists() and t_f.stat().st_size > 500:
-                    mux_tts_to_video(c, t_f)
+                    mux_tts_to_video(c, t_f, target_duration=scene_duration)
 
             smart_concat_videos(
                 valid_clips,
@@ -2355,10 +2650,19 @@ def run_scene_regeneration_worker(
         # Update scene prompts if provided
         if image_prompt:
             sc["image_generation_prompt"] = image_prompt
-        if motion_prompt:
-            sc["video_motion_prompt"] = motion_prompt
         if dialogue:
             sc["audio_dialogue"] = dialogue
+        if motion_prompt:
+            sc["video_motion_prompt"] = motion_prompt
+
+        # Ensure lip-sync match between video motion prompt and audio dialogue
+        if sc.get("audio_dialogue") and sc.get("video_motion_prompt"):
+            v_prompt = voice_info.get("veo_prompt", "")
+            sc["video_motion_prompt"] = sync_dialogue_to_motion_prompt(
+                sc["video_motion_prompt"],
+                sc["audio_dialogue"],
+                v_prompt
+            )
 
         sc["status"] = "RENDERING_VIDEO" if not regen_keyframe else "GENERATING_KEYFRAME"
         sc["status_text"] = "Đang render lại Video..." if not regen_keyframe else "Đang vẽ lại Keyframe..."
@@ -2508,8 +2812,8 @@ def run_scene_regeneration_worker(
         )
         tts_path = job_dir / f"tts_{scene_id}.mp3"
         generate_edge_tts(sc.get("audio_dialogue", ""), tts_path, voice=voice_info["edge_voice"], rate=voice_info["rate"])
-        if "veo" in video_engine:
-            mux_tts_to_video(clip_path, tts_path)
+        if tts_path.exists() and tts_path.stat().st_size > 500:
+            mux_tts_to_video(clip_path, tts_path, target_duration=job.get("scene_duration", 8))
 
         # Update scene in scenes list
         sc["status"] = "COMPLETED"
@@ -3254,13 +3558,22 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": f"Scene {scene_id} not found"}).encode("utf-8"))
                 return
 
-            sc = scenes[scene_id - 1]
             if image_prompt is not None:
                 sc["image_generation_prompt"] = sanitize_safety_content(image_prompt.strip())
-            if motion_prompt is not None:
-                sc["video_motion_prompt"] = sanitize_safety_content(motion_prompt.strip())
             if dialogue is not None:
                 sc["audio_dialogue"] = sanitize_safety_content(dialogue.strip())
+            if motion_prompt is not None:
+                sc["video_motion_prompt"] = sanitize_safety_content(motion_prompt.strip())
+
+            # Maintain strict lip synchronization between video prompt Say clause and audio dialogue
+            if sc.get("audio_dialogue") and sc.get("video_motion_prompt"):
+                voice_key = job.get("voice", "female_north")
+                v_info = VOICE_PROFILES.get(voice_key, VOICE_PROFILES["female_north"])
+                sc["video_motion_prompt"] = sync_dialogue_to_motion_prompt(
+                    sc["video_motion_prompt"],
+                    sc["audio_dialogue"],
+                    v_info.get("veo_prompt", "")
+                )
 
             update_job(job_id, scenes=scenes)
             self.send_response(200)
@@ -3508,6 +3821,9 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
             fixed_motion = fix_res.get("fixed_motion_prompt", motion_prompt)
             fixed_dialogue = fix_res.get("fixed_dialogue", dialogue)
+            voice_key = job.get("voice", "female_north")
+            v_info = VOICE_PROFILES.get(voice_key, VOICE_PROFILES["female_north"])
+            fixed_motion = sync_dialogue_to_motion_prompt(fixed_motion, fixed_dialogue, v_info.get("veo_prompt", ""))
             explanation = fix_res.get("explanation", "AI đã tối ưu hóa prompt an toàn thành công.")
 
             # Update scene

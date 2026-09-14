@@ -1,0 +1,19 @@
+{
+  "profiles": [
+    {
+      "id": "nick-a",
+      "project_id": "",
+      "note": "Chrome A. Create a Flow project in this nick, paste its uuid here, or leave empty to learn it from the tab URL."
+    },
+    {
+      "id": "nick-b",
+      "project_id": "",
+      "note": "Chrome B. Same: one Flow project that belongs to this Google account only."
+    },
+    {
+      "id": "nick-c",
+      "project_id": "",
+      "note": "Chrome C. Unpinned Nova jobs go to the least-busy nick; that nick's project_id is rewritten into the RPC."
+    }
+  ]
+}

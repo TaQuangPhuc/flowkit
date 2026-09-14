@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import re
 import signal
 from contextlib import asynccontextmanager
 
@@ -9,7 +10,7 @@ import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent.config import API_HOST, API_PORT, WS_HOST, WS_PORT
+from agent.config import API_HOST, API_PORT, BASE_DIR, WS_HOST, WS_PORT
 from agent.db.schema import init_db, close_db
 from agent.api.characters import router as characters_router
 from agent.api.projects import router as projects_router
@@ -24,6 +25,7 @@ from agent.api.music import router as music_router
 from agent.api.models import router as models_router
 from agent.api.providers import router as providers_router
 from agent.api.active_project import router as active_project_router
+from agent.api.accounts import router as accounts_router
 from agent.worker.processor import get_worker_controller
 from agent.services.flow_client import get_flow_client
 from agent.services.event_bus import event_bus
@@ -103,6 +105,25 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(controller.start())
     logger.info("WS server + worker started")
 
+    # Auto-launch enabled nicks if not already running
+    try:
+        from agent.services.accounts import load_accounts
+        from agent.services.chrome_nicks import chrome_running, launch_nick
+        for acc in load_accounts():
+            if acc.get("enabled", True) and not chrome_running(acc["id"]):
+                logger.info("Auto-launching Chrome for enabled nick: %s", acc["id"])
+                asyncio.create_task(launch_nick(acc["id"]))
+    except Exception as e:
+        logger.warning("Auto-launching nicks failed: %s", e)
+
+    # Start proxy health & temporary expiry daemon
+    try:
+        from agent.services.proxy_checker import start_proxy_health_daemon
+        start_proxy_health_daemon(interval_seconds=180)
+        logger.info("Proxy health & auto-expiry daemon started")
+    except Exception as e:
+        logger.warning("Failed to start proxy health daemon: %s", e)
+
     yield
 
     controller.request_shutdown()
@@ -135,6 +156,7 @@ app.include_router(music_router, prefix="/api")
 app.include_router(models_router)
 app.include_router(providers_router)
 app.include_router(active_project_router)
+app.include_router(accounts_router, prefix="/api")
 
 
 import secrets as _secrets
@@ -166,6 +188,102 @@ async def ext_callback(request: Request):
     return {"ok": False, "reason": "no matching pending request"}
 
 
+_NETLOG_PATH = BASE_DIR / ".scratch" / "ext-netlog.jsonl"
+_NETLOG_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+
+_NETLOG_UUID_SEARCH = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I
+)
+_CHAT_RPC_RE = re.compile(r"GN0Bre|StreamChat|CreationAgent|FlowCreationAgent", re.I)
+
+
+def _session_from_netlog(url: str, freq: str | None) -> str | None:
+    if not freq:
+        return None
+    chatty = bool(_CHAT_RPC_RE.search(f"{url or ''} {freq}"))
+    try:
+        env = json.loads(freq)
+    except json.JSONDecodeError:
+        env = None
+    if isinstance(env, list) and len(env) >= 2 and env[0] is None and isinstance(env[1], str):
+        try:
+            inner = json.loads(env[1])
+        except json.JSONDecodeError:
+            inner = None
+        if isinstance(inner, list) and inner and isinstance(inner[0], str) and _NETLOG_UUID.match(inner[0]):
+            return inner[0]
+    try:
+        item = env[0][0]
+        rpcid = item[0]
+        inner = item[1]
+        if isinstance(inner, str):
+            inner = json.loads(inner)
+        if rpcid == "GN0Bre" or "GN0Bre" in (url or ""):
+            sid = inner[0] if isinstance(inner, list) and inner else None
+            if isinstance(sid, str) and _NETLOG_UUID.match(sid):
+                return sid
+    except (TypeError, IndexError, KeyError, json.JSONDecodeError):
+        pass
+    if chatty:
+        found = _NETLOG_UUID_SEARCH.search(freq)
+        if found:
+            return found.group(0)
+    return None
+
+
+@app.post("/api/ext/netlog")
+async def ext_netlog(request: Request):
+    """Append a Flow RPC capture from the extension. Also pins GN0Bre session."""
+    data = await request.json()
+    url = str(data.get("url") or "")[:800]
+    freq = data.get("freq")
+    if isinstance(freq, str) and len(freq) > 24000:
+        freq = freq[:24000]
+    session = data.get("session") or _session_from_netlog(url, freq if isinstance(freq, str) else None)
+    rec = {
+        "ts": data.get("ts"),
+        "url": url,
+        "statusCode": data.get("statusCode"),
+        "rpcid": data.get("rpcid"),
+        "session": session,
+        "freq": freq,
+    }
+    _NETLOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _NETLOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    profile_id = data.get("profileId") or None
+    rec["profileId"] = profile_id
+    if session:
+        get_flow_client().remember_chat_session(session, profile_id=profile_id)
+    logger.info(
+        "ext/netlog rpcid=%s session=%s profile=%s status=%s",
+        rec.get("rpcid"),
+        session,
+        profile_id,
+        rec.get("statusCode"),
+    )
+    return {"ok": True, "session": session}
+
+
+@app.get("/api/ext/netlog")
+async def ext_netlog_tail(limit: int = 40):
+    """Tail the extension RPC capture log."""
+    if not _NETLOG_PATH.exists():
+        return {"count": 0, "path": str(_NETLOG_PATH), "entries": []}
+    lines = _NETLOG_PATH.read_text(encoding="utf-8").splitlines()
+    cap = max(1, min(int(limit or 40), 200))
+    entries = []
+    for line in lines[-cap:]:
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return {"count": len(lines), "path": str(_NETLOG_PATH), "entries": entries}
+
+
 @app.get("/health")
 async def health():
     client = get_flow_client()
@@ -174,6 +292,7 @@ async def health():
         "version": "0.2.0",
         "extension_connected": client.connected,
         "ws": client.ws_stats,
+        "workers": client.workers(),
     }
 
 

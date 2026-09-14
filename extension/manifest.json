@@ -17,6 +17,8 @@
     "https://flow-content.google/*",
     "https://labs.google/*",
     "https://aisandbox-pa.googleapis.com/*",
+    "https://www.google.com/recaptcha/*",
+    "https://www.gstatic.com/recaptcha/*",
     "http://127.0.0.1:8100/*"
   ],
   "background": {

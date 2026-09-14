@@ -36,15 +36,34 @@ MEDIA_HOST = "flow-content.google"
 
 RPC_GEN_IMAGE = "ogiZ0b"
 RPC_GEN_VIDEO = "eb1hJf"
+# Text-to-video. Distinct from i2v ``eb1hJf``: no start-image slot at all.
+RPC_GEN_T2V = "YhhmEf"
 RPC_OPERATION = "jwpduf"
 RPC_PROJECT_MEDIA = "Zzl0ze"
 RPC_MEDIA = "as29s"
 RPC_UPLOAD_IMAGE = "maseQ"
 # Label only — StreamChat is not a batchexecute rpcid; the URL is STREAM_CHAT_PATH.
 RPC_STREAM_CHAT = "StreamChat"
-# Page-load bind for the creation-agent conversation StreamChat is scoped to.
-# Inner payload is ``["<session uuid>"]``; the same id is StreamChat slot 0.
+# FlowCreationAgentService — captured from the frontend JS mapping, then
+# confirmed on the wire when Ingredients Generate ran (CreateSession 1s
+# before StreamChat). Opening the Ingredients panel only fires ListSessions;
+# it does not mint a conversation by itself.
+RPC_LIST_SESSIONS = "mrlkwd"      # ListSessions. Inner: ["<project uuid>"]
+RPC_CREATE_SESSION = "csbIsb"     # CreateSession. Inner: [project, null, client uuid]
+# GetSession. Inner ``["<session uuid>"]``. StreamChat slot 0 is the
+# CreateSession *response* id, not this request and not a client-minted uuid.
 RPC_CHAT_SESSION = "GN0Bre"
+# Project settings. Captured 2026-09-08 as the UI writing
+# ``default_generation_settings.video_defaults`` to
+# ``veo_3_1_lite_low_priority`` (Ingredients r2v, 0-credit). Same rpcid also
+# writes chat_panel_open / agent_toggle_state — those keys are not ported.
+RPC_PROJECT_SETTINGS = "Kcr7Ub"
+
+# Gemini Vision / Thinking script analysis RPC. Captured from Google Flow
+# assistant / image inspection: model gemini-3-flash-preview.
+RPC_VISION_ANALYZE = "agJzFb"
+VISION_ANALYZE_MODEL = "gemini-3-flash-preview"
+DEFAULT_VISION_SESSION_UUID = "b5f1193c-970f-41d6-bf36-184b5044a9b9"
 
 STREAM_CHAT_PATH = (
     "/_/AiSandboxAngularFrontend/data/"
@@ -61,9 +80,9 @@ CAPTCHA_CHAT = "CHAT_GENERATION"
 #: happen in the page, moments before the request leaves.
 CAPTCHA_SLOT = "__CAPTCHA__"
 
-#: StreamChat is scoped to a creation-agent conversation the page already has.
-#: The extension replaces this with the GN0Bre session it finds in the tab.
-#: A random uuid here is rejected as PUBLIC_ERROR_UNUSUAL_ACTIVITY.
+#: StreamChat is scoped to a creation-agent conversation CreateSession mints.
+#: The extension / agent replace this with that response id. A random uuid
+#: here is rejected as PUBLIC_ERROR_UNUSUAL_ACTIVITY.
 CHAT_SESSION_SLOT = "__CHAT_SESSION__"
 
 #: Trailing mode flag on the captured r2v StreamChat call. Keep as observed.
@@ -77,7 +96,16 @@ IMAGE_MODELS = {"GEM_PIX_2", "NARWHAL"}
 IMAGE_MODEL = "GEM_PIX_2"
 
 #: The nicknames models.json speaks, resolved to wire names.
-IMAGE_MODEL_BY_NICKNAME = {"NANO_BANANA_PRO": "GEM_PIX_2", "NANO_BANANA_2": "NARWHAL"}
+IMAGE_MODEL_BY_NICKNAME = {
+    "NANO_BANANA_PRO": "GEM_PIX_2",
+    "NANO_BANANA_2": "NARWHAL",
+    "Nano Banana Pro": "GEM_PIX_2",
+    "nano banana pro": "GEM_PIX_2",
+    "nano_banana_pro": "GEM_PIX_2",
+    "Nano Banana 2": "NARWHAL",
+    "nano banana 2": "NARWHAL",
+    "nano_banana_2": "NARWHAL",
+}
 
 #: Image aspect ratios, measured by generating one of each and reading the
 #: JPEG header. This slot was mistaken for a variant count at first — 1 means
@@ -95,6 +123,14 @@ ASPECT_BY_NAME = {
     "IMAGE_ASPECT_RATIO_LANDSCAPE": ASPECT_LANDSCAPE,
     "IMAGE_ASPECT_RATIO_PORTRAIT_FOUR_THREE": ASPECT_PORTRAIT_4_3,
     "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE": ASPECT_LANDSCAPE_4_3,
+    "9:16": ASPECT_PORTRAIT,
+    "16:9": ASPECT_LANDSCAPE,
+    "1:1": ASPECT_SQUARE,
+    "3:4": ASPECT_PORTRAIT_4_3,
+    "4:3": ASPECT_LANDSCAPE_4_3,
+    "PORTRAIT": ASPECT_PORTRAIT,
+    "LANDSCAPE": ASPECT_LANDSCAPE,
+    "SQUARE": ASPECT_SQUARE,
 }
 
 #: Video models this path accepts. The REST-era map was keyed by
@@ -102,10 +138,19 @@ ASPECT_BY_NAME = {
 #: variants; those are gone — aspect is its own slot now, and the suffixed
 #: names are rejected.
 VIDEO_MODEL = "veo_3_1_i2v_lite_low_priority"
+#: Captured 2026-09-08 off Flow UI text-to-video (rpcid ``YhhmEf``).
+VIDEO_T2V_MODEL = "veo_3_1_t2v_lite_low_priority"
+#: Captured 2026-09-08 off ``Kcr7Ub`` / ``default_generation_settings.video_defaults``.
+#: Ingredients r2v with this model is 0-credit; omitting it lets the agent
+#: pick Omni Flash (~15 credits) and ``ask_for_permission``.
+VIDEO_R2V_MODEL = "veo_3_1_lite_low_priority"
+#: Trailing int after ``[model, aspect]`` in that captured settings row.
+VIDEO_DEFAULTS_TRAILING = 1
 VIDEO_MODELS = {
     "veo_3_1_i2v_lite_low_priority",
     "veo_3_1_i2v_lite",
     "veo_3_1_i2v_s_fast_ultra",
+    VIDEO_T2V_MODEL,
 }
 
 #: Video aspect, and note it does NOT share the image encoding: here 1 is
@@ -221,6 +266,10 @@ def resolve_video_model(key: Optional[str]) -> str:
     if isinstance(key, str):
         if key in VIDEO_MODELS:
             return key
+        # t2v is a different RPC and a different model family; do not fold
+        # a t2v key onto an i2v wire name.
+        if "t2v" in key:
+            return VIDEO_T2V_MODEL
         if "ultra" in key:
             return "veo_3_1_i2v_s_fast_ultra"
         if "lite_low_priority" in key:
@@ -314,15 +363,36 @@ def first_payload(text: str, rpcid: str | None = None) -> Any:
     ``rpcid=None`` takes the first ok envelope — StreamChat has no rpcids=
     query and the wrb.fr id is not known until a response is captured.
     """
+    return payloads(text, rpcid)[0]
+
+
+def payloads(text: str, rpcid: str | None = None) -> list[Any]:
+    """Every ok envelope payload, in wire order.
+
+    StreamChat is a chunked stream: the first wrb.fr is often a chat-message
+    uuid, and the media record (``[mediaId, projectId, sceneId, CAE]``) lands
+    in a later chunk. Taking only the first envelope is what made r2v poll
+    forever on a uuid ``as29s`` does not know.
+    """
     results = parse_envelope(text)
+    out: list[Any] = []
+    first_err: RpcResult | None = None
+    others = 0
     for result in results:
         if rpcid and result.rpcid != rpcid:
+            others += 1
             continue
         if not result.ok:
-            raise RpcError(result.rpcid, result.error)
-        return result.data
+            if first_err is None:
+                first_err = result
+            continue
+        out.append(result.data)
+    if out:
+        return out
+    if first_err is not None:
+        raise RpcError(first_err.rpcid, first_err.error)
     label = rpcid or "envelope"
-    raise FlowBatchError(f"no {label} envelope in response ({len(results)} others)")
+    raise FlowBatchError(f"no {label} envelope in response ({others} others)")
 
 
 # ── request builders ─────────────────────────────────────────────────────────
@@ -417,6 +487,35 @@ def video_request(prompt: str, project_id: str, source_media_id: str,
     return build_envelope(RPC_GEN_VIDEO, inner)
 
 
+def t2v_request(prompt: str, project_id: str,
+                aspect: Any = VIDEO_ASPECT_LANDSCAPE,
+                model: str = VIDEO_T2V_MODEL,
+                count: int = 2) -> str:
+    """Text-to-video as the Flow UI sends it (rpcid ``YhhmEf``).
+
+    Captured 2026-09-08: not empty-slot i2v. The start-image + crop block is
+    omitted entirely, the model is ``veo_3_1_t2v_lite_low_priority``, and the
+    UI submits two identical-prompt variants. Guessing an empty media slot on
+    ``eb1hJf`` is accepted and then ignored — do not reuse :func:`video_request`.
+    """
+    ratio = resolve_video_aspect(aspect)
+    variants = []
+    for _ in range(max(1, count)):
+        variants.append([
+            [None, None, [[[prompt]]]],
+            model,
+            ratio,
+            None,
+            [None, None, None, None, _client_uuid(), _client_uuid()],
+        ])
+    inner = [
+        variants,
+        _context(project_id),
+        [_client_uuid(), 2],
+    ]
+    return build_envelope(RPC_GEN_T2V, inner)
+
+
 def upload_request(image_b64: str, project_id: str, mime_type: str = "image/jpeg",
                    file_name: str = "upload.jpg") -> str:
     """Put a local image into the project so it can be used as a reference.
@@ -442,6 +541,106 @@ def media_request(media_id: str) -> str:
     return build_envelope(RPC_MEDIA, [media_id])
 
 
+def list_sessions_request(project_id: str) -> str:
+    """List creation-agent conversations for a Flow project (``mrlkwd``)."""
+    return build_envelope(RPC_LIST_SESSIONS, [project_id])
+
+
+def create_session_request(project_id: str, client_id: str | None = None) -> str:
+    """Mint a creation-agent conversation (``csbIsb``).
+
+    Captured 2026-09-08 off Ingredients Generate:
+    ``["<project uuid>", null, "<uppercase client uuid>"]``. The conversation
+    id StreamChat reuses arrives in the response, not in this request.
+    """
+    return build_envelope(
+        RPC_CREATE_SESSION, [project_id, None, client_id or _client_uuid()]
+    )
+
+
+def get_session_request(session_id: str) -> str:
+    """Fetch one creation-agent conversation (``GN0Bre`` / GetSession)."""
+    return build_envelope(RPC_CHAT_SESSION, [session_id])
+
+
+def set_video_defaults_request(project_id: str,
+                               model: str = VIDEO_R2V_MODEL,
+                               aspect: Any = VIDEO_ASPECT_LANDSCAPE) -> str:
+    """Pin the project's Ingredients video model (``Kcr7Ub``).
+
+    Captured 2026-09-08: the UI wrote
+    ``["projects/<id>", [null, null, [null, ["veo_3_1_lite_low_priority", 2, 1]]],
+    [["default_generation_settings.video_defaults"]]]``. StreamChat itself has
+    no model slot; this setting is how low-priority r2v stays free.
+    """
+    ratio = resolve_video_aspect(aspect)
+    return build_envelope(RPC_PROJECT_SETTINGS, [
+        f"projects/{project_id}",
+        [None, None, [None, [model, ratio, VIDEO_DEFAULTS_TRAILING]]],
+        [["default_generation_settings.video_defaults"]],
+    ])
+
+
+def vision_analyze_request(
+    prompt: str,
+    images: list[tuple[str, str]] | list[str] | str | None = None,
+    system_instruction: str = "",
+    session_uuid: str | None = None,
+) -> str:
+    """Build the batchexecute envelope for Gemini Vision analysis (agJzFb).
+
+    Model: gemini-3-flash-preview.
+    Supports single or multiple images (tuples of (mime, base64) or base64 strings).
+    """
+    normalized_images: list[tuple[str, str]] = []
+    if images:
+        raw_list = [images] if isinstance(images, (str, bytes)) else list(images)
+        for img in raw_list:
+            if isinstance(img, tuple) and len(img) == 2:
+                mime, b64 = str(img[0]), str(img[1])
+            elif isinstance(img, str):
+                b64 = img.strip()
+                mime = "image/jpeg"
+                if b64.startswith("data:") and ";base64," in b64:
+                    prefix, b64 = b64.split(";base64,", 1)
+                    mime = prefix.replace("data:", "").strip() or "image/jpeg"
+            else:
+                continue
+            if "," in b64:
+                b64 = b64.split(",", 1)[1].strip()
+            if b64:
+                normalized_images.append((mime, b64))
+
+    user_parts: list[Any] = []
+    if prompt:
+        user_parts.append([prompt])
+    for mime, b64 in normalized_images:
+        user_parts.append([None, [mime, b64]])
+
+    if not user_parts:
+        user_parts.append([""])
+
+    system_slot = [[[system_instruction]]] if system_instruction else None
+
+    inner_payload = [
+        VISION_ANALYZE_MODEL,
+        None, None, None, None, None, None, None, None,
+        [
+            [
+                user_parts,
+                "user",
+            ]
+        ],
+        None,
+        system_slot,
+        [None, None, 4],
+        None,
+        [None, None, [None, None, None, session_uuid or CHAT_SESSION_SLOT]],
+        [CAPTCHA_SLOT, 1],
+    ]
+    return build_envelope(RPC_VISION_ANALYZE, inner_payload)
+
+
 # ── response readers ─────────────────────────────────────────────────────────
 
 def _walk_strings(node: Any):
@@ -450,13 +649,67 @@ def _walk_strings(node: Any):
     elif isinstance(node, list):
         for item in node:
             yield from _walk_strings(item)
+    elif isinstance(node, dict):
+        for item in node.values():
+            yield from _walk_strings(item)
 
 
-def _walk_lists(node: Any):
+def read_session_ids(payload: Any, *, exclude: set[str] | None = None) -> list[str]:
+    """UUIDs in a ListSessions / CreateSession payload, minus known ids.
+
+    CreateSession's request carries an uppercase client uuid; StreamChat's
+    session is a distinct lowercase id in the response. Project id is also
+    skipped so a listing that echoes it is not treated as a conversation.
+    """
+    skip = {item.lower() for item in (exclude or set()) if item}
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def walk(node: Any):
+        if isinstance(node, str):
+            yield node
+        elif isinstance(node, list):
+            for item in node:
+                yield from walk(item)
+        elif isinstance(node, dict):
+            for item in node.values():
+                yield from walk(item)
+
+    for text in walk(payload):
+        if not _UUID_RE.match(text):
+            continue
+        key = text.lower()
+        if key in skip or key in seen:
+            continue
+        seen.add(key)
+        found.append(text)
+    found.sort(key=lambda item: item.isupper())
+    return found
+
+
+def _walk_lists(node: Any, *, decode_json: bool = False):
+    """Yield every nested list.
+
+    ``decode_json`` also unwraps JSON arrays that Flow stuffed into a string
+    slot — StreamChat and GetSession do this. Default off so listing readers
+    keep matching the captured positional shape.
+    """
+    if decode_json and isinstance(node, str):
+        text = node.strip()
+        if text[:1] in "[{":
+            try:
+                node = json.loads(text)
+            except json.JSONDecodeError:
+                return
+            yield from _walk_lists(node, decode_json=True)
+            return
     if isinstance(node, list):
         yield node
         for item in node:
-            yield from _walk_lists(item)
+            yield from _walk_lists(item, decode_json=decode_json)
+    elif isinstance(node, dict):
+        for item in node.values():
+            yield from _walk_lists(item, decode_json=decode_json)
 
 
 def read_images(payload: Any) -> list[GeneratedImage]:
@@ -493,6 +746,14 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.I,
 )
+_UUID_SEARCH = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.I,
+)
+
+
+def _valid_uuid(value: Any) -> bool:
+    return isinstance(value, str) and bool(_UUID_RE.match(value))
 
 
 def _operation_from_node(node: list) -> Operation:
@@ -520,6 +781,9 @@ def read_stream_chat_operation(payload: Any) -> Operation:
     appears first and is *not* the listing key. Prefer a record whose
     second slot is a project uuid and whose fourth is a short status
     (``CAE`` once finished). A bare uuid is the last resort.
+
+    ``payload`` may be one envelope or a list of them — StreamChat streams
+    several wrb.fr chunks, and the CAE row is frequently not the first.
     """
     direct = None
     try:
@@ -528,7 +792,7 @@ def read_stream_chat_operation(payload: Any) -> Operation:
         pass
     fallback = None
     preferred = None
-    for node in _walk_lists(payload):
+    for node in _walk_lists(payload, decode_json=True):
         if not isinstance(node, list) or not node:
             continue
         head = node[0]
@@ -538,7 +802,7 @@ def read_stream_chat_operation(payload: Any) -> Operation:
             continue
         op = _operation_from_node(node)
         if _is_stream_chat_record(node):
-            if isinstance(node[3], str) and node[3] == "CAE":
+            if isinstance(node[3], str) and node[3] == STATUS_DONE:
                 return op
             if preferred is None:
                 preferred = op
@@ -546,11 +810,127 @@ def read_stream_chat_operation(payload: Any) -> Operation:
             fallback = op
     if preferred:
         return preferred
-    if direct:
+    if direct and _valid_uuid(direct.operation_id):
         return direct
-    if fallback:
+    if fallback and _valid_uuid(fallback.operation_id):
         return fallback
     raise FlowBatchError("StreamChat response carried no operation")
+
+
+def find_stream_chat_media_ids(
+    payload: Any, *, exclude: set[str] | None = None,
+) -> list[str]:
+    """Media ids from StreamChat / GetSession rows, CAE records first.
+
+    r2v listing rows are ``[mediaId, projectId, sceneId, status]``. Slot 0
+    is what ``as29s`` serves. Chat-message and session uuids are skipped
+    via ``exclude``.
+    """
+    skip = {item.lower() for item in (exclude or set()) if item}
+    found: list[tuple[bool, str]] = []
+    seen: set[str] = set()
+    for node in _walk_lists(payload, decode_json=True):
+        if not _is_stream_chat_record(node):
+            continue
+        media_id = node[0]
+        key = media_id.lower()
+        if key in skip or key in seen:
+            continue
+        seen.add(key)
+        found.append((node[3] == STATUS_DONE, media_id))
+    found.sort(key=lambda item: not item[0])
+    return [media_id for _, media_id in found]
+
+
+def _unescape_json_blob(text: str) -> str:
+    """Undo JSON string escaping enough to see CDN paths.
+
+    GetSession stuffs urls inside JSON-string slots, so ``\\/video\\/`` has to
+    count as ``/video/`` the same way a bare url does.
+    """
+    return text.replace("\\/", "/")
+
+
+def media_id_from_video_url(text: str) -> Optional[str]:
+    ids = video_media_ids_in_text(text)
+    return ids[0] if ids else None
+
+
+def video_media_ids_in_text(text: str) -> list[str]:
+    blob = _unescape_json_blob(text)
+    mark = MEDIA_HOST + "/video/"
+    found: list[str] = []
+    seen: set[str] = set()
+    start = 0
+    while True:
+        idx = blob.find(mark, start)
+        if idx == -1:
+            break
+        media_id = blob[idx + len(mark):].split("?", 1)[0]
+        media_id = media_id.split('"', 1)[0].split("'", 1)[0].rstrip("\\")
+        start = idx + len(mark)
+        if not _UUID_RE.match(media_id):
+            continue
+        key = media_id.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(media_id)
+    return found
+
+
+def find_video_media_ids(payload: Any, *, exclude: set[str] | None = None) -> list[str]:
+    """Media ids that already have a ``/video/`` CDN url in this payload."""
+    skip = {item.lower() for item in (exclude or set()) if item}
+    found: list[str] = []
+    seen: set[str] = set()
+    for text in _walk_strings(payload):
+        if not isinstance(text, str):
+            continue
+        for media_id in video_media_ids_in_text(text):
+            key = media_id.lower()
+            if key in skip or key in seen:
+                continue
+            seen.add(key)
+            found.append(media_id)
+    return found
+
+
+def collect_uuids(payload: Any, *, exclude: set[str] | None = None) -> list[str]:
+    """Every uuid in a payload, last occurrence kept last (newer chat last)."""
+    skip = {item.lower() for item in (exclude or set()) if item}
+    order: dict[str, str] = {}
+    for text in _walk_strings(payload):
+        if not isinstance(text, str):
+            continue
+        for match in _UUID_SEARCH.finditer(_unescape_json_blob(text)):
+            found = match.group(0)
+            key = found.lower()
+            if key in skip:
+                continue
+            order.pop(key, None)
+            order[key] = found
+    return list(order.values())
+
+
+def read_operations(payload: Any) -> list[Operation]:
+    """Every record in ``[null, 50, [[op…], …]]``. t2v submits two variants."""
+    records = payload[2] if isinstance(payload, list) and len(payload) > 2 else None
+    if not isinstance(records, list) or not records:
+        raise FlowBatchError("operation payload carried no record")
+    operations: list[Operation] = []
+    for record in records:
+        if not isinstance(record, list) or not record:
+            continue
+        operations.append(Operation(
+            operation_id=record[0],
+            project_id=record[1] if len(record) > 1 else None,
+            status=record[3] if len(record) > 3 else None,
+            error=read_operation_error(record),
+        ))
+    if not operations:
+        raise FlowBatchError("operation payload carried no record")
+    return operations
 
 
 def read_operation(payload: Any) -> Operation:
@@ -559,16 +939,7 @@ def read_operation(payload: Any) -> Operation:
     Note the third uuid is the **scene**, not the media. Reading it as a media
     id is what made every `as29s` lookup answer NOT_FOUND.
     """
-    records = payload[2] if isinstance(payload, list) and len(payload) > 2 else None
-    record = records[0] if isinstance(records, list) and records else None
-    if not isinstance(record, list) or not record:
-        raise FlowBatchError("operation payload carried no record")
-    return Operation(
-        operation_id=record[0],
-        project_id=record[1] if len(record) > 1 else None,
-        status=record[3] if len(record) > 3 else None,
-        error=read_operation_error(record),
-    )
+    return read_operations(payload)[0]
 
 
 def read_operation_error(record: list) -> Optional[str]:
@@ -615,6 +986,15 @@ def find_media_id(payload: Any, operation_id: str) -> Optional[str]:
 #: appear depending on whether the text has been through a JSON decode.
 _MEDIA_SLOT = re.compile(r'null,null,\\?"([0-9a-fA-F-]{36})\\?"')
 
+#: StreamChat r2v listing row: ``[mediaId, projectId, sceneId, "CAE"]``.
+#: GetSession is only the chat transcript — it never carries this row — so
+#: the listing text is how a poll finds the clip. Escaped or not, both forms
+#: appear depending on whether the text has been through a JSON decode.
+_R2V_LISTING_ROW = re.compile(
+    r'\\?"([0-9a-fA-F-]{36})\\?"\s*,\s*\\?"([0-9a-fA-F-]{36})\\?"\s*,\s*'
+    r'\\?"([0-9a-fA-F-]{36})\\?"\s*,\s*\\?"CAE\\?"'
+)
+
 
 def find_media_id_in_text(text: str, operation_id: str) -> Optional[str]:
     """Same lookup as :func:`find_media_id`, but on an unparsed listing.
@@ -638,13 +1018,188 @@ def find_media_id_in_text(text: str, operation_id: str) -> Optional[str]:
     return None
 
 
+#: GetSession tool result: ``["media_id", [null, null, "<uuid>"]]``. The clip
+#: is named here while status is still ``queued``, before a ``/video/`` url
+#: or a listing CAE row exists. Escaped or not, both forms appear.
+_SESSION_MEDIA_ID = re.compile(
+    r'\\*"media_id\\*"\s*,\s*\[\s*null\s*,\s*null\s*,\s*'
+    r'\\*"([0-9a-fA-F-]{36})\\*"',
+    re.I,
+)
+
+
+def find_r2v_session_media_ids(
+    payload: Any, *, exclude: set[str] | None = None,
+) -> list[str]:
+    """Clip ids GetSession names on ``generate_video_with_references``.
+
+    Captured 2026-09-08: the tool result carries
+    ``["media_id", [null, null, "<uuid>"]]`` and ``["status", […, "queued"]]``
+    with no CDN path. A poll that waits for ``/video/`` or a CAE row here
+    never binds the clip.
+    """
+    skip = {item.lower() for item in (exclude or set()) if item}
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def take(media_id: Any) -> None:
+        if not _valid_uuid(media_id):
+            return
+        key = media_id.lower()
+        if key in skip or key in seen:
+            return
+        seen.add(key)
+        found.append(media_id)
+
+    def from_slot(slot: Any) -> None:
+        if isinstance(slot, list):
+            for item in reversed(slot):
+                if isinstance(item, str) and _valid_uuid(item):
+                    take(item)
+                    return
+        elif isinstance(slot, dict):
+            take(slot.get("literalString"))
+        elif isinstance(slot, str):
+            take(slot)
+
+    if isinstance(payload, str):
+        for match in _SESSION_MEDIA_ID.finditer(_unescape_json_blob(payload)):
+            take(match.group(1))
+
+    for node in _walk_lists(payload, decode_json=True):
+        if not isinstance(node, list) or len(node) < 2:
+            continue
+        if node[0] != "media_id":
+            continue
+        from_slot(node[1])
+    return found
+
+
+def find_r2v_media_ids_in_text(
+    text: str, project_id: str | None = None, *,
+    operation_id: str | None = None, exclude: set[str] | None = None,
+) -> list[str]:
+    """Media ids of listing rows ``[mediaId, projectId, opOrSceneId, "CAE"]``.
+
+    t2v/i2v/images share this shape — slot 2 is the operation id. A poll that
+    takes any CAE row will steal an older clip. When ``operation_id`` is set,
+    only a row whose slot 2 (or slot 0) is that id counts.
+    """
+    skip = {item.lower() for item in (exclude or set()) if item}
+    if project_id:
+        skip.add(project_id.lower())
+    want = (operation_id or "").lower()
+    order: dict[str, str] = {}
+    for match in _R2V_LISTING_ROW.finditer(text or ""):
+        media_id, proj, scene = match.group(1), match.group(2), match.group(3)
+        if project_id and proj.lower() != project_id.lower():
+            continue
+        if want and scene.lower() != want and media_id.lower() != want:
+            continue
+        key = media_id.lower()
+        if key in skip or (scene.lower() in skip and scene.lower() != want):
+            continue
+        order.pop(key, None)
+        order[key] = media_id
+    return list(order.values())
+
+
 def read_media_urls(payload: Any, media_id: str) -> MediaUrls:
     video = image = None
+    video_mark = MEDIA_HOST + "/video/"
+    image_mark = MEDIA_HOST + "/image/"
     for text in _walk_strings(payload):
-        if not text.startswith("https://"):
+        if not isinstance(text, str):
             continue
-        if MEDIA_HOST + "/video/" in text and video is None:
-            video = text
-        elif MEDIA_HOST + "/image/" in text and image is None:
-            image = text
+        blob = _unescape_json_blob(text)
+        if video is None and video_mark in blob:
+            start = blob.find("https://")
+            if start != -1:
+                video = blob[start:].split('"', 1)[0].split("'", 1)[0]
+        elif image is None and image_mark in blob:
+            start = blob.find("https://")
+            if start != -1:
+                image = blob[start:].split('"', 1)[0].split("'", 1)[0]
     return MediaUrls(media_id=media_id, video=video, image=image)
+
+
+def read_vision_analysis(payload: Any) -> dict:
+    """Extract and parse Gemini vision / script analysis from agJzFb response.
+
+    Handles raw batchexecute response text or already decoded JSON payloads.
+    Extracts embedded JSON blocks, falling back to returning raw_text if not JSON.
+    """
+    if isinstance(payload, str):
+        try:
+            payload = first_payload(payload, RPC_VISION_ANALYZE)
+        except Exception:
+            # Could already be unescaped JSON text or raw chunk
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                pass
+
+    content_str: Optional[str] = None
+
+    # Standard path: inner_data[3][0][1][0][0][0]
+    if isinstance(payload, list) and len(payload) > 3 and isinstance(payload[3], list):
+        try:
+            candidate = payload[3][0][1][0][0][0]
+            if isinstance(candidate, str) and candidate:
+                content_str = candidate
+        except (IndexError, TypeError):
+            pass
+
+    # Fallback: scan strings in payload
+    if not content_str:
+        longest = ""
+        for s in _walk_strings(payload):
+            if not isinstance(s, str):
+                continue
+            if "{" in s and "}" in s:
+                if len(s) > len(longest):
+                    longest = s
+            elif len(s) > len(longest) and len(s) > 20:
+                longest = s
+        if longest:
+            content_str = longest
+
+    if not content_str:
+        raise FlowBatchError("agJzFb response carried no content or text")
+
+    # Try markdown json fence
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content_str, re.DOTALL)
+    if fence_match:
+        try:
+            parsed = json.loads(fence_match.group(1))
+            if isinstance(parsed, dict):
+                if "_raw_text" not in parsed:
+                    parsed["_raw_text"] = content_str
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Try widest { ... }
+    json_match = re.search(r"(\{.*\})", content_str, re.DOTALL)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(1))
+            if isinstance(parsed, dict):
+                if "_raw_text" not in parsed:
+                    parsed["_raw_text"] = content_str
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Direct json
+    try:
+        parsed = json.loads(content_str)
+        if isinstance(parsed, dict):
+            if "_raw_text" not in parsed:
+                parsed["_raw_text"] = content_str
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # If not valid JSON, return formatted dict with raw_text
+    return {"raw_text": content_str}

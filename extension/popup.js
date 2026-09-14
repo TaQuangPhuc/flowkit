@@ -132,6 +132,35 @@ document.getElementById('btn-panel').addEventListener('click', () => {
   });
 });
 
+const profileInput = document.getElementById('profile-id');
+const profileProject = document.getElementById('profile-project');
+
+function showProfile(status) {
+  if (!status) return;
+  if (status.profileId && profileInput && !profileInput.matches(':focus')) {
+    profileInput.value = status.profileId;
+  }
+  if (profileProject) {
+    const pid = status.flowProjectId || '';
+    profileProject.textContent = pid ? pid.slice(0, 8) : '';
+    profileProject.title = pid || 'Flow project learned from the tab';
+  }
+}
+
+if (profileInput) {
+  profileInput.addEventListener('change', () => {
+    chrome.runtime.sendMessage({
+      type: 'SET_PROFILE_ID',
+      profileId: profileInput.value.trim(),
+    });
+  });
+}
+
+chrome.runtime.sendMessage({ type: 'STATUS' }, (data) => {
+  if (chrome.runtime.lastError) return;
+  showProfile(data);
+});
+
 chrome.runtime.sendMessage({ type: 'REQUEST_LOG' }, (data) => {
   if (chrome.runtime.lastError) return;
   if (data && data.log) renderLog(data.log);

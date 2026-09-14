@@ -15,8 +15,19 @@ from agent.worker._parsing import _extract_media_id, _extract_output_url, _is_er
 PROJECT = "11111111-2222-3333-4444-555555555555"
 MEDIA = "12345678-1234-1234-1234-1234567890ab"
 OPERATION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+CHAT_SESSION = "8c72f80b-41ff-42f6-9dff-5a759553f9f4"
 IMAGE_URL = f"https://{fb.MEDIA_HOST}/image/{MEDIA}?sig=x"
 VIDEO_URL = f"https://{fb.MEDIA_HOST}/video/{MEDIA}?sig=x"
+
+
+def rpc_call(client, rpcid):
+    return next(c for c in client.calls if c["rpcid"] == rpcid)
+
+
+def stub_create_session(client, session=CHAT_SESSION):
+    client.responses[fb.RPC_CREATE_SESSION] = {
+        "data": envelope(fb.RPC_CREATE_SESSION, [session])
+    }
 
 
 def envelope(rpcid: str, payload) -> str:
@@ -45,7 +56,12 @@ def client(monkeypatch):
         c.calls.append({"rpcid": rpcid, "freq": freq,
                         "captcha": captcha_action, "match": match, "path": path})
         canned = c.responses.get(rpcid, {"data": ""})
-        return canned(match) if callable(canned) else canned
+        if callable(canned):
+            try:
+                return canned(match, freq)
+            except TypeError:
+                return canned(match)
+        return canned
 
     c.batch_rpc = fake_batch_rpc
     return c
@@ -146,19 +162,72 @@ class TestGenerateVideo:
         payload = json.loads(json.loads(client.calls[0]["freq"])[0][0][1])
         assert payload[0][0][4][1] == "start-mid"
 
+    async def test_t2v_uses_yhhmef_when_no_start_image(self, client):
+        client.responses[fb.RPC_GEN_T2V] = {
+            "data": envelope(fb.RPC_GEN_T2V, [None, 50, [
+                [OPERATION, PROJECT, "scene", None],
+            ]])
+        }
+        result = await client.generate_video(None, "go", PROJECT, "scene-1")
+
+        assert not _is_error(result)
+        call = client.calls[0]
+        assert call["rpcid"] == fb.RPC_GEN_T2V
+        assert call["captcha"] == fb.CAPTCHA_VIDEO
+        inner = json.loads(json.loads(call["freq"])[0][0][1])
+        assert inner[0][0][1] == fb.VIDEO_T2V_MODEL
+        assert len(inner[0][0]) == 5
+        assert json.dumps(fb.FULL_FRAME_CROP) not in json.dumps(inner)
+        assert result["data"]["operations"][0]["operation"]["name"] == OPERATION
+
+    async def test_t2v_empty_start_image_is_not_i2v(self, client):
+        client.responses[fb.RPC_GEN_T2V] = {
+            "data": envelope(fb.RPC_GEN_T2V, [None, 50, [[OPERATION, PROJECT, "scene", None]]])
+        }
+        await client.generate_video("", "go", PROJECT, "scene-1")
+        assert client.calls[0]["rpcid"] == fb.RPC_GEN_T2V
+        assert fb.RPC_GEN_VIDEO not in [c["rpcid"] for c in client.calls]
+
+    async def test_t2v_rejects_an_end_frame_instead_of_dropping_it(self, client):
+        result = await client.generate_video(
+            None, "go", PROJECT, "scene-1", end_image_media_id="end-mid")
+        assert "t2v" in result["error"]
+        assert not client.calls
+
+    async def test_t2v_returns_an_operation_per_variant(self, client):
+        op_b = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
+        client.responses[fb.RPC_GEN_T2V] = {
+            "data": envelope(fb.RPC_GEN_T2V, [None, 50, [
+                [OPERATION, PROJECT, "scene", None],
+                [op_b, PROJECT, "scene", None],
+            ]])
+        }
+        result = await client.generate_video(None, "go", PROJECT, "s")
+        names = [o["operation"]["name"] for o in result["data"]["operations"]]
+        assert names == [OPERATION, op_b]
+        assert client._operation_projects[op_b] == PROJECT
+
     async def test_r2v_posts_stream_chat_with_the_reference_ids(self, client):
+        stub_create_session(client)
         client.responses[fb.RPC_STREAM_CHAT] = self._submitted(client)
         result = await client.generate_video_from_references(
             ["ref-a", "ref-b"], "go", PROJECT, "s")
 
         assert not _is_error(result)
-        call = client.calls[0]
-        assert call["rpcid"] == fb.RPC_STREAM_CHAT
+        assert [c["rpcid"] for c in client.calls][:3] == [
+            fb.RPC_PROJECT_SETTINGS, fb.RPC_CREATE_SESSION, fb.RPC_STREAM_CHAT,
+        ]
+        settings = rpc_call(client, fb.RPC_PROJECT_SETTINGS)
+        assert settings["captcha"] is None
+        row = json.loads(json.loads(settings["freq"])[0][0][1])
+        assert row[1][2][1][0] == fb.VIDEO_R2V_MODEL
+        assert row[2] == [["default_generation_settings.video_defaults"]]
+        call = rpc_call(client, fb.RPC_STREAM_CHAT)
         assert call["path"] == fb.STREAM_CHAT_PATH
         assert call["captcha"] == fb.CAPTCHA_CHAT
         outer = json.loads(call["freq"])
         inner = json.loads(outer[1])
-        assert inner[0] == fb.CHAT_SESSION_SLOT
+        assert inner[0] == CHAT_SESSION
         assert inner[1][0][0][0][0] == "go"
         assert inner[1][1] == [["ref-a"], ["ref-b"]]
         assert inner[2][0] == f"projects/{PROJECT}"
@@ -166,14 +235,59 @@ class TestGenerateVideo:
         assert inner[2][5] == fb.STREAM_CHAT_VIDEO_MODE
         assert result["data"]["operations"][0]["operation"]["name"] == OPERATION
 
-    async def test_r2v_reuses_the_gn0bre_chat_session(self, client):
-        client.remember_chat_session("8c72f80b-41ff-42f6-9dff-5a759553f9f4")
+    async def test_r2v_mints_a_fresh_chat_session(self, client):
+        stale = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        fresh = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        client.remember_chat_session(stale)
+        stub_create_session(client, fresh)
         client.responses[fb.RPC_STREAM_CHAT] = self._submitted(client)
         result = await client.generate_video_from_references(
             ["ref-a"], "go", PROJECT, "s")
         assert not _is_error(result)
-        inner = json.loads(json.loads(client.calls[0]["freq"])[1])
-        assert inner[0] == "8c72f80b-41ff-42f6-9dff-5a759553f9f4"
+        chat = rpc_call(client, fb.RPC_STREAM_CHAT)
+        inner = json.loads(json.loads(chat["freq"])[1])
+        assert inner[0] == fresh
+        assert inner[0] != stale
+        assert client._operation_chat_sessions[OPERATION] == fresh
+        assert client._operation_ref_ids[OPERATION] == ("ref-a",)
+
+    async def test_r2v_without_a_uuid_polls_via_the_chat_session(self, client):
+        """An ack with a null operation slot still has to be pollable."""
+        stub_create_session(client)
+        client.responses[fb.RPC_STREAM_CHAT] = {
+            "data": envelope(fb.RPC_STREAM_CHAT, [None, 50, [[None, PROJECT, "s", None]]])
+        }
+        result = await client.generate_video_from_references(
+            ["ref-a"], "go", PROJECT, "s")
+        assert result["data"]["operations"][0]["operation"]["name"] == CHAT_SESSION
+        assert client._operation_chat_sessions[CHAT_SESSION] == CHAT_SESSION
+        assert client._operation_ref_ids[CHAT_SESSION] == ("ref-a",)
+
+    async def test_r2v_prefers_a_later_cae_chunk_over_the_chat_uuid(self, client):
+        """StreamChat streams the chat-message first; the listing key is later."""
+        chat = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        scene = "99999999-9999-9999-9999-999999999999"
+        body = (
+            envelope(fb.RPC_STREAM_CHAT, [["chat-event", chat, "hello"]])
+            + envelope(fb.RPC_STREAM_CHAT, [[MEDIA, PROJECT, scene, "CAE"]])
+        )
+        stub_create_session(client)
+        client.responses[fb.RPC_STREAM_CHAT] = {"data": body}
+        result = await client.generate_video_from_references(
+            ["ref-a"], "go", PROJECT, "s")
+        assert result["data"]["operations"][0]["operation"]["name"] == MEDIA
+        assert client._operation_media[MEDIA] == MEDIA
+
+    async def test_t2v_ops_snapshot_keeps_the_project_pin(self, client):
+        client.responses[fb.RPC_GEN_T2V] = {
+            "data": envelope(fb.RPC_GEN_T2V, [None, 50, [
+                [OPERATION, PROJECT, "scene", None],
+            ]])
+        }
+        await client.generate_video(None, "go", PROJECT, "scene-1")
+        row = client._ops_snapshot()[OPERATION]
+        assert row["project"] == PROJECT
+        assert row["session"] == ""
 
     async def test_r2v_without_refs_fails_before_a_call(self, client):
         result = await client.generate_video_from_references([], "go", PROJECT, "s")
@@ -293,6 +407,148 @@ class TestCheckVideoStatus:
     async def test_a_nameless_operation_fails_instead_of_polling_forever(self, client):
         result = await client.check_video_status([{"operation": {}}])
         assert result["data"]["operations"][0]["status"] == "MEDIA_GENERATION_STATUS_FAILED"
+
+    async def test_r2v_poll_uses_get_session_when_the_listing_misses(self, client):
+        """Chat-message uuid is not the listing key; GN0Bre holds the clip."""
+        session = "8c72f80b-41ff-42f6-9dff-5a759553f9f4"
+        scene = "99999999-9999-9999-9999-999999999999"
+        client._operation_projects[OPERATION] = PROJECT
+        client._operation_chat_sessions[OPERATION] = session
+        client._operation_ref_ids[OPERATION] = ("ref-a",)
+        client.responses[fb.RPC_OPERATION] = self._poll(complaint="Media not found.")
+        client.responses[fb.RPC_PROJECT_MEDIA] = self._listing(found=False)
+        client.responses[fb.RPC_CHAT_SESSION] = {
+            "data": envelope(fb.RPC_CHAT_SESSION, [
+                [MEDIA, PROJECT, scene, "CAE"],
+                VIDEO_URL,
+            ])
+        }
+
+        def media_rpc(match, freq=None):
+            inner = json.loads(json.loads(freq)[0][0][1])
+            if inner[0] == MEDIA:
+                return {"data": envelope(fb.RPC_MEDIA, [VIDEO_URL])}
+            return {"error": "as29s failed: [5]"}
+
+        client.responses[fb.RPC_MEDIA] = media_rpc
+
+        op = await self._status(client)
+        assert op["status"] == "MEDIA_GENERATION_STATUS_SUCCESSFUL"
+        assert op["operation"]["metadata"]["video"]["mediaId"] == MEDIA
+        assert "/video/" in op["operation"]["metadata"]["video"]["fifeUrl"]
+        assert fb.RPC_CHAT_SESSION in [c["rpcid"] for c in client.calls]
+
+    async def test_r2v_poll_binds_queued_get_session_media_id(self, client):
+        """GetSession names the clip while queued; as29s grows /video/ later."""
+        session = "8c72f80b-41ff-42f6-9dff-5a759553f9f4"
+        client._operation_projects[OPERATION] = PROJECT
+        client._operation_chat_sessions[OPERATION] = session
+        client._operation_ref_ids[OPERATION] = ("ref-a",)
+        client.responses[fb.RPC_OPERATION] = self._poll(complaint="Media not found.")
+        client.responses[fb.RPC_PROJECT_MEDIA] = self._listing(found=False)
+        client.responses[fb.RPC_CHAT_SESSION] = {
+            "data": envelope(fb.RPC_CHAT_SESSION, [
+                ["media_id", [None, None, MEDIA]],
+                ["status", [None, None, "queued"]],
+            ])
+        }
+        client.responses[fb.RPC_MEDIA] = {"data": envelope(fb.RPC_MEDIA, [])}
+
+        op = await self._status(client)
+        assert op["status"] == "MEDIA_GENERATION_STATUS_PENDING"
+        assert op["operation"]["metadata"]["video"]["mediaId"] == MEDIA
+        assert client._operation_media[OPERATION] == MEDIA
+
+        client.responses[fb.RPC_MEDIA] = {"error": "as29s failed: [5]"}
+        op = await self._status(client)
+        assert op["status"] == "MEDIA_GENERATION_STATUS_PENDING"
+        assert op["operation"]["metadata"]["video"]["mediaId"] == MEDIA
+
+        client.responses[fb.RPC_MEDIA] = {"data": envelope(fb.RPC_MEDIA, [VIDEO_URL])}
+        op = await self._status(client)
+        assert op["status"] == "MEDIA_GENERATION_STATUS_SUCCESSFUL"
+        assert op["operation"]["metadata"]["video"]["mediaId"] == MEDIA
+        assert "/video/" in op["operation"]["metadata"]["video"]["fifeUrl"]
+
+    async def test_r2v_poll_reads_a_dict_wrapped_get_session_url(self, client):
+        """GetSession stuffs the clip url in a JSON object, not a CAE row."""
+        session = "8c72f80b-41ff-42f6-9dff-5a759553f9f4"
+        client._operation_projects[OPERATION] = PROJECT
+        client._operation_chat_sessions[OPERATION] = session
+        client.responses[fb.RPC_OPERATION] = self._poll(complaint="Media not found.")
+        client.responses[fb.RPC_PROJECT_MEDIA] = self._listing(found=False)
+        escaped = f"https://{fb.MEDIA_HOST}\\/video\\/{MEDIA}?sig=x"
+        client.responses[fb.RPC_CHAT_SESSION] = {
+            "data": envelope(fb.RPC_CHAT_SESSION, {"clip": escaped})
+        }
+        client.responses[fb.RPC_MEDIA] = {"data": envelope(fb.RPC_MEDIA, [VIDEO_URL])}
+
+        op = await self._status(client)
+        assert op["status"] == "MEDIA_GENERATION_STATUS_SUCCESSFUL"
+        assert op["operation"]["metadata"]["video"]["mediaId"] == MEDIA
+
+    async def test_r2v_poll_reads_cae_rows_from_the_full_listing(self, client):
+        """GetSession is the chat transcript; the listing row is keyed by media id."""
+        session = "8c72f80b-41ff-42f6-9dff-5a759553f9f4"
+        client._operation_projects[OPERATION] = PROJECT
+        client._operation_chat_sessions[OPERATION] = session
+        client._operation_ref_ids[OPERATION] = ("ref-a",)
+        client.responses[fb.RPC_OPERATION] = self._poll(complaint="Media not found.")
+        client.responses[fb.RPC_CHAT_SESSION] = {
+            "data": envelope(fb.RPC_CHAT_SESSION, [session, "still cooking"])
+        }
+        listing = f'[["{MEDIA}","{PROJECT}","{OPERATION}","CAE"]]'
+        client.responses[fb.RPC_PROJECT_MEDIA] = {"data": listing}
+
+        def media_rpc(match, freq=None):
+            inner = json.loads(json.loads(freq)[0][0][1])
+            if inner[0] == MEDIA:
+                return {"data": envelope(fb.RPC_MEDIA, [VIDEO_URL])}
+            return {"error": "as29s failed: [5]"}
+
+        client.responses[fb.RPC_MEDIA] = media_rpc
+
+        op = await self._status(client)
+        assert op["status"] == "MEDIA_GENERATION_STATUS_SUCCESSFUL"
+        assert op["operation"]["metadata"]["video"]["mediaId"] == MEDIA
+        listing_call = next(c for c in client.calls if c["rpcid"] == fb.RPC_PROJECT_MEDIA)
+        assert listing_call["match"] is None
+
+    async def test_r2v_poll_does_not_steal_an_unrelated_cae_clip(self, client):
+        """Finished t2v/i2v rows also look like [mediaId, project, op, CAE]."""
+        session = "8c72f80b-41ff-42f6-9dff-5a759553f9f4"
+        other_op = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        client._operation_projects[OPERATION] = PROJECT
+        client._operation_chat_sessions[OPERATION] = session
+        client.responses[fb.RPC_OPERATION] = self._poll(complaint="Media not found.")
+        client.responses[fb.RPC_CHAT_SESSION] = {
+            "data": envelope(fb.RPC_CHAT_SESSION, [session, "still cooking"])
+        }
+        listing = f'[["{MEDIA}","{PROJECT}","{other_op}","CAE"]]'
+        client.responses[fb.RPC_PROJECT_MEDIA] = {"data": listing}
+
+        def media_rpc(match, freq=None):
+            inner = json.loads(json.loads(freq)[0][0][1])
+            if inner[0] == MEDIA:
+                return {"data": envelope(fb.RPC_MEDIA, [VIDEO_URL])}
+            return {"error": "as29s failed: [5]"}
+
+        client.responses[fb.RPC_MEDIA] = media_rpc
+
+        op = await self._status(client)
+        assert op["status"] == "MEDIA_GENERATION_STATUS_PENDING"
+
+    async def test_t2v_poll_does_not_ask_get_session(self, client):
+        """GetSession on a t2v miss would steal an unrelated Ingredients clip."""
+        client.responses[fb.RPC_OPERATION] = self._poll(status="CAE")
+        client.responses[fb.RPC_PROJECT_MEDIA] = self._listing()
+        client.responses[fb.RPC_MEDIA] = {"data": envelope(fb.RPC_MEDIA, [VIDEO_URL])}
+        client.responses[fb.RPC_CHAT_SESSION] = {
+            "data": envelope(fb.RPC_CHAT_SESSION, [[MEDIA, PROJECT, "s", "CAE"]])
+        }
+
+        assert (await self._status(client))["status"] == "MEDIA_GENERATION_STATUS_SUCCESSFUL"
+        assert fb.RPC_CHAT_SESSION not in [c["rpcid"] for c in client.calls]
 
 
 class TestMediaAndUpload:

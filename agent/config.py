@@ -53,6 +53,39 @@ API_COOLDOWN = int(os.environ.get("API_COOLDOWN", "10"))  # seconds between API 
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "5"))  # Google Flow max parallel requests
 STALE_PROCESSING_TIMEOUT = int(os.environ.get("STALE_PROCESSING_TIMEOUT", "600"))  # 10 min
 
+# ─── Multi-nick gate ─────────────────────────────────────────
+# Nova (and everything else) still talks to one URL on :8100. Behind it, each
+# Chrome profile is one Flow nick + one sticky proxy + one Flow project.
+# Concurrent slots are per nick; credits are not multiplied.
+PROFILE_MAX_CONCURRENT = int(os.environ.get("PROFILE_MAX_CONCURRENT", "2"))
+PROFILES_FILE = Path(os.environ.get("FLOW_PROFILES_FILE", Path(__file__).parent / "profiles.json"))
+# Live nick + proxy store. Secrets stay here, not in the committed profiles.json.
+ACCOUNTS_FILE = Path(os.environ.get("FLOW_ACCOUNTS_FILE", Path(__file__).parent / "accounts.json"))
+
+
+def load_flow_profiles(path: Path | None = None) -> list[dict]:
+    """Load nick → Flow-project pins. Missing or empty file is a single-nick setup."""
+    target = path or PROFILES_FILE
+    if not target.exists():
+        return []
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    rows = raw.get("profiles") if isinstance(raw, dict) else raw
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("id") or "").strip()
+        if not pid:
+            continue
+        project = str(row.get("project_id") or "").strip()
+        out.append({"id": pid, "project_id": project, "note": str(row.get("note") or "")})
+    return out
+
 # ─── Model Keys (loaded from models.json for easy updates) ──
 _MODELS_FILE = Path(__file__).parent / "models.json"
 with open(_MODELS_FILE) as _f:
