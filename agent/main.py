@@ -26,6 +26,8 @@ from agent.api.models import router as models_router
 from agent.api.providers import router as providers_router
 from agent.api.active_project import router as active_project_router
 from agent.api.accounts import router as accounts_router
+from agent.api.system import router as system_router
+from agent.services.request_shield import RequestShieldMiddleware, get_request_shield
 from agent.worker.processor import get_worker_controller
 from agent.services.flow_client import get_flow_client
 from agent.services.event_bus import event_bus
@@ -93,13 +95,6 @@ async def lifespan(app: FastAPI):
 
     controller = get_worker_controller()
 
-    # SIGTERM handler for graceful shutdown (Unix only)
-    try:
-        loop = asyncio.get_event_loop()
-        loop.add_signal_handler(signal.SIGTERM, controller.request_shutdown)
-    except (NotImplementedError, AttributeError):
-        pass
-
     # Start background tasks
     ws_task = asyncio.create_task(run_ws_server())
     worker_task = asyncio.create_task(controller.start())
@@ -126,16 +121,31 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Graceful shutdown: Never drop in-flight client requests
+    shield = get_request_shield()
+    shield.set_draining(True)
+    logger.info("Graceful shutdown: Waiting for %d active client HTTP requests to complete...", shield.active_count)
+    await shield.wait_until_idle(timeout=45.0)
+
+    logger.info("Graceful shutdown: Draining background worker tasks...")
     controller.request_shutdown()
-    await controller.drain()
+    await controller.drain(timeout=120.0)
+
+    try:
+        from agent.services.proxy_checker import stop_proxy_health_daemon
+        stop_proxy_health_daemon()
+    except Exception:
+        pass
+
     ws_task.cancel()
     worker_task.cancel()
     await close_db()
-    logger.info("Flow Kit stopped")
+    logger.info("Flow Kit stopped cleanly without dropping client requests")
 
 
 app = FastAPI(title="Flow Kit", version="1.1.0", lifespan=lifespan)
 
+app.add_middleware(RequestShieldMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -157,6 +167,7 @@ app.include_router(models_router)
 app.include_router(providers_router)
 app.include_router(active_project_router)
 app.include_router(accounts_router, prefix="/api")
+app.include_router(system_router, prefix="/api")
 
 
 import secrets as _secrets
@@ -358,4 +369,5 @@ if __name__ == "__main__":
         port=API_PORT,
         reload=reload_enabled,
         reload_excludes=["*.db", "*.db-wal", "*.db-shm", "output/*"],
+        timeout_graceful_shutdown=60,
     )

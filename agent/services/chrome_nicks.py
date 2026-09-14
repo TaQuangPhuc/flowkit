@@ -255,15 +255,33 @@ def chrome_data_dir(nick_id: str) -> Path:
     return root / nick_id
 
 
+def find_running_chrome_pid(nick_id: str) -> Optional[int]:
+    """Find OS PID of an already running Chrome browser for this nick."""
+    data = str(chrome_data_dir(nick_id))
+    try:
+        out = subprocess.check_output(["pgrep", "-af", "chrome"], text=True)
+        for line in out.splitlines():
+            # Main browser process matches user-data-dir and is not a child worker/renderer
+            if data in line and "--type=" not in line:
+                parts = line.strip().split()
+                if parts and parts[0].isdigit():
+                    return int(parts[0])
+    except Exception:
+        pass
+    return None
+
+
 def chrome_running(nick_id: str) -> bool:
     proc = _procs.get(nick_id)
-    if proc is None:
-        return False
-    code = proc.poll()
-    if code is None:
-        return True
-    _procs.pop(nick_id, None)
-    return False
+    if proc is not None:
+        code = proc.poll()
+        if code is None:
+            return True
+        _procs.pop(nick_id, None)
+
+    # If server was restarted, check if Chrome process is still running on OS
+    pid = find_running_chrome_pid(nick_id)
+    return pid is not None
 
 
 def running_chrome_proxy_port(nick_id: str) -> Optional[int]:
@@ -365,11 +383,19 @@ async def launch_nick(nick_id: str) -> dict:
     if account is None:
         raise KeyError(nick_id)
     if chrome_running(nick_id):
+        existing_pid = _procs[nick_id].pid if nick_id in _procs else find_running_chrome_pid(nick_id)
+        if account.get("proxy_url"):
+            try:
+                parsed = parse_proxy_url(account["proxy_url"])
+                if parsed.has_auth:
+                    await ensure_bridge(nick_id, parsed)
+            except Exception as e:
+                logger.warning("Could not re-ensure bridge for %s: %s", nick_id, e)
         return {
             "ok": True,
             "id": nick_id,
             "already_running": True,
-            "pid": _procs[nick_id].pid,
+            "pid": existing_pid,
             "data_dir": str(chrome_data_dir(nick_id)),
         }
 
