@@ -100,16 +100,21 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(controller.start())
     logger.info("WS server + worker started")
 
-    # Auto-launch / ensure enabled nicks and their local proxy bridges
+    # Auto-restore bridges and launch enabled nicks
     try:
         from agent.services.accounts import load_accounts
-        from agent.services.chrome_nicks import launch_nick
+        from agent.services.chrome_nicks import ensure_nick_active, restore_all_bridges
+        # 1. ALWAYS restore proxy bridges immediately on startup so running Chromes never fail
+        restored_bridges = await restore_all_bridges()
+        if restored_bridges:
+            logger.info("Restored proxy bridges on startup: %s", restored_bridges)
+        # 2. Ensure all enabled accounts are active
         for acc in load_accounts():
             if acc.get("enabled", True):
                 logger.info("Auto-ensuring Chrome & proxy bridge for enabled nick: %s", acc["id"])
-                asyncio.create_task(launch_nick(acc["id"]))
+                asyncio.create_task(ensure_nick_active(acc["id"]))
     except Exception as e:
-        logger.warning("Auto-launching nicks failed: %s", e)
+        logger.warning("Auto-restoring nicks & bridges failed: %s", e)
 
     # Start proxy health & temporary expiry daemon
     try:

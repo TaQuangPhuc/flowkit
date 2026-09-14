@@ -325,6 +325,42 @@ def get_bridge(nick_id: str) -> Optional[LocalProxyBridge]:
     return _bridges.get(nick_id)
 
 
+async def restore_nick_bridge(nick_id: str) -> Optional[LocalProxyBridge]:
+    """Ensure the local proxy bridge is listening on the exact port expected by Chrome.
+    
+    Prevents ERR_PROXY_CONNECTION_FAILED and error pages when FlowKit restarts.
+    """
+    from agent.services.accounts import get_account
+    account = get_account(nick_id)
+    if not account or not account.get("proxy_url"):
+        return None
+
+    parsed = parse_proxy_url(account["proxy_url"])
+    if not parsed.has_auth:
+        return None
+
+    # Determine what port Chrome was started with (if running)
+    expected_port = running_chrome_proxy_port(nick_id) or 0
+    bridge = await ensure_bridge(nick_id, parsed, port=expected_port)
+    logger.info("Proxy bridge restored/verified for %s on port %d -> %s", nick_id, bridge.port, parsed.redacted)
+    return bridge
+
+
+async def restore_all_bridges() -> dict[str, int]:
+    """Ensure proxy bridges are actively listening for ALL enabled accounts on startup."""
+    from agent.services.accounts import load_accounts
+    restored = {}
+    for acc in load_accounts():
+        if acc.get("enabled", True) and acc.get("proxy_url"):
+            try:
+                bridge = await restore_nick_bridge(acc["id"])
+                if bridge and bridge.port:
+                    restored[acc["id"]] = bridge.port
+            except Exception as exc:
+                logger.warning("Could not restore bridge for %s: %s", acc["id"], exc)
+    return restored
+
+
 async def check_proxy(proxy_url: str) -> dict:
     resolved = resolve_known_proxy(proxy_url)
     parsed = parse_proxy_url(resolved)
@@ -490,25 +526,39 @@ def _pid_is_live(pid: int) -> bool:
     return state not in {"", "Z"}
 
 
-def drop_stale_chrome_lock(user_data_dir: Path | str) -> bool:
-    """Remove SingletonLock if its pid is gone or a zombie.
+def get_all_chrome_pids_for_nick(nick_id: str) -> list[int]:
+    """Find ALL Chrome process PIDs (main, renderers, utility, crashpad) for this nick."""
+    data = str(chrome_data_dir(nick_id))
+    pids = []
+    try:
+        out = subprocess.check_output(["pgrep", "-af", "chrome"], text=True)
+        for line in out.splitlines():
+            if data in line:
+                parts = line.strip().split()
+                if parts and parts[0].isdigit():
+                    pids.append(int(parts[0]))
+    except Exception:
+        pass
+    return pids
 
-    Chrome treats the lock as 'profile in use'. After Stop, an unreaped
-    child stays a zombie so kill(pid,0) still succeeds and Launch bounces.
-    """
+
+def drop_stale_chrome_lock(user_data_dir: Path | str, force: bool = False) -> bool:
+    """Remove SingletonLock if its pid is gone or a zombie, or unconditionally if force=True."""
     data = Path(user_data_dir)
     lock = data / "SingletonLock"
     if not lock.exists() and not lock.is_symlink():
         return False
-    live = False
-    try:
-        target = os.readlink(lock)
-        pid = int(target.rsplit("-", 1)[-1])
-        live = _pid_is_live(pid)
-    except (OSError, ValueError):
+    if not force:
         live = False
-    if live:
-        return False
+        try:
+            target = os.readlink(lock)
+            pid = int(target.rsplit("-", 1)[-1])
+            live = _pid_is_live(pid)
+        except (OSError, ValueError):
+            live = False
+        if live:
+            return False
+
     for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         try:
             (data / name).unlink()
@@ -519,56 +569,104 @@ def drop_stale_chrome_lock(user_data_dir: Path | str) -> bool:
     return True
 
 
-async def stop_nick(nick_id: str) -> bool:
-    proc = _procs.pop(nick_id, None)
-    stopped = False
-    if proc is not None and proc.poll() is None:
+def cleanup_orphaned_chrome(nick_id: str, force: bool = False) -> int:
+    """Detect and clean up orphaned or stuck Chrome processes for this nick."""
+    pids = get_all_chrome_pids_for_nick(nick_id)
+    if not pids:
+        drop_stale_chrome_lock(chrome_data_dir(nick_id), force=force)
+        return 0
+
+    killed = 0
+    for pid in pids:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)
+            killed += 1
         except (ProcessLookupError, PermissionError, OSError):
-            proc.terminate()
+            pass
+
+    time.sleep(0.3)
+    for pid in pids:
+        if _pid_is_live(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+    _procs.pop(nick_id, None)
+    drop_stale_chrome_lock(chrome_data_dir(nick_id), force=True)
+    logger.info("Cleaned up %d orphaned Chrome processes for nick=%s", killed, nick_id)
+    return killed
+
+
+async def stop_nick(nick_id: str) -> bool:
+    """Stop Chrome and all child processes for this nick cleanly."""
+    pids = get_all_chrome_pids_for_nick(nick_id)
+    proc = _procs.pop(nick_id, None)
+    if proc is not None and proc.pid not in pids:
+        pids.append(proc.pid)
+
+    stopped = False
+    if pids:
         stopped = True
-        for _ in range(40):
-            if proc.poll() is not None:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        for _ in range(25):
+            remaining = [p for p in pids if _pid_is_live(p)]
+            if not remaining:
                 break
             await asyncio.sleep(0.1)
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                proc.kill()
-            await asyncio.sleep(0.2)
-        try:
-            proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            pass
-    else:
-        orphan_pid = find_running_chrome_pid(nick_id)
-        if orphan_pid:
-            try:
-                os.killpg(os.getpgid(orphan_pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
+
+        for pid in pids:
+            if _pid_is_live(pid):
                 try:
-                    os.kill(orphan_pid, signal.SIGTERM)
-                except Exception:
-                    pass
-            stopped = True
-            for _ in range(40):
-                if not _pid_is_live(orphan_pid):
-                    break
-                await asyncio.sleep(0.1)
-            if _pid_is_live(orphan_pid):
-                try:
-                    os.killpg(os.getpgid(orphan_pid), signal.SIGKILL)
+                    os.kill(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, OSError):
-                    try:
-                        os.kill(orphan_pid, signal.SIGKILL)
-                    except Exception:
-                        pass
-                await asyncio.sleep(0.2)
-    drop_stale_chrome_lock(chrome_data_dir(nick_id))
+                    pass
+
+    drop_stale_chrome_lock(chrome_data_dir(nick_id), force=True)
     await stop_bridge(nick_id)
     return stopped
+
+
+async def ensure_nick_active(nick_id: str) -> dict:
+    """Ensure nick has active Chrome and its proxy bridge is listening on startup.
+    
+    Prevents orphaned processes and eliminates ERR_PROXY_CONNECTION_FAILED permanently.
+    """
+    from agent.services.accounts import get_account
+    account = get_account(nick_id)
+    if not account:
+        raise KeyError(nick_id)
+
+    # 1. Restore/ensure bridge first so Chrome never encounters ERR_PROXY_CONNECTION_FAILED
+    if account.get("proxy_url"):
+        try:
+            parsed = parse_proxy_url(account["proxy_url"])
+            if parsed.has_auth:
+                expected_port = running_chrome_proxy_port(nick_id) or 0
+                await ensure_bridge(nick_id, parsed, port=expected_port)
+        except Exception as e:
+            logger.warning("ensure_nick_active: bridge setup error for %s: %s", nick_id, e)
+
+    # 2. Check if Chrome is already alive
+    if chrome_running(nick_id):
+        existing_pid = _procs[nick_id].pid if nick_id in _procs else find_running_chrome_pid(nick_id)
+        logger.info("ensure_nick_active: Chrome already alive for %s (PID %s)", nick_id, existing_pid)
+        return {
+            "ok": True,
+            "id": nick_id,
+            "already_running": True,
+            "pid": existing_pid,
+            "data_dir": str(chrome_data_dir(nick_id)),
+        }
+
+    # 3. Clean any orphaned lockfiles and launch Chrome
+    drop_stale_chrome_lock(chrome_data_dir(nick_id), force=True)
+    return await launch_nick(nick_id)
 
 
 def launch_status(nick_id: str) -> dict:

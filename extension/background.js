@@ -679,12 +679,28 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
       const execMsg = e?.message || '';
       if (execMsg.includes('Frame with ID 0 is showing error page') || execMsg.includes('cannot be scripted')) {
         try { await chrome.tabs.update(tabId, { url: FLOW_TAB_URL }); } catch {}
+        return { error: 'ERROR_PAGE_NAVIGATED', isErrorPage: true };
       }
       throw e;
     }
     await sleep(200);
     return await chrome.tabs.sendMessage(tabId, payload);
   }
+}
+
+/** Helper to wait until a tab finishes loading its HTML without error page. */
+async function waitForTabLoad(tabId, timeoutMs = 8000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t && t.status === 'complete' && t.url && !t.url.startsWith('chrome-error://') && !t.url.includes('chromewebdata')) {
+        return t;
+      }
+    } catch {}
+    await sleep(350);
+  }
+  return null;
 }
 
 /** Try to wake a discarded Flow tab so `sendMessage` can reach it.
@@ -712,11 +728,27 @@ function captchaFromTab(tabId, requestId, captchaAction) {
 async function solveCaptcha(requestId, captchaAction) {
   let tabs = await chrome.tabs.query({ url: flowUrls });
 
-  // No Flow tab at all — spawn one and let it settle.
+  // If no Flow tab, check if any tab was knocked to chrome-error:// or chromewebdata
   if (!tabs.length) {
     try {
-      await chrome.tabs.create({ url: FLOW_TAB_URL, active: false });
-      await sleep(3000);
+      const allTabs = await chrome.tabs.query({});
+      for (const t of allTabs) {
+        if (t.url && (t.url.startsWith('chrome-error://') || t.url.includes('chromewebdata'))) {
+          try {
+            await chrome.tabs.update(t.id, { url: FLOW_TAB_URL, active: true });
+            await waitForTabLoad(t.id, 6000);
+          } catch {}
+        }
+      }
+      tabs = await chrome.tabs.query({ url: flowUrls });
+    } catch {}
+  }
+
+  // Still no Flow tab — spawn one and wait for it to settle
+  if (!tabs.length) {
+    try {
+      const created = await chrome.tabs.create({ url: FLOW_TAB_URL, active: false });
+      await waitForTabLoad(created.id, 8000);
       tabs = await chrome.tabs.query({ url: flowUrls });
     } catch (e) {
       return { error: e.message || 'NO_FLOW_TAB' };
@@ -724,17 +756,24 @@ async function solveCaptcha(requestId, captchaAction) {
     if (!tabs.length) return { error: 'NO_FLOW_TAB' };
   }
 
-  // Try each Flow tab in turn. A tab that answers "no grecaptcha" is a tab
-  // sitting on a page that never loaded it — another Flow tab may well be
-  // fine. Returning on the first one let one stale tab veto every generation.
+  // Try each Flow tab in turn
   const errors = [];
   for (const candidate of tabs) {
+    // If candidate tab is on an error page, redirect it and try next candidate
+    if (candidate.url && (candidate.url.startsWith('chrome-error://') || candidate.url.includes('chromewebdata'))) {
+      try { await chrome.tabs.update(candidate.id, { url: FLOW_TAB_URL }); } catch {}
+      continue;
+    }
+
     const tab = await reviveTabIfNeeded(candidate);
     if (!tab) continue;
     try {
-      // execute() often never installs on a backgrounded Flow tab.
       try { await chrome.tabs.update(tab.id, { active: true }); } catch {}
       const resp = await captchaFromTab(tab.id, requestId, captchaAction);
+      if (resp?.isErrorPage) {
+        errors.push(resp?.error || 'ERROR_PAGE');
+        continue;
+      }
       if (!resp?.token) {
         errors.push(resp?.error || 'NO_TOKEN');
         continue;
@@ -743,8 +782,6 @@ async function solveCaptcha(requestId, captchaAction) {
     } catch (e) {
       const msg = e?.message || '';
       errors.push(msg);
-      // Tab evaporated mid-call (window closed, discarded again, navigated
-      // away, or error page). Move on to the next candidate rather than failing the job.
       if (
         msg.includes('No current window') ||
         msg.includes('No tab with id') ||
@@ -761,14 +798,14 @@ async function solveCaptcha(requestId, captchaAction) {
     }
   }
 
-  // Every candidate failed — last-ditch, spawn a fresh tab and try it once.
+  // Every candidate failed — last-ditch, spawn a fresh tab and wait for it to load completely
   try {
-    await chrome.tabs.create({ url: FLOW_TAB_URL, active: false });
-    await sleep(3000);
-    const fresh = await chrome.tabs.query({ url: flowUrls });
-    const target = fresh.find((t) => !t.discarded) || fresh[0];
-    if (!target) return { error: 'NO_FLOW_TAB' };
-    return await captchaFromTab(target.id, requestId, captchaAction);
+    const createdTab = await chrome.tabs.create({ url: FLOW_TAB_URL, active: true });
+    const readyTab = (await waitForTabLoad(createdTab.id, 8000)) || createdTab;
+    await sleep(1000);
+    const resp = await captchaFromTab(readyTab.id, requestId, captchaAction);
+    if (resp?.token) return resp;
+    return resp || { error: 'NO_TOKEN_AFTER_FRESH_TAB' };
   } catch (e) {
     return { error: e?.message || errors[0] || 'NO_FLOW_TAB' };
   }
@@ -827,20 +864,29 @@ async function handleReloadFlowTab(msg) {
 const CAPTCHA_SLOT = '__CAPTCHA__';
 const MAX_RPC_TEXT = 32000000; // the project listing alone is past 17 MB
 
+async function ensureLoadedFlowTab(timeoutMs = 8000) {
+  const tabs = await chrome.tabs.query({ url: flowUrls });
+  for (const t of tabs) {
+    if (!t.discarded && t.url && !t.url.startsWith('chrome-error://') && !t.url.includes('chromewebdata')) {
+      return t;
+    }
+  }
+  try {
+    const created = await chrome.tabs.create({ url: FLOW_TAB_URL, active: true });
+    return (await waitForTabLoad(created.id, timeoutMs)) || created;
+  } catch {
+    return null;
+  }
+}
+
 async function runBatchRpc(cmd) {
   const tabs = await chrome.tabs.query({ url: flowUrls });
-  let candidate = tabs.find((t) => !t.discarded) || tabs[0];
-  if (!candidate) {
-    // No Flow tab — open one and give the app a moment to boot, otherwise
-    // WIZ_global_data is not on the page yet and `at` comes back empty.
-    try {
-      await chrome.tabs.create({ url: FLOW_TAB_URL, active: false });
-      await sleep(5000);
-      const fresh = await chrome.tabs.query({ url: flowUrls });
-      candidate = fresh.find((t) => !t.discarded) || fresh[0];
-    } catch (e) {
-      return { error: e?.message || 'NO_FLOW_TAB' };
+  let candidate = tabs.find((t) => !t.discarded && !t.url?.startsWith('chrome-error://') && !t.url?.includes('chromewebdata')) || tabs[0];
+  if (!candidate || candidate.url?.startsWith('chrome-error://') || candidate.url?.includes('chromewebdata')) {
+    if (candidate) {
+      try { await chrome.tabs.update(candidate.id, { url: FLOW_TAB_URL }); } catch {}
     }
+    candidate = await ensureLoadedFlowTab(7000);
     if (!candidate) return { error: 'NO_FLOW_TAB' };
   }
   // Chrome discards backgrounded tabs; executeScript throws on a dead one.
@@ -890,7 +936,31 @@ async function runBatchRpc(cmd) {
       },
     });
   } catch (e) {
-    return { error: e?.message || 'INJECT_FAILED' };
+    const execErr = e?.message || '';
+    if (execErr.includes('Frame with ID 0 is showing error page') || execErr.includes('cannot be scripted')) {
+      // Auto-recover error page
+      try { await chrome.tabs.update(tab.id, { url: FLOW_TAB_URL }); } catch {}
+      // Retry once on a freshly loaded Flow tab
+      const fallbackTab = await ensureLoadedFlowTab(7000);
+      if (fallbackTab && fallbackTab.id !== tab.id) {
+        try {
+          const retryResults = await chrome.scripting.executeScript({
+            target: { tabId: fallbackTab.id },
+            world: 'MAIN',
+            args,
+            func: async (rpcid, freqStr, maxText, match, customPath) => {
+              if (typeof globalThis.__flowRunBatch === 'function') {
+                return globalThis.__flowRunBatch(rpcid, freqStr, maxText, match, customPath);
+              }
+              return { error: 'NO_BATCH_RUNNER' };
+            },
+          });
+          const injectedRetry = (retryResults || []).find((row) => row && row.result != null);
+          if (injectedRetry?.result) return injectedRetry.result;
+        } catch (_) {}
+      }
+    }
+    return { error: execErr || 'INJECT_FAILED' };
   }
   const injected = (results || []).find((row) => row && row.result != null);
   return injected?.result || { error: 'NO_INJECTION_RESULT' };
