@@ -206,14 +206,15 @@ def save_batch_job(batch_id: str, **kwargs):
     pending = sum(1 for it in items if it.get("status") == "PENDING")
 
     pct = round((completed / total * 100), 1) if total > 0 else 0
+    is_video_running = any(it.get("video_status") in ["SUBMITTING", "RENDERING", "GENERATING"] for it in items)
     b["stats"] = {
         "total": total,
         "completed": completed,
         "failed": failed,
-        "processing": processing,
+        "processing": processing + (1 if is_video_running else 0),
         "pending": pending,
         "progress_percent": pct,
-        "is_done": (completed + failed) == total and total > 0
+        "is_done": (completed + failed) == total and total > 0 and not is_video_running
     }
 
     bdir = WORK_DIR / f"batch_{batch_id}"
@@ -305,23 +306,50 @@ def transfer_item_to_video(batch_id: str, item_id: int, motion_prompt: str = "")
     """Transfer completed image as first frame to Veo 3.1 for an 8s commercial video."""
     b = BATCH_JOBS.get(batch_id)
     if not b:
+        bpath = WORK_DIR / f"batch_{batch_id}" / "batch.json"
+        if bpath.exists():
+            try:
+                b = json.loads(bpath.read_text(encoding="utf-8"))
+                BATCH_JOBS[batch_id] = b
+            except Exception:
+                pass
+    if not b:
         return
     item = next((it for it in b.get("items", []) if it.get("item_id") == item_id), None)
-    if not item or not item.get("output_media_id"):
+    if not item:
         return
 
     bdir = WORK_DIR / f"batch_{batch_id}"
+    item_img = bdir / f"item_{item_id}.jpg"
+
     v_prompt = motion_prompt or (
         "Cinematic commercial fashion shot, model posing smoothly, subtle breathing movement, "
         "gentle fabric motion, product perfectly visible and stable, photorealistic 8k vertical video."
     )
 
     item["video_status"] = "SUBMITTING"
+    item["video_error"] = None
     save_batch_job(batch_id)
 
     try:
+        # Guarantee start image exists on active FlowKit worker
+        start_mid = None
+        if item_img.exists():
+            try:
+                start_mid = upload_image_flowkit(item_img)
+                item["output_media_id"] = start_mid
+                print(f"[BATCH VIDEO] Item {item_id} re-uploaded to active worker media_id: {start_mid}")
+            except Exception as up_err:
+                print(f"[BATCH VIDEO] Could not re-upload item {item_id}, fallback to existing media_id: {up_err}")
+                start_mid = item.get("output_media_id")
+        else:
+            start_mid = item.get("output_media_id")
+
+        if not start_mid:
+            raise RuntimeError(f"Không tìm thấy ảnh gốc cho item #{item_id}")
+
         payload = {
-            "start_image_media_id": item["output_media_id"],
+            "start_image_media_id": start_mid,
             "prompt": v_prompt,
             "project_id": "",
             "scene_id": f"batch_{batch_id}_{item_id}",
