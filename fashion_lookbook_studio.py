@@ -134,66 +134,77 @@ LOOKBOOK_TEMPLATES = {
 
 LOOKBOOK_MODELS = {
     "asian_elegance_24": {
+        "id": "asian_elegance_24",
         "model_id": "asian_elegance_24",
-        "name": "Lan Anh (Á Đông Thanh Lịch)",
+        "name": "Mai Phương (Á Đông Thanh Lịch)",
         "gender": "female",
         "age_approx": 24,
         "height_approx": "1m70",
+        "description": "24 tuổi, 1m70, gương mặt Á Đông thanh tú, da trắng sứ, vóc dáng mảnh mai, thần thái tiểu thư nhẹ nhàng.",
         "vibe": "Da trắng sứ, thanh tú, vóc dáng mảnh mai, thần thái tiểu thư nhẹ nhàng",
         "anchor": "A stunning 24-year-old East Asian female fashion model, 172cm height, porcelain skin tone, elegant sleek black hair pulled into a sophisticated low bun, refined high-fashion facial features, natural minimalist makeup, poised upright posture.",
-        "thumbnail_url": "/assets/models/asian_elegance_24.jpg",
-        "default_file": Path("/home/pc/flowkit/mau/human.jpg")
+        "avatar_url": "/showcase/models/asian_elegance.jpg",
+        "thumbnail_url": "/showcase/models/asian_elegance.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/asian_elegance.jpg")
     },
-    "korean_minimalist_23": {
-        "model_id": "korean_minimalist_23",
-        "name": "Min-ji (Hàn Quốc Trẻ Trung)",
+    "korean_chic_22": {
+        "id": "korean_chic_22",
+        "model_id": "korean_chic_22",
+        "name": "Min Ji (Hàn Quốc Trẻ Trung)",
         "gender": "female",
-        "age_approx": 23,
+        "age_approx": 22,
         "height_approx": "1m68",
+        "description": "22 tuổi, 1m68, phong cách ulzzang hiện đại, tóc ngắn/búi gọn, phong thái trong trẻo ngọt ngào.",
         "vibe": "Phong cách ulzzang hiện đại, tóc ngắn/búi gọn, phong thái trong trẻo",
-        "anchor": "A chic 23-year-old Korean female fashion model, 168cm height, luminous dewy skin, soft textured shoulder-length hair, graceful youthful high-fashion look, confident gentle expression.",
-        "thumbnail_url": "/assets/models/korean_minimalist_23.jpg",
-        "default_file": Path("/home/pc/flowkit/mau/human.jpg")
+        "anchor": "A chic 22-year-old Korean female fashion model, 168cm height, luminous dewy skin, soft textured shoulder-length hair, graceful youthful high-fashion look, confident gentle expression.",
+        "avatar_url": "/showcase/models/korean_chic.jpg",
+        "thumbnail_url": "/showcase/models/korean_chic.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/korean_chic.jpg")
     },
     "caucasian_chic_25": {
+        "id": "caucasian_chic_25",
         "model_id": "caucasian_chic_25",
         "name": "Elena (Âu Mỹ Haute Couture)",
         "gender": "female",
         "age_approx": 25,
         "height_approx": "1m76",
+        "description": "25 tuổi, 1m76, gương mặt góc cạnh chuẩn sàn diễn Paris/Milan, thần thái high-fashion sắc sảo.",
         "vibe": "Gương mặt góc cạnh chuẩn sàn diễn Paris/Milan, thần thái high-fashion sắc sảo",
         "anchor": "A striking 25-year-old European female runway model, 176cm height, sculptured Parisian cheekbones, sleek chestnut hair, confident intense gaze, statuesque posture.",
-        "thumbnail_url": "/assets/models/caucasian_chic_25.jpg",
-        "default_file": Path("/home/pc/flowkit/mau/human.jpg")
+        "avatar_url": "/showcase/models/western_editorial.jpg",
+        "thumbnail_url": "/showcase/models/western_editorial.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/western_editorial.jpg")
     }
 }
+# Backward compatibility alias
+LOOKBOOK_MODELS["korean_minimalist_23"] = LOOKBOOK_MODELS["korean_chic_22"]
 
 # ─── MUSIC PRESETS ───────────────────────────────────────────────────────────
 
 LOOKBOOK_BGM = {
     "original": {
         "bgm_id": "original",
-        "label": "🔊 Âm thanh gốc Veo 3.1 (Tiếng sải bước & không khí sàn diễn)",
+        "label": "🎵 Nhạc nền gốc đề xuất (Tự động mix)",
         "file": None
     },
     "vogue_runway": {
         "bgm_id": "vogue_runway",
-        "label": "👠 Vogue Runway House (Nhịp điệu Catwalk hiện đại)",
-        "file": BGM_DIR / "tiktok_upbeat_carefree.mp3"
+        "label": "✨ Vogue Runway Beats (120 BPM - Sàn diễn)",
+        "file": BGM_DIR / "vogue_runway_120bpm.mp3"
     },
-    "deep_minimal_house": {
-        "bgm_id": "deep_minimal_house",
-        "label": "🎧 Deep Minimal Lounge (Sành điệu, sang trọng)",
-        "file": BGM_DIR / "tiktok_vlog_beetle.mp3"
+    "french_chic": {
+        "bgm_id": "french_chic",
+        "label": "🍷 French Chic Lounge (Thanh lịch, thời thượng)",
+        "file": BGM_DIR / "french_chic_lounge.mp3"
     },
-    "paris_chic_jazz": {
-        "bgm_id": "paris_chic_jazz",
-        "label": "☕ Paris Chic Acoustic (Nhẹ nhàng, thư thái)",
-        "file": BGM_DIR / "acoustic_soft.mp3"
+    "luxury_minimal": {
+        "bgm_id": "luxury_minimal",
+        "label": "💎 Luxury Minimal Ambient (Sang trọng, êm dịu)",
+        "file": BGM_DIR / "luxury_minimal_ambient.mp3"
     },
-    "tiktok_playful": {
-        "bgm_id": "tiktok_playful",
-        "label": "🎵 TikTok Playful & Vibrant (Vui tươi, bắt tai)",
+    "tiktok_viral": {
+        "bgm_id": "tiktok_viral",
+        "label": "🔥 TikTok Viral Fashion (Bắt tai, xu hướng)",
         "file": BGM_DIR / "tiktok_playful_snitch.mp3"
     },
     "lofi_chill": {
@@ -213,7 +224,12 @@ def get_public_templates() -> list[dict]:
 
 def get_public_models() -> list[dict]:
     res = []
+    seen = set()
     for m in LOOKBOOK_MODELS.values():
+        mid = m.get("id") or m.get("model_id")
+        if mid in seen:
+            continue
+        seen.add(mid)
         item = dict(m)
         if "default_file" in item:
             item["default_file"] = str(item["default_file"]) if item["default_file"] else None
