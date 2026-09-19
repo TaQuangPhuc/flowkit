@@ -3448,11 +3448,11 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             data = {
                 "ok": True,
                 "active_workers": max(1, workers_count),
-                "max_concurrency": max(10, workers_count * 10),
-                "default_threads": 10,
+                "max_concurrency": max(15, workers_count * 15),
+                "default_threads": 15,
                 "min_threads": 1,
-                "max_threads": 30,
-                "recommended_threads": 15,
+                "max_threads": 45,
+                "recommended_threads": 20,
                 "description": "Số luồng xử lý song song tối ưu cho cụm Google AI."
             }
             self.send_response(200)
