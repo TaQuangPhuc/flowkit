@@ -164,20 +164,105 @@ LOOKBOOK_MODELS = {
     "caucasian_chic_25": {
         "id": "caucasian_chic_25",
         "model_id": "caucasian_chic_25",
-        "name": "Elena (Âu Mỹ Haute Couture)",
+        "name": "Maria Vitoria (Âu Mỹ Haute Couture)",
         "gender": "female",
         "age_approx": 25,
         "height_approx": "1m76",
-        "description": "25 tuổi, 1m76, gương mặt góc cạnh chuẩn sàn diễn Paris/Milan, thần thái high-fashion sắc sảo.",
+        "description": "25 tuổi, 1m76, gương mặt góc cạnh chuẩn sàn diễn Paris/Milan, thần thái high-fashion sắc sảo quyến rũ.",
         "vibe": "Gương mặt góc cạnh chuẩn sàn diễn Paris/Milan, thần thái high-fashion sắc sảo",
-        "anchor": "A striking 25-year-old European female runway model, 176cm height, sculptured Parisian cheekbones, sleek chestnut hair, confident intense gaze, statuesque posture.",
+        "anchor": "A striking 25-year-old European female runway model, 176cm height, sculptured Parisian cheekbones, sleek dark brown hair, confident intense gaze, statuesque posture, luxury editorial aesthetic.",
         "avatar_url": "/showcase/models/western_editorial.jpg",
         "thumbnail_url": "/showcase/models/western_editorial.jpg",
         "default_file": Path("/home/pc/flowkit/mau/models/western_editorial.jpg")
+    },
+    "parisian_chic_24": {
+        "id": "parisian_chic_24",
+        "model_id": "parisian_chic_24",
+        "name": "Juliette (Parisian Chic & Tinh Tế)",
+        "gender": "female",
+        "age_approx": 24,
+        "height_approx": "1m75",
+        "description": "24 tuổi, 1m75, nét đẹp Pháp tự nhiên thanh tú, mắt nâu sâu thẳm, phong thái lãng mạn nhẹ nhàng.",
+        "vibe": "Nét đẹp Pháp tự nhiên, mắt nâu sâu thẳm, phong thái lãng mạn nhẹ nhàng",
+        "anchor": "A chic 24-year-old French female fashion model, 175cm height, natural brown hair falling gently over shoulders, refined European features, deep soulful brown eyes, Parisian understated elegance, calm sophisticated gaze.",
+        "avatar_url": "/showcase/models/juliette_potier.jpg",
+        "thumbnail_url": "/showcase/models/juliette_potier.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/juliette_potier.jpg")
+    },
+    "western_gentleman_26": {
+        "id": "western_gentleman_26",
+        "model_id": "western_gentleman_26",
+        "name": "Aiden (Nam Âu Mỹ Lịch Lãm & Suit)",
+        "gender": "male",
+        "age_approx": 26,
+        "height_approx": "1m85",
+        "description": "26 tuổi, 1m85, đường nét góc cạnh nam tính, ánh nhìn cuốn hút, chuẩn quý ông thời trang vest & suit.",
+        "vibe": "Gương mặt góc cạnh nam tính, ánh nhìn cuốn hút, chuẩn quý ông thời trang cao cấp",
+        "anchor": "A handsome 26-year-old Caucasian male fashion model, 185cm height, strong jawline, neatly styled brown hair, warm confident expression, athletic lean build, sophisticated gentleman demeanor.",
+        "avatar_url": "/showcase/models/aiden_schmahl.jpg",
+        "thumbnail_url": "/showcase/models/aiden_schmahl.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/aiden_schmahl.jpg")
+    },
+    "asian_streetwear_23": {
+        "id": "asian_streetwear_23",
+        "model_id": "asian_streetwear_23",
+        "name": "Chang-Yi (Nam Á Đông Streetwear Cá Tính)",
+        "gender": "male",
+        "age_approx": 23,
+        "height_approx": "1m82",
+        "description": "23 tuổi, 1m82, phong cách street-style Á Đông sắc nét, vóc dáng chuẩn, phù hợp thời trang unisex và trẻ trung.",
+        "vibe": "Street-style Á Đông sắc nét, cá tính, vóc dáng chuẩn",
+        "anchor": "A striking 23-year-old East Asian male fashion model, 182cm height, contemporary buzz cut, sharp high-fashion facial contours, intense charismatic gaze, lean athletic physique, edgy modern streetwear aesthetic.",
+        "avatar_url": "/showcase/models/changyi_chen.jpg",
+        "thumbnail_url": "/showcase/models/changyi_chen.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/changyi_chen.jpg")
+    },
+    "asian_minimalist_25": {
+        "id": "asian_minimalist_25",
+        "model_id": "asian_minimalist_25",
+        "name": "Cun-Hui (Á Đông Hiện Đại & Tối Giản)",
+        "gender": "female",
+        "age_approx": 25,
+        "height_approx": "1m74",
+        "description": "25 tuổi, 1m74, tóc đen suôn dài, nét đẹp Á Đông thuần khiết, phong cách tối giản thanh lịch vượt thời gian.",
+        "vibe": "Nét đẹp Á Đông thuần khiết, tóc đen suôn dài, phong cách tối giản thanh lịch",
+        "anchor": "An elegant 25-year-old East Asian female fashion model, 174cm height, sleek long black hair, porcelain skin, graceful serene features, minimalist high-fashion poise, effortless quiet luxury vibe.",
+        "avatar_url": "/showcase/models/cunhui_yu.jpg",
+        "thumbnail_url": "/showcase/models/cunhui_yu.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/cunhui_yu.jpg")
+    },
+    "southeast_asian_23": {
+        "id": "southeast_asian_23",
+        "model_id": "southeast_asian_23",
+        "name": "Sirimanee (Đông Nam Á Năng Động & Tươi Tắn)",
+        "gender": "female",
+        "age_approx": 23,
+        "height_approx": "1m71",
+        "description": "23 tuổi, 1m71, làn da bánh mật khỏe khoắn, nụ cười rạng rỡ, thần thái nhiệt đới tràn đầy sức sống.",
+        "vibe": "Làn da bánh mật khỏe khoắn, nụ cười rạng rỡ, năng lượng nhiệt đới tươi mới",
+        "anchor": "A radiant 23-year-old Southeast Asian female fashion model, 171cm height, warm honey-toned skin, glowing natural complexion, flowing dark brown hair, bright expressive eyes, youthful energetic high-fashion presence.",
+        "avatar_url": "/showcase/models/sirimanee.jpg",
+        "thumbnail_url": "/showcase/models/sirimanee.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/sirimanee.jpg")
+    },
+    "latin_editorial_25": {
+        "id": "latin_editorial_25",
+        "model_id": "latin_editorial_25",
+        "name": "Tomas (Latin Phóng Khoáng & Khỏe Khoắn)",
+        "gender": "male",
+        "age_approx": 25,
+        "height_approx": "1m84",
+        "description": "25 tuổi, 1m84, đường nét Latin nam tính, tóc nâu gợn sóng, phong thái tự do lãng tử và thể thao.",
+        "vibe": "Đường nét Latin nam tính, tóc nâu gợn sóng, phong thái tự do lãng tử",
+        "anchor": "A charismatic 25-year-old Latino male fashion model, 184cm height, sculpted facial features, textured wavy brown hair, athletic toned build, warm magnetic presence, stylish resort and casual wear aesthetic.",
+        "avatar_url": "/showcase/models/tomas_gonzalez.jpg",
+        "thumbnail_url": "/showcase/models/tomas_gonzalez.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/tomas_gonzalez.jpg")
     }
 }
-# Backward compatibility alias
+# Backward compatibility aliases
 LOOKBOOK_MODELS["korean_minimalist_23"] = LOOKBOOK_MODELS["korean_chic_22"]
+LOOKBOOK_MODELS["elena_runway_25"] = LOOKBOOK_MODELS["caucasian_chic_25"]
 
 # ─── MUSIC PRESETS ───────────────────────────────────────────────────────────
 
