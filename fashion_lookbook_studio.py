@@ -133,47 +133,19 @@ LOOKBOOK_TEMPLATES = {
 # ─── MODEL PRESETS ───────────────────────────────────────────────────────────
 
 LOOKBOOK_MODELS = {
-    "asian_elegance_24": {
-        "id": "asian_elegance_24",
-        "model_id": "asian_elegance_24",
-        "name": "Mai Phương (Á Đông Thanh Lịch)",
-        "gender": "female",
-        "age_approx": 24,
-        "height_approx": "1m70",
-        "description": "24 tuổi, 1m70, gương mặt Á Đông thanh tú, da trắng sứ, vóc dáng mảnh mai, thần thái tiểu thư nhẹ nhàng.",
-        "vibe": "Da trắng sứ, thanh tú, vóc dáng mảnh mai, thần thái tiểu thư nhẹ nhàng",
-        "anchor": "A stunning 24-year-old East Asian female fashion model, 172cm height, porcelain skin tone, elegant sleek black hair pulled into a sophisticated low bun, refined high-fashion facial features, natural minimalist makeup, poised upright posture.",
-        "avatar_url": "/showcase/models/asian_elegance.jpg",
-        "thumbnail_url": "/showcase/models/asian_elegance.jpg",
-        "default_file": Path("/home/pc/flowkit/mau/models/asian_elegance.jpg")
-    },
-    "korean_chic_22": {
-        "id": "korean_chic_22",
-        "model_id": "korean_chic_22",
-        "name": "Min Ji (Hàn Quốc Trẻ Trung)",
-        "gender": "female",
-        "age_approx": 22,
-        "height_approx": "1m68",
-        "description": "22 tuổi, 1m68, phong cách ulzzang hiện đại, tóc ngắn/búi gọn, phong thái trong trẻo ngọt ngào.",
-        "vibe": "Phong cách ulzzang hiện đại, tóc ngắn/búi gọn, phong thái trong trẻo",
-        "anchor": "A chic 22-year-old Korean female fashion model, 168cm height, luminous dewy skin, soft textured shoulder-length hair, graceful youthful high-fashion look, confident gentle expression.",
-        "avatar_url": "/showcase/models/korean_chic.jpg",
-        "thumbnail_url": "/showcase/models/korean_chic.jpg",
-        "default_file": Path("/home/pc/flowkit/mau/models/korean_chic.jpg")
-    },
-    "caucasian_chic_25": {
-        "id": "caucasian_chic_25",
-        "model_id": "caucasian_chic_25",
-        "name": "Maria Vitoria (Âu Mỹ Haute Couture)",
+    "asian_minimalist_25": {
+        "id": "asian_minimalist_25",
+        "model_id": "asian_minimalist_25",
+        "name": "Cun-Hui (Á Đông Hiện Đại & Tối Giản)",
         "gender": "female",
         "age_approx": 25,
-        "height_approx": "1m76",
-        "description": "25 tuổi, 1m76, gương mặt góc cạnh chuẩn sàn diễn Paris/Milan, thần thái high-fashion sắc sảo quyến rũ.",
-        "vibe": "Gương mặt góc cạnh chuẩn sàn diễn Paris/Milan, thần thái high-fashion sắc sảo",
-        "anchor": "A striking 25-year-old European female runway model, 176cm height, sculptured Parisian cheekbones, sleek dark brown hair, confident intense gaze, statuesque posture, luxury editorial aesthetic.",
-        "avatar_url": "/showcase/models/western_editorial.jpg",
-        "thumbnail_url": "/showcase/models/western_editorial.jpg",
-        "default_file": Path("/home/pc/flowkit/mau/models/western_editorial.jpg")
+        "height_approx": "1m74",
+        "description": "25 tuổi, 1m74, tóc đen suôn dài, nét đẹp Á Đông thuần khiết, phong cách tối giản thanh lịch vượt thời gian.",
+        "vibe": "Nét đẹp Á Đông thuần khiết, tóc đen suôn dài, phong cách tối giản thanh lịch",
+        "anchor": "An elegant 25-year-old East Asian female fashion model, 174cm height, sleek long black hair, porcelain skin, graceful serene features, minimalist high-fashion poise, effortless quiet luxury vibe.",
+        "avatar_url": "/showcase/models/cunhui_yu.jpg",
+        "thumbnail_url": "/showcase/models/cunhui_yu.jpg",
+        "default_file": Path("/home/pc/flowkit/mau/models/cunhui_yu.jpg")
     },
     "parisian_chic_24": {
         "id": "parisian_chic_24",
@@ -217,20 +189,6 @@ LOOKBOOK_MODELS = {
         "thumbnail_url": "/showcase/models/changyi_chen.jpg",
         "default_file": Path("/home/pc/flowkit/mau/models/changyi_chen.jpg")
     },
-    "asian_minimalist_25": {
-        "id": "asian_minimalist_25",
-        "model_id": "asian_minimalist_25",
-        "name": "Cun-Hui (Á Đông Hiện Đại & Tối Giản)",
-        "gender": "female",
-        "age_approx": 25,
-        "height_approx": "1m74",
-        "description": "25 tuổi, 1m74, tóc đen suôn dài, nét đẹp Á Đông thuần khiết, phong cách tối giản thanh lịch vượt thời gian.",
-        "vibe": "Nét đẹp Á Đông thuần khiết, tóc đen suôn dài, phong cách tối giản thanh lịch",
-        "anchor": "An elegant 25-year-old East Asian female fashion model, 174cm height, sleek long black hair, porcelain skin, graceful serene features, minimalist high-fashion poise, effortless quiet luxury vibe.",
-        "avatar_url": "/showcase/models/cunhui_yu.jpg",
-        "thumbnail_url": "/showcase/models/cunhui_yu.jpg",
-        "default_file": Path("/home/pc/flowkit/mau/models/cunhui_yu.jpg")
-    },
     "southeast_asian_23": {
         "id": "southeast_asian_23",
         "model_id": "southeast_asian_23",
@@ -260,9 +218,12 @@ LOOKBOOK_MODELS = {
         "default_file": Path("/home/pc/flowkit/mau/models/tomas_gonzalez.jpg")
     }
 }
-# Backward compatibility aliases
-LOOKBOOK_MODELS["korean_minimalist_23"] = LOOKBOOK_MODELS["korean_chic_22"]
-LOOKBOOK_MODELS["elena_runway_25"] = LOOKBOOK_MODELS["caucasian_chic_25"]
+# Backward compatibility aliases for removed legacy models
+LOOKBOOK_MODELS["asian_elegance_24"] = LOOKBOOK_MODELS["asian_minimalist_25"]
+LOOKBOOK_MODELS["korean_chic_22"] = LOOKBOOK_MODELS["asian_minimalist_25"]
+LOOKBOOK_MODELS["korean_minimalist_23"] = LOOKBOOK_MODELS["asian_minimalist_25"]
+LOOKBOOK_MODELS["caucasian_chic_25"] = LOOKBOOK_MODELS["parisian_chic_24"]
+LOOKBOOK_MODELS["elena_runway_25"] = LOOKBOOK_MODELS["parisian_chic_24"]
 
 # ─── MUSIC PRESETS ───────────────────────────────────────────────────────────
 
@@ -909,8 +870,8 @@ def _run_lookbook_worker_impl(job_id: str):
     garment_anchor = profile.get("canonical_visual_anchor", "High-end luxury designer outfit")
 
     # Model Anchor
-    model_preset_id = job.get("model_preset_id", "asian_elegance_24")
-    model_preset = LOOKBOOK_MODELS.get(model_preset_id, LOOKBOOK_MODELS["asian_elegance_24"])
+    model_preset_id = job.get("model_preset_id", "asian_minimalist_25")
+    model_preset = LOOKBOOK_MODELS.get(model_preset_id, LOOKBOOK_MODELS["asian_minimalist_25"])
     model_anchor = model_preset["anchor"]
     if model_img.exists():
         save_lookbook_job(job_id, status="ANALYZING", progress_percent=15, message="Đang phân tích diện mạo và nhân dạng người mẫu...")
@@ -1295,7 +1256,7 @@ def create_lookbook_job(
     outfit_url: str = "",
     model_bytes: Optional[bytes] = None,
     model_url: str = "",
-    model_preset_id: str = "asian_elegance_24",
+    model_preset_id: str = "asian_minimalist_25",
     template_id: str = "runway_catwalk",
     aspect_ratio: str = "9:16",
     num_scenes: int = 3,
@@ -1310,13 +1271,19 @@ def create_lookbook_job(
     if outfit_bytes:
         outfit_img.write_bytes(outfit_bytes)
     elif outfit_url:
-        urllib.request.urlretrieve(outfit_url, str(outfit_img))
+        try:
+            urllib.request.urlretrieve(outfit_url, str(outfit_img))
+        except Exception as e:
+            print(f"[LOOKBOOK] Error fetching outfit url: {e}")
 
     model_img = jdir / "model.jpg"
     if model_bytes:
         model_img.write_bytes(model_bytes)
     elif model_url:
-        urllib.request.urlretrieve(model_url, str(model_img))
+        try:
+            urllib.request.urlretrieve(model_url, str(model_img))
+        except Exception as e:
+            print(f"[LOOKBOOK] Error fetching model url: {e}")
 
     save_lookbook_job(
         job_id,
@@ -1445,7 +1412,7 @@ def create_stage1_lookbook_job(
     product_urls: list[str] = None,
     model_file: Optional[tuple[str, bytes]] = None,
     model_url: str = "",
-    model_preset_id: str = "asian_elegance_24",
+    model_preset_id: str = "asian_minimalist_25",
     background_file: Optional[tuple[str, bytes]] = None,
     background_url: str = "",
     background_preset: str = "pure white studio",
@@ -1587,7 +1554,7 @@ def run_stage1_lookbook_worker(job_id: str):
         lighting_preset = job.get("lighting_preset", "soft studio lighting")
         background_preset = job.get("background_preset", "pure white studio")
         has_bg_ref = bool(job.get("has_background_ref"))
-        model_preset_id = job.get("model_preset_id", "asian_elegance_24")
+        model_preset_id = job.get("model_preset_id", "asian_minimalist_25")
         images_data = job.get("images", [])
 
         # Step 1: Upload references
@@ -1612,7 +1579,7 @@ def run_stage1_lookbook_worker(job_id: str):
             except Exception as e:
                 print(f"[LOOKBOOK STAGE1] Error uploading model: {e}")
         else:
-            model_preset = LOOKBOOK_MODELS.get(model_preset_id, LOOKBOOK_MODELS["asian_elegance_24"])
+            model_preset = LOOKBOOK_MODELS.get(model_preset_id, LOOKBOOK_MODELS["asian_minimalist_25"])
             if model_preset.get("default_file") and Path(model_preset["default_file"]).exists():
                 try:
                     model_mid = upload_image_flowkit(Path(model_preset["default_file"]))
