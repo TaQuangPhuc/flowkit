@@ -37,6 +37,7 @@ from agent.services.headers import random_headers
 logger = logging.getLogger(__name__)
 
 _R2V_OPS_PATH = BASE_DIR / ".scratch" / "r2v_ops.json"
+_MEDIA_PROFILES_PATH = BASE_DIR / ".scratch" / "media_profiles.json"
 _GETSESSION_DUMP = BASE_DIR / ".scratch" / "getsession-last.txt"
 _LISTING_DUMP = BASE_DIR / ".scratch" / "listing-last.txt"
 _R2V_AS29S_CAP = 12
@@ -88,8 +89,10 @@ class FlowClient:
         from agent.services.accounts import load_nick_pins
         self._configured_profiles: list[dict] = load_nick_pins()
         self._profile_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._retrying_profiles: set[str] = set()
         self._last_route: Optional[dict] = None
         self._load_r2v_ops()
+        self._load_media_profiles()
 
     def reload_configured_profiles(self) -> None:
         from agent.services.accounts import load_nick_pins
@@ -563,8 +566,13 @@ class FlowClient:
                         )
 
                         # Attempt one immediate retry with the new proxy
-                        if not getattr(self, "_in_retry", False):
-                            self._in_retry = True
+                        retrying = getattr(self, "_retrying_profiles", None)
+                        if retrying is None:
+                            self._retrying_profiles = set()
+                            retrying = self._retrying_profiles
+
+                        if prof_id not in retrying:
+                            retrying.add(prof_id)
                             try:
                                 logger.info(
                                     "Auto-retrying request for %s on new proxy %s...",
@@ -587,8 +595,8 @@ class FlowClient:
                                 finally:
                                     _current_route.reset(token_route)
 
-                                # Settle delay after page reload for reCAPTCHA Enterprise stub
-                                await asyncio.sleep(1.5)
+                                # Settle delay after page reload (extension already waited 3.5s)
+                                await asyncio.sleep(0.5)
 
                                 # Pre-flight test: verify 1 live reCAPTCHA Enterprise token can be minted on the new proxy
                                 token_probe = _current_route.set(route)
@@ -610,10 +618,19 @@ class FlowClient:
 
                                 token_retry = _current_route.set(route)
                                 try:
-                                    try:
-                                        retry_last = await builder(pid)
-                                    except Exception as e:
-                                        retry_last = _batch_error(e)
+                                    retry_last = None
+                                    for retry_try in range(2):
+                                        try:
+                                            retry_last = await builder(pid)
+                                        except Exception as e:
+                                            retry_last = _batch_error(e)
+
+                                        retry_err_str = str(retry_last.get("error") or "")
+                                        if ("Frame with ID 0" in retry_err_str or "Execution context was destroyed" in retry_err_str) and retry_try == 0:
+                                            logger.info("Frame still initializing on %s; waiting 3s before retry attempt 2...", prof_id)
+                                            await asyncio.sleep(3.0)
+                                            continue
+                                        break
 
                                     rotation_info["retry_attempted"] = True
                                     if not retry_last.get("error") and (
@@ -647,7 +664,7 @@ class FlowClient:
                                 finally:
                                     _current_route.reset(token_retry)
                             finally:
-                                self._in_retry = False
+                                retrying.discard(prof_id)
                     except Exception as rot_exc:
                         logger.error("Auto-rotation failed for %s: %s", prof_id, rot_exc)
                         rotation_info["rotation_error"] = str(rot_exc)
@@ -1256,8 +1273,9 @@ class FlowClient:
         """Which nick uploaded or generated this media id."""
         if not media_id:
             return
-        if len(self._media_profiles) > 1024:
-            self._media_profiles.clear()
+        if len(self._media_profiles) > 2048:
+            for k in list(self._media_profiles.keys())[:512]:
+                self._media_profiles.pop(k, None)
         pid = profile_id
         if not pid:
             route = _current_route.get()
@@ -1265,6 +1283,29 @@ class FlowClient:
                 pid = route.get("profile_id")
         if pid:
             self._media_profiles[media_id] = pid
+            self._save_media_profiles()
+
+    def _load_media_profiles(self) -> None:
+        """Restore media_id -> profile_id mappings so an agent restart maintains pinning."""
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        try:
+            raw = json.loads(_MEDIA_PROFILES_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._media_profiles.update({str(k): str(v) for k, v in raw.items()})
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def _save_media_profiles(self) -> None:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        try:
+            _MEDIA_PROFILES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _MEDIA_PROFILES_PATH.write_text(
+                json.dumps(self._media_profiles, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.debug("media profiles map not saved: %s", exc)
 
     def _load_r2v_ops(self) -> None:
         """Restore r2v poll handles so an agent restart can still GetSession."""
@@ -1654,6 +1695,28 @@ class FlowClient:
                     operation_id, error=str(e), media_id=media_id)
 
         if not urls or not urls.video:
+            rounds = self._operation_polls.get(operation_id, 0)
+            if rounds > 0 and rounds % 3 == 0:
+                refreshed_id, op_complaint = await self._find_operation_media(operation_id)
+                if op_complaint:
+                    complaint = op_complaint
+                if refreshed_id and refreshed_id != media_id:
+                    media_id = refreshed_id
+                    self._operation_media[operation_id] = media_id
+                    self._remember_media(media_id)
+                    self._save_r2v_ops()
+
+            if rounds >= 25:
+                logger.warning(
+                    "Operation %s timed out waiting for video media (rounds=%d, complaint=%s)",
+                    operation_id[:20], rounds, complaint,
+                )
+                return {
+                    "operation": {"name": operation_id},
+                    "status": "MEDIA_GENERATION_STATUS_FAILED",
+                    "error": complaint or "Google Flow: video generation failed upstream (timeout)",
+                }
+
             # The id landed but the clip is still being written; downloading
             # now would save the poster still instead of the video.
             return _as_pending_operation(operation_id, error=complaint, media_id=media_id)
@@ -1907,9 +1970,14 @@ class FlowClient:
         return media_id
 
     async def _batch_media_urls(self, media_id: str) -> "fb.MediaUrls":
-        payload = await self._batch_payload(
-            fb.RPC_MEDIA, fb.media_request(media_id), timeout=60)
-        return fb.read_media_urls(payload, media_id)
+        try:
+            payload = await self._batch_payload(
+                fb.RPC_MEDIA, fb.media_request(media_id), timeout=60)
+            return fb.read_media_urls(payload, media_id)
+        except fb.RpcError as e:
+            if "[5]" in str(e):
+                return fb.MediaUrls(media_id=media_id, video=None, image=None)
+            raise
 
     async def get_credits(self) -> dict:
         """Get user credits and tier.

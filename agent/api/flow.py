@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from agent.config import USE_BATCH_RPC, FLOW_PROJECT_ID, FLOW_ALLOW_DEGRADED
 from agent.services.flow_client import get_flow_client
@@ -46,11 +46,19 @@ def _respond_flow_result(result: dict):
         return result.get("data", result)
 
     error_str = str(result.get("error") or result.get("data") or "")
-    if result.get("proxy_rotated") or "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in error_str:
+    is_transient = (
+        result.get("proxy_rotated")
+        or "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in error_str
+        or "Frame with ID 0" in error_str
+        or "Execution context was destroyed" in error_str
+        or "Target closed" in error_str
+        or "Session closed" in error_str
+    )
+    if is_transient:
         new_proxy = result.get("new_proxy") or ""
         msg = result.get("message") or (
-            f"UNUSUAL_ACTIVITY: Proxy đã được đổi thành công sang IP mới ({new_proxy}). "
-            "Vui lòng retry lại ngay."
+            f"ROTATION_IN_PROGRESS: Phiên Flow đang làm mới hoặc đổi IP ({new_proxy}). "
+            "Vui lòng đợi và thử lại."
         )
         return JSONResponse(
             status_code=429,
@@ -62,9 +70,9 @@ def _respond_flow_result(result: dict):
                 "proxy_rotated": True,
                 "new_proxy": new_proxy,
                 "retryable": True,
-                "retry_after_s": 1,
+                "retry_after_s": 3,
             },
-            headers={"Retry-After": "1"},
+            headers={"Retry-After": "3"},
         )
 
     status = result.get("status", 502)
@@ -83,15 +91,33 @@ class GenerateImageRequest(BaseModel):
     character_media_ids: Optional[list[str]] = None
     reference_image_media_ids: Optional[list[str]] = Field(default=None, alias="referenceImageMediaIds")
     reference_media_ids: Optional[list[str]] = None
+    image_inputs: Optional[list[Any]] = Field(default=None, alias="imageInputs")
     image_model: Optional[str] = Field(default=None, alias="modelDisplayName")
 
     @model_validator(mode="after")
     def populate_refs(self) -> "GenerateImageRequest":
+        extracted = []
+        if self.image_inputs and isinstance(self.image_inputs, list):
+            for item in self.image_inputs:
+                if isinstance(item, str) and item.strip():
+                    extracted.append(item.strip())
+                elif isinstance(item, dict):
+                    mid = item.get("media_id") or item.get("mediaId") or item.get("id") or item.get("name")
+                    if mid and isinstance(mid, str):
+                        extracted.append(mid.strip())
+
         if not self.character_media_ids:
-            if self.reference_image_media_ids:
+            if extracted:
+                self.character_media_ids = extracted
+            elif self.reference_image_media_ids:
                 self.character_media_ids = self.reference_image_media_ids
             elif self.reference_media_ids:
                 self.character_media_ids = self.reference_media_ids
+        elif extracted:
+            # Combine if character_media_ids is already present but image_inputs has extra
+            for m in extracted:
+                if m not in self.character_media_ids:
+                    self.character_media_ids.append(m)
         return self
 
 
@@ -481,9 +507,11 @@ async def get_media(media_id: str, request: Request):
     if not client.connected:
         raise HTTPException(503, "Extension not connected")
     result = await client.get_media(media_id)
+    status = result.get("status", 200)
+    if status == 404:
+        raise HTTPException(404, result.get("error", f"Media {media_id} not found or still generating"))
     if result.get("error"):
         raise HTTPException(502, result["error"])
-    status = result.get("status", 200)
     if isinstance(status, int) and status >= 400:
         raise HTTPException(status, result.get("data", "Media not found"))
     data = result.get("data", result)
