@@ -13,6 +13,7 @@ import concurrent.futures
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import batch_image_studio as bis
+import fashion_lookbook_studio as fls
 
 FLOWKIT_API = "http://127.0.0.1:8100"
 WORK_DIR = Path("/home/pc/flowkit/auto_runs")
@@ -170,18 +171,19 @@ def run_claude_cli_json(prompt: str) -> any:
         except Exception as e:
             raise ValueError(f"All CLI fallbacks (agy & claude) failed ({e}): {stdout[:300]}")
 
-NOVA_BASE_URL = "https://novagateway.net/v1"
-NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "")
-NOVA_MODEL = os.environ.get("NOVA_MODEL", "google/gemini-3.8-flash")
+NOVA_BASE_URL = os.environ.get("NOVA_BASE_URL", "https://api.vilao.ai/v1")
+NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "sk-ed315f54662e9ebe508d95bca3d93a65f4d697030d90cea81fde7f39d64e0055")
+NOVA_MODEL = os.environ.get("NOVA_MODEL", "deepseek-v4-flash")
 
-def grok_chat_completion(messages: list[dict], max_tokens: int = 8192, thinking_budget: int = 2048, timeout: int = 150) -> str:
-    """Send chat completion to Nova Gateway (Google Gemini 3.8 Flash)."""
+def grok_chat_completion(messages: list[dict], max_tokens: int = 8192, thinking_budget: int = 0, timeout: int = 150) -> str:
+    """Send chat completion to LLM API (chib/deepseek-v4.1-flash)."""
     payload = {
         "model": NOVA_MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
-        "thinking_config": {"thinking_budget": thinking_budget}
     }
+    if thinking_budget and "gemini" in NOVA_MODEL.lower():
+        payload["thinking_config"] = {"thinking_budget": thinking_budget}
     req = urllib.request.Request(
         f"{NOVA_BASE_URL}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -231,13 +233,105 @@ def grok_script_generate(prompt: str) -> any:
         print(f"[SCRIPT LLM ERROR] Nova Gemini Script failed: {e_grok}. Auto-switching to AGY CLI fallback...")
         return run_agy_cli_json(prompt)
 
+VOICE_BIBLE = {
+    "female_north": {
+        "voice_id": "CHAR_VN_FEMALE_NORTH_01",
+        "gender": "female",
+        "age": "22-26",
+        "accent": "Northern Vietnamese",
+        "pitch": "medium, warm mezzo-soprano",
+        "timbre": "warm, silky, clear resonant presence",
+        "energy": "medium, poised elegant delivery",
+        "speed": "medium, steady conversational cadence",
+        "delivery": "calm conversational delivery, clear natural pronunciation",
+        "vocal_weight": "moderate-light",
+        "acoustics": "studio close-mic direct sound, intimate warm presence, zero room echo",
+        "negative_constraints": "no pitch drift, no dramatic pitch jumps, no youthful high-pitched screech, no robotic monotone",
+        "lock_prompt": (
+            "VOICE LOCK — DO NOT reinterpret: "
+            "Speaker: Vietnamese female, approx 24 years old. "
+            "Voice identity: Warm mezzo-soprano, clear silky texture, moderate vocal weight, stable pitch, calm natural conversational delivery, neutral Northern Vietnamese accent, medium speaking speed, studio close-mic direct sound with zero room echo. "
+            "This is the exact same speaker and voice identity used in every previous scene. "
+            "Do not change vocal age, gender, accent, pitch range, timbre, vocal texture, or speaking rhythm. "
+            "No dramatic pitch changes, no high-pitched screech."
+        ),
+    },
+    "female_south": {
+        "voice_id": "CHAR_VN_FEMALE_SOUTH_01",
+        "gender": "female",
+        "age": "22-25",
+        "accent": "Southern Vietnamese",
+        "pitch": "medium, melodious warm soprano",
+        "timbre": "bright, sweet, friendly resonant texture",
+        "energy": "lively, warm welcoming delivery",
+        "speed": "medium, expressive fluent cadence",
+        "delivery": "engaging conversational reviewer delivery, clear sweet articulation",
+        "vocal_weight": "light-moderate",
+        "acoustics": "studio close-mic direct sound, intimate warm presence, zero room echo",
+        "negative_constraints": "no pitch drift, no dramatic pitch jumps, no cartoonish squeak, no robotic monotone",
+        "lock_prompt": (
+            "VOICE LOCK — DO NOT reinterpret: "
+            "Speaker: Vietnamese female, approx 23 years old. "
+            "Voice identity: Sweet melodious soprano, bright warm texture, light-moderate weight, stable pitch, engaging friendly delivery, natural Southern Vietnamese accent, medium speaking speed, studio close-mic direct sound with zero room echo. "
+            "This is the exact same speaker and voice identity used in every previous scene. "
+            "Do not change vocal age, gender, accent, pitch range, timbre, vocal texture, or speaking rhythm. "
+            "No dramatic pitch changes, no cartoonish squeak."
+        ),
+    },
+    "male_north": {
+        "voice_id": "CHAR_VN_MALE_NORTH_01",
+        "gender": "male",
+        "age": "28-32",
+        "accent": "Northern Vietnamese",
+        "pitch": "low male baritone",
+        "timbre": "warm, deep, slightly husky vocal texture",
+        "energy": "steady, confident authoritative delivery",
+        "speed": "medium, calm conversational speed",
+        "delivery": "calm conversational delivery, clear natural pronunciation",
+        "vocal_weight": "moderate-heavy",
+        "acoustics": "studio close-mic direct sound, intimate warm presence, zero room echo",
+        "negative_constraints": "no pitch drift, no dramatic pitch changes, no youthful high-pitched qualities, no robotic monotone",
+        "lock_prompt": (
+            "VOICE LOCK — DO NOT reinterpret: "
+            "Speaker: Vietnamese male, approx 30 years old. "
+            "Voice identity: Low male baritone, warm slightly husky vocal texture, moderate vocal weight, stable pitch, calm conversational delivery, neutral Northern Vietnamese accent, medium speaking speed, studio close-mic direct sound with zero room echo. "
+            "This is the exact same speaker and voice identity used in every previous scene. "
+            "Do not change vocal age, gender, accent, pitch range, timbre, vocal texture, or speaking rhythm. "
+            "No dramatic pitch changes, no youthful/high-pitched qualities."
+        ),
+    },
+    "male_south": {
+        "voice_id": "CHAR_VN_MALE_SOUTH_01",
+        "gender": "male",
+        "age": "26-30",
+        "accent": "Southern Vietnamese",
+        "pitch": "medium-low resonant tenor",
+        "timbre": "warm, dynamic, friendly open texture",
+        "energy": "dynamic, enthusiastic friendly delivery",
+        "speed": "medium, natural fluent reviewer cadence",
+        "delivery": "approachable lifestyle reviewer delivery, clear natural pronunciation",
+        "vocal_weight": "moderate",
+        "acoustics": "studio close-mic direct sound, intimate warm presence, zero room echo",
+        "negative_constraints": "no pitch drift, no sudden pitch jumps, no exaggerated screaming, no robotic monotone",
+        "lock_prompt": (
+            "VOICE LOCK — DO NOT reinterpret: "
+            "Speaker: Vietnamese male, approx 28 years old. "
+            "Voice identity: Resonant warm tenor, dynamic friendly texture, moderate vocal weight, stable pitch, enthusiastic approachable delivery, natural Southern Vietnamese accent, medium speaking speed, studio close-mic direct sound with zero room echo. "
+            "This is the exact same speaker and voice identity used in every previous scene. "
+            "Do not change vocal age, gender, accent, pitch range, timbre, vocal texture, or speaking rhythm. "
+            "No dramatic pitch changes, no exaggerated screaming."
+        ),
+    },
+}
+
 VOICE_PROFILES = {
     "female_north": {
         "id": "female_north",
         "label": "Nữ Miền Bắc",
         "badge": "👩 Nữ Miền Bắc (Thanh lịch)",
         "tone_desc": "Giọng nữ miền Bắc chuẩn phát thanh, thanh lịch, nhẹ nhàng, tự nhiên (dùng từ: 'nhé', 'ạ', 'mọi người ơi', 'chị em ơi', 'cực kỳ').",
-        "veo_prompt": "natural Vietnamese female Northern accent, clear sweet articulating voice",
+        "veo_prompt": VOICE_BIBLE["female_north"]["lock_prompt"],
+        "voice_bible": VOICE_BIBLE["female_north"],
         "edge_voice": "vi-VN-HoaiMyNeural",
         "rate": "+0%"
     },
@@ -246,7 +340,8 @@ VOICE_PROFILES = {
         "label": "Nữ Miền Nam",
         "badge": "👩 Nữ Miền Nam (Ngọt ngào)",
         "tone_desc": "Giọng nữ miền Nam ngọt ngào, gần gũi, duyên dáng, thân thiện chuẩn reviewer TikTok (dùng từ: 'nè', 'nghen', 'thiệt sự luôn á', 'cả nhà ơi', 'mọi người ơi').",
-        "veo_prompt": "natural Vietnamese female Southern accent, lively sweet warm friendly voice",
+        "veo_prompt": VOICE_BIBLE["female_south"]["lock_prompt"],
+        "voice_bible": VOICE_BIBLE["female_south"],
         "edge_voice": "vi-VN-HoaiMyNeural",
         "rate": "+5%"
     },
@@ -255,7 +350,8 @@ VOICE_PROFILES = {
         "label": "Nam Miền Bắc",
         "badge": "👨 Nam Miền Bắc (Trầm ấm)",
         "tone_desc": "Giọng nam miền Bắc trầm ấm, uy tín, chững chạc, dứt khoát (dùng từ: 'nhé', 'anh em ơi', 'các bác ơi', 'chuẩn xác', 'cực kỳ').",
-        "veo_prompt": "natural Vietnamese male Northern accent, confident deep warm authoritative voice",
+        "veo_prompt": VOICE_BIBLE["male_north"]["lock_prompt"],
+        "voice_bible": VOICE_BIBLE["male_north"],
         "edge_voice": "vi-VN-NamMinhNeural",
         "rate": "+0%"
     },
@@ -264,7 +360,8 @@ VOICE_PROFILES = {
         "label": "Nam Miền Nam",
         "badge": "👨 Nam Miền Nam (Hào sảng)",
         "tone_desc": "Giọng nam miền Nam hào sảng, phóng khoáng, thân thiện, năng động chuẩn reviewer (dùng từ: 'nè', 'anh em ơi', 'cả nhà ơi', 'thiệt tình', 'siêu êm').",
-        "veo_prompt": "natural Vietnamese male Southern accent, dynamic friendly enthusiastic voice",
+        "veo_prompt": VOICE_BIBLE["male_south"]["lock_prompt"],
+        "voice_bible": VOICE_BIBLE["male_south"],
         "edge_voice": "vi-VN-NamMinhNeural",
         "rate": "+5%"
     }
@@ -293,19 +390,43 @@ BGM_PROFILES = {
     }
 }
 
-def generate_edge_tts(text: str, output_path: Path, voice: str = "vi-VN-HoaiMyNeural", rate: str = "+0%"):
-    """Generate TTS audio with edge-tts as clean audio track."""
-    try:
-        import asyncio
-        import edge_tts
-        async def _synth():
-            comm = edge_tts.Communicate(text, voice, rate=rate)
-            await comm.save(str(output_path))
-        asyncio.run(_synth())
-        return True
-    except Exception as e:
-        print(f"Edge-TTS synthesis error: {e}")
+def generate_edge_tts(text: str, output_path: Path, voice: str = "vi-VN-HoaiMyNeural", rate: str = "+0%", max_retries: int = 5) -> bool:
+    """Generate TTS audio with edge-tts as clean audio track with retry & backoff."""
+    if not text or not text.strip():
         return False
+    import asyncio
+    import edge_tts
+    import time
+    
+    clean_text = text.strip()
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            if output_path.exists():
+                output_path.unlink(missing_ok=True)
+                
+            async def _synth():
+                comm = edge_tts.Communicate(clean_text, voice, rate=rate)
+                await comm.save(str(output_path))
+                
+            asyncio.run(_synth())
+            
+            if output_path.exists() and output_path.stat().st_size > 1000:
+                return True
+            else:
+                if output_path.exists():
+                    output_path.unlink(missing_ok=True)
+                print(f"[EDGE-TTS] Warning: Attempt {attempt}/{max_retries} produced empty/invalid file for: {clean_text[:40]}...")
+        except Exception as e:
+            if output_path.exists():
+                output_path.unlink(missing_ok=True)
+            print(f"[EDGE-TTS] Attempt {attempt}/{max_retries} error for '{clean_text[:30]}...': {e}")
+            
+        if attempt < max_retries:
+            time.sleep(1.5 * attempt)
+            
+    print(f"[EDGE-TTS] ❌ Failed to generate TTS after {max_retries} attempts: '{clean_text[:50]}'")
+    return False
 
 def get_media_duration(path: Path) -> float:
     """Get exact duration of video or audio file using ffprobe."""
@@ -315,6 +436,29 @@ def get_media_duration(path: Path) -> float:
         return float(out)
     except Exception:
         return 0.0
+
+# ==============================================================================
+# CRITICAL ARCHITECTURAL RULE — AUDIO & NATIVE VOICE PRESERVATION:
+# 1. Google Veo 3.1 & xAI Grok Video 1.5 have native multimodal audio generation.
+#    When prompted with `Say: "..." in natural Vietnamese...`, they generate
+#    realistic Vietnamese speech, accurate lip-sync, and object Foley sound effects.
+# 2. NEVER overwrite, strip, or replace native video audio with Edge-TTS.
+# 3. Always check `check_video_has_audio(clip_path)` first:
+#    - If True: PRESERVE native audio 100%. Do NOT mux TTS.
+#    - If False: Only then use Edge-TTS as fallback for silent video models.
+# Reference Jobs: 3fb7954b (Veo native audio), 1908aee1 (Grok native audio).
+# ==============================================================================
+
+def check_video_has_audio(video_path: Path) -> bool:
+    """Check if video file already contains a valid audio stream (e.g. native sound from Google Veo or Grok Video)."""
+    if not video_path or not video_path.exists():
+        return False
+    try:
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)]
+        out = subprocess.check_output(cmd, timeout=10).decode().strip()
+        return bool(out)
+    except Exception:
+        return False
 
 def mux_tts_to_video(video_path: Path, tts_path: Path, output_path: Path = None, target_duration: float = None) -> bool:
     """Mux Edge-TTS audio track with video clip into an MP4 container, replacing any existing audio.
@@ -567,17 +711,27 @@ def sync_dialogue_to_motion_prompt(motion_prompt: str, dialogue: str, veo_voice_
     if not clean_dlg:
         return motion_prompt
 
-    replacement = f'Say: \\"{clean_dlg}\\"'
-    pattern_escaped = re.compile(r'Say:\s*\\\"(.*?)\\\"', re.DOTALL | re.IGNORECASE)
-    pattern_unescaped = re.compile(r'Say:\s*\"(.*?)\"', re.DOTALL | re.IGNORECASE)
-
-    if pattern_escaped.search(motion_prompt):
-        return pattern_escaped.sub(lambda m: replacement, motion_prompt, count=1)
-    elif pattern_unescaped.search(motion_prompt):
-        return pattern_unescaped.sub(lambda m: replacement, motion_prompt, count=1)
+    if veo_voice_prompt:
+        voice_clause = f" in {veo_voice_prompt}"
+        replacement = f'Say: \\"{clean_dlg}\\"{voice_clause}'
+        pattern_escaped_full = re.compile(r'Say:\s*\\\"(.*?)\\\"(?:\s+(?:in|with)\s+[^.]+)?(?:\.|$)', re.DOTALL | re.IGNORECASE)
+        pattern_unescaped_full = re.compile(r'Say:\s*\"(.*?)\"(?:\s+(?:in|with)\s+[^.]+)?(?:\.|$)', re.DOTALL | re.IGNORECASE)
+        if pattern_escaped_full.search(motion_prompt):
+            return pattern_escaped_full.sub(lambda m: replacement.rstrip('.') + '.', motion_prompt, count=1)
+        elif pattern_unescaped_full.search(motion_prompt):
+            return pattern_unescaped_full.sub(lambda m: replacement.rstrip('.') + '.', motion_prompt, count=1)
+        else:
+            return f"{motion_prompt.rstrip()} {replacement.rstrip('.')}."
     else:
-        voice_clause = f" in {veo_voice_prompt}" if veo_voice_prompt else ""
-        return f'{motion_prompt.rstrip()} Say: \\"{clean_dlg}\\"{voice_clause}.'
+        replacement = f'Say: \\"{clean_dlg}\\"'
+        pattern_escaped = re.compile(r'Say:\s*\\\"(.*?)\\\"', re.DOTALL | re.IGNORECASE)
+        pattern_unescaped = re.compile(r'Say:\s*\"(.*?)\"', re.DOTALL | re.IGNORECASE)
+        if pattern_escaped.search(motion_prompt):
+            return pattern_escaped.sub(lambda m: replacement, motion_prompt, count=1)
+        elif pattern_unescaped.search(motion_prompt):
+            return pattern_unescaped.sub(lambda m: replacement, motion_prompt, count=1)
+        else:
+            return f'{motion_prompt.rstrip()} Say: \\"{clean_dlg}\\".'
 
 def rotate_profile_proxy(nick_id: str = "nick-a") -> dict:
     """Call FlowKit API to explicitly rotate proxy for a nick."""
@@ -614,12 +768,17 @@ def call_flowkit_api(endpoint: str, payload: dict, timeout: int = 120, max_retri
 
             is_unusual = "UNUSUAL_ACTIVITY" in err_body or "ogiZ0b failed: [13]" in err_body or err.code == 429
             if is_unusual and attempt < max_retries:
-                print(f"[RETRY] Detected UNUSUAL_ACTIVITY / Rate-limit on {endpoint} (Attempt {attempt}/{max_retries}). Rotating proxy and retrying in 3.5s...")
+                retry_s = 3.5
+                try:
+                    err_json = json.loads(err_body)
+                    if isinstance(err_json, dict):
+                        retry_s = float(err_json.get("retry_after_s") or 3.5)
+                except Exception:
+                    pass
+                print(f"[RETRY] Detected UNUSUAL_ACTIVITY / Rate-limit on {endpoint} (Attempt {attempt}/{max_retries}). FlowKit server is settling/rotating proxy, retrying in {retry_s}s...")
                 if job_id:
-                    update_job(job_id, message="Hệ thống đang điều phối tài nguyên máy chủ AI...")
-                rotate_profile_proxy("nick-a")
-                rotate_profile_proxy("Nick-b")
-                time.sleep(3.5)
+                    update_job(job_id, message=f"Hệ thống AI đang làm mới phiên (chờ {retry_s}s)...")
+                time.sleep(retry_s)
                 continue
             elif attempt < max_retries and err.code in [500, 502, 503, 504]:
                 print(f"[RETRY] Server error {err.code} on {endpoint} (Attempt {attempt}/{max_retries}). Retrying in 3.5s...")
@@ -771,6 +930,15 @@ def sanitize_kf_prompt(prompt: str, canonical_anchor: str = "", model_anchor: st
             prompt += ", photorealistic 8k vertical 9:16"
         prompt += clean_canvas_guard
         return sanitize_safety_content(prompt)
+    elif mode == "fashion":
+        if model_anchor and "CREATOR REFERENCE LOCK" not in prompt and "MODEL REFERENCE LOCK" not in prompt:
+            prompt = f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {model_anchor}.. {prompt}"
+        if canonical_anchor and "PRODUCT REFERENCE LOCK" not in prompt:
+            prompt = f"PRODUCT REFERENCE LOCK — HIGHEST PRIORITY: {canonical_anchor}.. {prompt}"
+        if "photorealistic" not in prompt.lower():
+            prompt += ", luxury fashion boutique lookbook, photorealistic 8k vertical 9:16, elegant drape, realistic fabric textures, clean seams"
+        prompt += clean_canvas_guard
+        return sanitize_safety_content(prompt)
     else:
         # UGC or Store Review mode
         if model_anchor and "CREATOR REFERENCE LOCK" not in prompt and "KOL REFERENCE LOCK" not in prompt:
@@ -827,7 +995,7 @@ def refresh_ref_ids_from_disk(job_id: str) -> list[str]:
     flow_mode = job.get("flow_mode", "pov")
     
     new_refs = []
-    if flow_mode in ["ugc", "store_review"] or (flow_mode == "demo" and model_file.exists()):
+    if flow_mode in ["ugc", "store_review", "fashion"] or (flow_mode == "demo" and model_file.exists()):
         if model_file.exists():
             new_refs.append(upload_to_flowkit(model_file, job_id=job_id))
         if prod_file.exists():
@@ -915,7 +1083,7 @@ def batch_poll_videos_flowkit(
     job_dir: Path,
     on_clip_done: callable = None,
     on_clip_failed: callable = None,
-    max_duration_s: int = 1200
+    max_duration_s: int = 420
 ) -> dict[int, Path]:
     """Centralized Batch Poller Daemon: Polls all pending operations in a single consolidated request.
     
@@ -927,6 +1095,7 @@ def batch_poll_videos_flowkit(
     completed_clips: dict[int, Path] = {}
     active_ops = dict(pending_ops)
     start_time = time.time()
+    scene_start_times = {s_idx: time.time() for s_idx in active_ops}
     poll_round = 0
     
     if active_ops:
@@ -949,6 +1118,18 @@ def batch_poll_videos_flowkit(
                     
             for scene_idx, op_name in list(active_ops.items()):
                 curr = results_by_name.get(op_name)
+                # Per-scene timeout check: 300s max per scene
+                elapsed_sc = time.time() - scene_start_times.get(scene_idx, start_time)
+                if elapsed_sc > 300:
+                    print(f"[BATCH POLLER] ⚠️ Scene {scene_idx} timed out after {int(elapsed_sc)}s.")
+                    del active_ops[scene_idx]
+                    if on_clip_failed:
+                        try:
+                            on_clip_failed(scene_idx, f"Quá thời gian render Veo ({int(elapsed_sc)}s). Bấm 'Render lại Video' để thử lại.")
+                        except Exception as fb_err:
+                            print(f"[BATCH POLLER] Failed callback error for scene {scene_idx}: {fb_err}")
+                    continue
+
                 if not curr:
                     continue
                 status = curr.get("status")
@@ -960,9 +1141,22 @@ def batch_poll_videos_flowkit(
                     print(f"[BATCH POLLER] 🎉 Scene {scene_idx} completed after {int(time.time() - start_time)}s! Downloading to {clip_path.name}...")
                     urllib.request.urlretrieve(fife, str(clip_path))
                     tts_file = job_dir / f"tts_{scene_idx}.mp3"
-                    if tts_file.exists() and tts_file.stat().st_size > 500:
-                        job_dur = (JOBS.get(job_id) or {}).get("scene_duration", 8)
-                        mux_tts_to_video(clip_path, tts_file, target_duration=job_dur)
+                    has_native_audio = check_video_has_audio(clip_path)
+                    if has_native_audio:
+                        print(f"[BATCH POLLER] 🎙️ Scene {scene_idx} has native AI synchronized audio ({clip_path.name}). Preserving native voice!")
+                    else:
+                        job_obj = JOBS.get(job_id) or {}
+                        if not tts_file.exists() or tts_file.stat().st_size < 1000:
+                            sc_list = job_obj.get("scenes", [])
+                            matching_sc = next((s for s in sc_list if s.get("scene_id") == scene_idx), None)
+                            dlg = (matching_sc.get("audio_dialogue") or "").strip() if matching_sc else ""
+                            if dlg:
+                                v_key = job_obj.get("voice", "female_north")
+                                v_info = VOICE_PROFILES.get(v_key, VOICE_PROFILES["female_north"])
+                                generate_edge_tts(dlg, tts_file, voice=v_info["edge_voice"], rate=v_info.get("rate", "+0%"))
+                        if tts_file.exists() and tts_file.stat().st_size > 500:
+                            job_dur = job_obj.get("scene_duration", 8)
+                            mux_tts_to_video(clip_path, tts_file, target_duration=job_dur)
                     completed_clips[scene_idx] = clip_path
                     del active_ops[scene_idx]
                     if on_clip_done:
@@ -988,14 +1182,21 @@ def batch_poll_videos_flowkit(
             time.sleep(6)
             
     if active_ops:
-        raise TimeoutError(f"Scenes {list(active_ops.keys())} timed out after {max_duration_s}s")
+        print(f"[BATCH POLLER] ⚠️ Job {job_id}: Scenes {list(active_ops.keys())} reached max duration {int(time.time() - start_time)}s.")
+        for sc_idx in list(active_ops.keys()):
+            if on_clip_failed:
+                try:
+                    on_clip_failed(sc_idx, f"Quá thời gian render Veo ({int(time.time() - start_time)}s). Bấm 'Render lại Video' để thử lại.")
+                except Exception as fb_err:
+                    print(f"[BATCH POLLER] Failed callback error for scene {sc_idx}: {fb_err}")
+            del active_ops[sc_idx]
         
     return completed_clips
 
 def generate_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int, job_id: str = None, duration_s: int = 8) -> str:
     """Fallback single-scene video generator (used for single scene regeneration)."""
     op_name = submit_video_flowkit(keyframe_mid, motion_prompt, scene_idx, job_id=job_id, duration_s=duration_s)
-    for poll_idx in range(240): # up to ~20 mins
+    for poll_idx in range(75): # up to 300s (~5 mins)
         time.sleep(4)
         poll_body = {"operations": [{"operation": {"name": op_name}}]}
         try:
@@ -1005,7 +1206,7 @@ def generate_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int
             metadata = (curr.get("operation") or {}).get("metadata", {})
             fife = metadata.get("video", {}).get("fifeUrl")
             if poll_idx % 15 == 0:
-                print(f"[VEO POLL] Scene {scene_idx} ({op_name[:12]}...): loop {poll_idx}/240, status={status}")
+                print(f"[VEO POLL] Scene {scene_idx} ({op_name[:12]}...): loop {poll_idx}/75, status={status}")
             if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL" or fife:
                 print(f"[VEO DONE] Scene {scene_idx} completed after {poll_idx * 4}s!")
                 return fife
@@ -1015,7 +1216,7 @@ def generate_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int
             if "Veo render failed" in str(e):
                 raise
             continue
-    raise TimeoutError(f"Veo video scene {scene_idx} timed out after 240 polling cycles")
+    raise TimeoutError(f"Veo video scene {scene_idx} timed out after 300s")
 
 GROK_VOICE_CONFIGS = {
     "female_north": {
@@ -1077,7 +1278,7 @@ def build_grok_video_prompt(
     safe_dialogue = sanitize_safety_content(dialogue)
 
     # Determine if human / creator is present
-    is_human = has_model or flow_mode in ["ugc", "store_review"]
+    is_human = has_model or flow_mode in ["ugc", "store_review", "fashion"]
     # If clean_motion explicitly mentions "NO human" or "empty of people", force non-human
     if re.search(r'\bno\s+human\b|\bzero\s+human\b|\bempty\s+of\s+people\b', clean_motion, re.IGNORECASE):
         is_human = False
@@ -1237,7 +1438,7 @@ def generate_video_grok(
                 dialogue = sc.get("audio_dialogue", "")
                 break
                 
-    has_model = (flow_mode in ["ugc", "store_review"]) or ((keyframe_path.parent / "model.jpg").exists())
+    has_model = (flow_mode in ["ugc", "store_review", "fashion"]) or ((keyframe_path.parent / "model.jpg").exists())
 
     # Build structured prompt for Grok (token-safe, clear speech/lip-sync/voice-over blocks)
     grok_prompt = build_grok_video_prompt(
@@ -1258,108 +1459,126 @@ def generate_video_grok(
         "image": {"url": data_url}
     }
     
-    init_data = None
-    last_init_err = None
-    for init_attempt in range(3):
-        try:
-            req = urllib.request.Request(
-                f"{base_url}/v1/videos",
-                data=json.dumps(payload).encode("utf-8"),
+    max_render_retries = 2
+    for render_round in range(1, max_render_retries + 1):
+        init_data = None
+        last_init_err = None
+        for init_attempt in range(3):
+            try:
+                req = urllib.request.Request(
+                    f"{base_url}/v1/videos",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "Nova-TVC/1.0"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    init_data = json.loads(resp.read().decode("utf-8"))
+                if init_data and init_data.get("id"):
+                    break
+            except Exception as ie:
+                last_init_err = ie
+                print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx} init attempt {init_attempt+1}/3 error: {ie}")
+                if init_attempt < 2:
+                    time.sleep(2)
+            
+        video_id = init_data.get("id") if init_data else None
+        if not video_id:
+            if render_round < max_render_retries:
+                print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx} init failed, retrying round {render_round+1} in 4s...")
+                time.sleep(4)
+                continue
+            raise RuntimeError(f"Grok Video init failed after 3 attempts: {init_data or last_init_err}")
+            
+        print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx}: video_id={video_id} submitted (round {render_round}). Polling...")
+        
+        poll_url = f"{base_url}/v1/videos/{video_id}"
+        t0 = time.time()
+        round_failed_transient = False
+        for poll_cycle in range(60): # up to ~5 minutes
+            time.sleep(5)
+            preq = urllib.request.Request(
+                poll_url,
                 headers={
                     "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
                     "User-Agent": "Nova-TVC/1.0"
-                },
-                method="POST"
+                }
             )
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                init_data = json.loads(resp.read().decode("utf-8"))
-            if init_data and init_data.get("id"):
-                break
-        except Exception as ie:
-            last_init_err = ie
-            print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx} init attempt {init_attempt+1}/3 error: {ie}")
-            if init_attempt < 2:
-                time.sleep(2)
-        
-    video_id = init_data.get("id") if init_data else None
-    if not video_id:
-        raise RuntimeError(f"Grok Video init failed after 3 attempts: {init_data or last_init_err}")
-        
-    print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx}: video_id={video_id} submitted. Polling...")
-    
-    poll_url = f"{base_url}/v1/videos/{video_id}"
-    t0 = time.time()
-    for poll_cycle in range(60): # up to ~5 minutes
-        time.sleep(5)
-        preq = urllib.request.Request(
-            poll_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": "Nova-TVC/1.0"
-            }
-        )
-        try:
-            with urllib.request.urlopen(preq, timeout=30) as presp:
-                pdata = json.loads(presp.read().decode("utf-8"))
-            status = pdata.get("status", "").lower()
-            if status in ("completed", "success"):
-                v_url = pdata.get("video_url") or pdata.get("url") or pdata.get("share_url")
-                if not v_url:
-                    raise RuntimeError("No video URL returned in completed Grok response")
-                clip_path = keyframe_path.parent / f"clip_{scene_idx}.mp4"
-                
-                # Retry download up to 3 times to guard against network blips
-                downloaded = False
-                for dl_attempt in range(3):
-                    try:
-                        dl_req = urllib.request.Request(v_url, headers={"User-Agent": "Nova-TVC/1.0", "Authorization": f"Bearer {api_key}"})
-                        with urllib.request.urlopen(dl_req, timeout=90) as dresp, open(clip_path, "wb") as out_f:
-                            out_f.write(dresp.read())
-                        if clip_path.exists() and clip_path.stat().st_size > 10000:
-                            downloaded = True
-                            break
-                    except Exception as dl_err:
-                        print(f"[GROK VIDEO] Download attempt {dl_attempt+1}/3 failed for Scene {scene_idx}: {dl_err}")
-                        time.sleep(2)
-                        
-                if not downloaded:
-                    raise RuntimeError(f"Failed to download completed Grok video after 3 attempts: {v_url}")
+            try:
+                with urllib.request.urlopen(preq, timeout=30) as presp:
+                    pdata = json.loads(presp.read().decode("utf-8"))
+                status = pdata.get("status", "").lower()
+                if status in ("completed", "success"):
+                    v_url = pdata.get("video_url") or pdata.get("url") or pdata.get("share_url")
+                    if not v_url:
+                        raise RuntimeError("No video URL returned in completed Grok response")
+                    clip_path = keyframe_path.parent / f"clip_{scene_idx}.mp4"
+                    
+                    # Retry download up to 3 times to guard against network blips
+                    downloaded = False
+                    for dl_attempt in range(3):
+                        try:
+                            dl_req = urllib.request.Request(v_url, headers={"User-Agent": "Nova-TVC/1.0", "Authorization": f"Bearer {api_key}"})
+                            with urllib.request.urlopen(dl_req, timeout=90) as dresp, open(clip_path, "wb") as out_f:
+                                out_f.write(dresp.read())
+                            if clip_path.exists() and clip_path.stat().st_size > 10000:
+                                downloaded = True
+                                break
+                        except Exception as dl_err:
+                            print(f"[GROK VIDEO] Download attempt {dl_attempt+1}/3 failed for Scene {scene_idx}: {dl_err}")
+                            time.sleep(2)
+                            
+                    if not downloaded:
+                        raise RuntimeError(f"Failed to download completed Grok video after 3 attempts: {v_url}")
 
-                # Auto-align lip-sync lead-in: If speech starts immediately at t=0 (<0.1s) without pause,
-                # add a micro 250ms delay so mouth opening and spoken voice start in perfect synchrony
-                if has_model and clip_path.exists() and clip_path.stat().st_size > 10000:
-                    try:
-                        p_cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", str(clip_path)]
-                        has_audio = bool(subprocess.check_output(p_cmd).decode().strip())
-                        if has_audio:
-                            s_cmd = ["ffmpeg", "-i", str(clip_path), "-af", "silencedetect=noise=-35dB:d=0.08", "-f", "null", "-"]
-                            s_res = subprocess.run(s_cmd, capture_output=True, text=True)
-                            has_initial_silence = ("silence_start: 0" in s_res.stderr and "silence_duration: 0.2" in s_res.stderr)
-                            if not has_initial_silence:
-                                synced_tmp = clip_path.parent / f"synced_{clip_path.name}"
-                                sync_cmd = ["ffmpeg", "-y", "-i", str(clip_path), "-af", "adelay=250|250", "-c:v", "copy", "-c:a", "aac", "-shortest", str(synced_tmp)]
-                                sync_res = subprocess.run(sync_cmd, capture_output=True)
-                                if sync_res.returncode == 0 and synced_tmp.exists() and synced_tmp.stat().st_size > 10000:
-                                    synced_tmp.replace(clip_path)
-                                    print(f"[GROK VIDEO] Scene {scene_idx}: Auto-aligned lip-sync lead-in (+250ms)")
-                    except Exception as sync_err:
-                        print(f"[GROK VIDEO] Scene {scene_idx}: lip-sync alignment check skipped: {sync_err}")
+                    # Auto-align lip-sync lead-in: If speech starts immediately at t=0 (<0.1s) without pause,
+                    # add a micro 250ms delay so mouth opening and spoken voice start in perfect synchrony
+                    if has_model and clip_path.exists() and clip_path.stat().st_size > 10000:
+                        try:
+                            p_cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", str(clip_path)]
+                            has_audio = bool(subprocess.check_output(p_cmd).decode().strip())
+                            if has_audio:
+                                s_cmd = ["ffmpeg", "-i", str(clip_path), "-af", "silencedetect=noise=-35dB:d=0.08", "-f", "null", "-"]
+                                s_res = subprocess.run(s_cmd, capture_output=True, text=True)
+                                has_initial_silence = ("silence_start: 0" in s_res.stderr and "silence_duration: 0.2" in s_res.stderr)
+                                if not has_initial_silence:
+                                    synced_tmp = clip_path.parent / f"synced_{clip_path.name}"
+                                    sync_cmd = ["ffmpeg", "-y", "-i", str(clip_path), "-af", "adelay=250|250", "-c:v", "copy", "-c:a", "aac", "-shortest", str(synced_tmp)]
+                                    sync_res = subprocess.run(sync_cmd, capture_output=True)
+                                    if sync_res.returncode == 0 and synced_tmp.exists() and synced_tmp.stat().st_size > 10000:
+                                        synced_tmp.replace(clip_path)
+                                        print(f"[GROK VIDEO] Scene {scene_idx}: Auto-aligned lip-sync lead-in (+250ms)")
+                        except Exception as sync_err:
+                            print(f"[GROK VIDEO] Scene {scene_idx}: lip-sync alignment check skipped: {sync_err}")
 
-                print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx}: completed in {int(time.time() - t0)}s! Saved to {clip_path}")
-                return clip_path
-            elif status in ("failed", "error"):
-                raise RuntimeError(f"Grok video render failed: {pdata.get('error')}")
-        except RuntimeError as re:
-            if "render failed" in str(re) or "Failed to download" in str(re):
-                raise
-            print(f"[GROK VIDEO] Scene {scene_idx} poll error: {re}")
-        except urllib.error.HTTPError as he:
-            print(f"[GROK VIDEO] Scene {scene_idx} poll HTTP error: {he.code}")
-        except Exception as ex:
-            print(f"[GROK VIDEO] Scene {scene_idx} poll transient error: {ex}")
+                    print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx}: completed in {int(time.time() - t0)}s! Saved to {clip_path}")
+                    return clip_path
+                elif status in ("failed", "error"):
+                    err_info = pdata.get('error')
+                    err_str = str(err_info).lower()
+                    is_transient = any(k in err_str for k in ["không khả dụng", "giới hạn tốc độ", "rate_limit", "server_error", "could not store video", "busy", "timeout", "temporarily"])
+                    if is_transient and render_round < max_render_retries:
+                        print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx}: upstream transient error '{err_info}', retrying in 6s (round {render_round+1}/{max_render_retries})...")
+                        time.sleep(6)
+                        round_failed_transient = True
+                        break
+                    raise RuntimeError(f"Grok video render failed: {err_info}")
+            except RuntimeError as re:
+                if "render failed" in str(re) or "Failed to download" in str(re):
+                    raise
+                print(f"[GROK VIDEO] Scene {scene_idx} poll error: {re}")
+            except urllib.error.HTTPError as he:
+                print(f"[GROK VIDEO] Scene {scene_idx} poll HTTP error: {he.code}")
+            except Exception as ex:
+                print(f"[GROK VIDEO] Scene {scene_idx} poll transient error: {ex}")
+
+        if round_failed_transient:
+            continue
             
-    raise TimeoutError(f"Grok video scene {scene_idx} timed out after 300s")
+        raise TimeoutError(f"Grok video scene {scene_idx} timed out after 300s")
 
 def batch_generate_videos_grok(
     scenes_to_run: list,
@@ -1374,11 +1593,14 @@ def batch_generate_videos_grok(
     on_clip_done: callable = None,
     on_clip_failed: callable = None
 ) -> dict:
-    """Generate multiple Grok videos concurrently using thread pool."""
+    """Generate multiple Grok videos concurrently using thread pool with concurrency throttling and stagger."""
     completed = {}
-    max_workers = max(1, min(num_threads, len(scenes_to_run), 5))
+    max_workers = max(1, min(num_threads, len(scenes_to_run), 2))
     
-    def _worker(item):
+    def _worker(item_and_delay):
+        item, delay_s = item_and_delay
+        if delay_s > 0:
+            time.sleep(delay_s)
         s_idx, kf_p, m_prompt = item[:3]
         dlg = item[3] if len(item) > 3 else ""
         try:
@@ -1401,8 +1623,9 @@ def batch_generate_videos_grok(
                 on_clip_failed(s_idx, str(e))
             return s_idx, None, str(e)
             
+    items_with_delays = [(item, i * 2.0) for i, item in enumerate(scenes_to_run)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_worker, item) for item in scenes_to_run]
+        futures = [executor.submit(_worker, item_d) for item_d in items_with_delays]
         for fut in concurrent.futures.as_completed(futures):
             s_idx, c_p, err = fut.result()
             if c_p:
@@ -1539,16 +1762,18 @@ def run_pipeline_worker(job_id: str):
         flow_mode = "unboxing"
     elif raw_mode in ["demo", "demo_product", "product_demo"]:
         flow_mode = "demo"
+    elif raw_mode in ["fashion", "fashion_lookbook", "lookbook", "tryon", "virtual_tryon"]:
+        flow_mode = "fashion"
     else:
         flow_mode = "pov"
 
     # Enforce fallback or default model if no model image uploaded for modes requiring model
-    if flow_mode in ["ugc", "store_review"] and not model_file.exists():
+    if flow_mode in ["ugc", "store_review", "fashion"] and not model_file.exists():
         default_model = Path("/home/pc/flowkit/mau/human.jpg")
         if default_model.exists():
             import shutil
             shutil.copy(default_model, model_file)
-            print(f"UGC mode: Auto-assigned default realistic creator model {default_model} -> {model_file}")
+            print(f"{flow_mode.upper()} mode: Auto-assigned default realistic model {default_model} -> {model_file}")
         else:
             print("No model image provided, falling back to POV mode.")
             flow_mode = "pov"
@@ -1742,6 +1967,46 @@ Extract exact details and return a strict JSON object with:
                     except Exception as e_fk:
                         profile_data = run_claude_cli_json(vision_prompt)
 
+            elif flow_mode == "fashion":
+                update_job(job_id, status="ANALYZING", message="Giai đoạn 0: AI Vision (Google Gemini 3.8 Flash) đang bóc tách thiết kế may mặc, chất liệu vải và phom dáng thời trang...", step=1, total_steps=5)
+                vision_prompt = f"""
+    Read and analyze the fashion garment image at {prod_file} and model portrait image at {model_file}.
+    You are a High-Fashion Runway Creative Director & Haute Couture Stylist.
+    Extract exact garment structure, silhouette, fabric, and model profile, returning a strict JSON object with:
+    {{
+      "product": {{
+        "brand": "brand name or Boutique",
+        "name": "detailed fashion item name (e.g. Đầm lụa xếp ly cúp ngực, Áo blazer may đo oversize, Set dạ tweed thanh lịch)",
+        "category": "Thời trang thiết kế / Váy đầm / Áo sơ mi / Quần âu / Áo khoác / Set đồ",
+        "material": "exact fabric texture (lụa tơ tằm, dạ tweed cao cấp, cotton organic, voan tơ bay bổng, đũi mát mịn)",
+        "features": "collar style, neckline, sleeve cut, waistline fit, button accents, hemline, pleats, silhouette",
+        "details": "exact color shade, fabric sheen, pattern/print, sewing lines, drapery, lining"
+      }},
+      "canonical_visual_anchor": "CRITICAL: MUST BE 100% IN CONCISE ENGLISH. Precise visual description of the fashion garment for image models (Banana Pro 2). Detail exact silhouette, color palette, fabric texture, neckline, sleeve cut, buttons, hemline, natural folds and drape. Strictly highlight realistic fabric physics, neat stitching, and luxury garment construction.",
+      "model": {{
+        "gender": "female or male",
+        "age_approx": 24,
+        "hair": "sleek hairstyle fitting luxury lookbook",
+        "clothing": "wearing the exact specified fashion garment naturally and gracefully",
+        "facial_features": "graceful confident facial expression, flawless skin tone, radiant natural makeup"
+      }},
+      "canonical_model_anchor": "CRITICAL: MUST BE 100% IN CONCISE ENGLISH. Description of the model: gender, mature adult age (22+), ethnicity, skin tone, hairstyle/color, graceful posture, perfectly fitted into the garment. This anchor will be locked across all scenes to ensure zero morphing.",
+      "suggested_background": "Pure white studio background with soft diffuse light, or an elegant luxury minimalist boutique showroom",
+      "accent_suggested": "Nữ Miền Bắc thanh lịch hoặc Nữ Miền Nam ngọt ngào"
+    }}
+    """
+                try:
+                    update_job(job_id, message="Giai đoạn 0: Đang gọi AI Vision (Google Gemini 3.8 Flash) quét chi tiết thời trang và người mẫu...")
+                    profile_data = grok_vision_analyze(vision_prompt, [prod_file, model_file])
+                    if not isinstance(profile_data, dict) or "product" not in profile_data:
+                        raise ValueError("Gemini 3.8 Flash Vision returned invalid profile structure")
+                except Exception as e_grok:
+                    print(f"Gemini 3.8 Flash Vision error: {e_grok}, falling back to FlowKit Vision...")
+                    try:
+                        profile_data = flowkit_vision_analyze(vision_prompt, [prod_file, model_file])
+                    except Exception as e_fk:
+                        profile_data = run_claude_cli_json(vision_prompt)
+
             else: # store_review
                 update_job(job_id, status="ANALYZING", message="Giai đoạn 0: AI Vision (Google Gemini 3.8 Flash) đang quét sản phẩm và KOL Review Showroom...", step=1, total_steps=5)
                 vision_prompt = f"""
@@ -1790,7 +2055,8 @@ Extract exact details and return a strict JSON object with:
             "unboxing": "Unboxing Studio (100% Sản Phẩm - Không người)",
             "demo": "Demo Công Dụng (Thao tác & Hiệu quả thực tế)",
             "ugc": "UGC (Người dùng thật - Phòng riêng)",
-            "store_review": "Review Cửa Hàng (Showroom sang trọng)"
+            "store_review": "Review Cửa Hàng (Showroom sang trọng)",
+            "fashion": "Thời Trang AI (Fashion Lookbook 15 Dáng Studio)"
         }
         update_job(
             job_id,
@@ -1801,7 +2067,7 @@ Extract exact details and return a strict JSON object with:
 
         canonical_anchor = profile_data.get("canonical_visual_anchor") or profile_data.get("product", {}).get("details", "") or profile_data.get("product", {}).get("features", "")
         canonical_model_anchor = profile_data.get("canonical_model_anchor", "")
-        if not canonical_model_anchor and flow_mode in ["ugc", "store_review"]:
+        if not canonical_model_anchor and flow_mode in ["ugc", "store_review", "fashion"]:
             m = profile_data.get("model", {})
             parts = []
             if m.get("gender"): parts.append(f"{m.get('gender')}")
@@ -1839,6 +2105,7 @@ Extract exact details and return a strict JSON object with:
         if product_highlights:
             profile_data["product"]["highlights"] = product_highlights
 
+        profile_data["voice_bible"] = VOICE_BIBLE.get(voice_key, VOICE_BIBLE["female_north"])
         update_job(job_id, profile=profile_data)
 
         # Build persona rules & audience guidance
@@ -1895,6 +2162,22 @@ Extract exact details and return a strict JSON object with:
                     "visual_plan": f"Mô tả bối cảnh và hành động chi tiết cho Phân Cảnh {i+1}...",
                     "image_generation_prompt": f"PRODUCT REFERENCE LOCK — HIGHEST PRIORITY: {canonical_anchor}. [Action and camera angle for Scene {i+1}]. Photorealistic 8k vertical 9:16.",
                     "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY: [Subtle movement for Scene {i+1}]. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['veo_prompt']}"
+                } for i in range(num_scenes)
+            ]
+        elif flow_mode == "fashion":
+            fashion_poses_en = [
+                "Full body frontal view, graceful runway standing pose, completely showcasing the garment silhouette and natural drape",
+                "Medium close-up shot focusing on the luxury fabric texture, sewing seams, collar line, and buttons",
+                "Three-quarter angle turnaround pose with natural gentle movement, highlighting waistline fit and graceful movement"
+            ]
+            skeleton_items = [
+                {
+                    "scene_id": i + 1,
+                    "duration_seconds": scene_duration,
+                    "audio_dialogue": f"Lời thoại tiếng Việt tự nhiên cho Phân Cảnh {i+1} ({word_count_rule}).",
+                    "visual_plan": f"Mô tả góc chụp thời trang và cử chỉ người mẫu cho Phân Cảnh {i+1}...",
+                    "image_generation_prompt": f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {canonical_model_anchor}.. PRODUCT REFERENCE LOCK: {canonical_anchor}.. {fashion_poses_en[i % len(fashion_poses_en)]}. Soft luxury studio lighting, pure elegant setting, natural fabric folds, clean composition, no watermark, no text. Photorealistic 8k vertical 9:16.",
+                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC. Model maintains elegant poised posture with subtle head movement, gently turning or posing naturally to show off the outfit fit. Direct camera eye contact. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['veo_prompt']}"
                 } for i in range(num_scenes)
             ]
         else:
@@ -2029,6 +2312,43 @@ CRITICAL UGC PRODUCTION RULES:
     - NEVER use ambiguous tactile actions in prompts or dialogue (NO 'unzipping slit', NO 'smooth zipper', NO 'pulling out of slit', NO 'khóa kéo mở bung', NO 'rubbing', NO 'stroking').
     - For product interaction: keep gestures natural, gentle, and commercial: 'holding product comfortably near chest level', 'pointing gently at feature', 'gently opening the presentation pouch to reveal the cute character'.
 14. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
+
+Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
+{skeleton_json}
+"""
+        elif flow_mode == "fashion":
+            script_prompt = f"""
+You are an International Haute Couture Creative Director & Commercial Fashion Lookbook Producer specializing in E-Commerce Fashion, Virtual Try-On, and Runway Showcases.
+Product (Garment) Profile: {json.dumps(profile_data['product'], ensure_ascii=False)}
+Fashion Model Visual Lock: {canonical_model_anchor}
+Garment Reference Lock: {canonical_anchor}
+Studio Setting: {profile_data.get('suggested_background', 'Pure white studio background or luxury boutique runway with soft professional studio lighting')}
+
+CRITICAL FASHION LOOKBOOK PRODUCTION RULES:
+1. LOẠI HÌNH: THỜI TRANG AI — FASHION LOOKBOOK & VIRTUAL TRY-ON (Chuẩn 15 Dáng Studio Quốc Tế).
+2. ZERO-MORPHING & OUTFIT CONTINUITY:
+   - Model Identity (gương mặt, kiểu tóc, màu da, vóc dáng tỉ lệ cơ thể) KHÓA 100% across all scenes ({canonical_model_anchor}).
+   - Garment & Products (áo, quần, váy, đầm, đường may, hoa văn, chất liệu vải, nếp gấp) KHÓA 100% chuẩn xác theo ảnh tham chiếu ({canonical_anchor}).
+   - Every scene's "image_generation_prompt" MUST start with:
+     `CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {canonical_model_anchor}.. PRODUCT REFERENCE LOCK: {canonical_anchor}..`
+3. 15 STUDIO POSES CYCLING:
+   - Scene 1: Toàn thân, nhìn thẳng / catwalk tự nhiên (Trình diễn tổng thể outfit, form dáng chuẩn).
+   - Scene 2: Cận cảnh chi tiết chất liệu vải / đường may / cổ áo / tay áo (Tôn vinh chất lượng may mặc, độ rủ của vải).
+   - Scene 3: Xoay người thanh lịch 360 độ hoặc góc nghiêng ba phần tư (Khoe trọn vẻ đẹp sau lưng và chuyển động bồng bềnh).
+4. ZERO ON-SCREEN TEXT OR GRAPHICS: TUYỆT ĐỐI KHÔNG CÓ CHỮ TRÊN MÀN HÌNH (NO on-screen text, NO subtitles, NO captions, NO typography, NO watermark, NO banners).
+5. PROMPTS MUST BE 100% IN ENGLISH: "image_generation_prompt" and "video_motion_prompt" MUST be written in concise English only!
+6. TOTAL SCENES: EXACTLY {num_scenes} SCENES.
+7. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
+8. DIALOGUE WORD LIMIT: Each scene's "audio_dialogue" MUST contain {word_count_rule} to perfectly fit speaking in {scene_duration} seconds!
+9. VOICE STYLE & DIALECT: {voice_info['label']} — {voice_info['tone_desc']}
+10. TONE & VOCABULARY: Giọng điệu tư vấn thời trang sang trọng, sành điệu, khéo léo khen form dáng, hack chiều cao, chất vải mềm mát, phối đồ dạo phố/đi tiệc/công sở (ví dụ: 'Mẫu đầm thiết kế chuẩn phom tôn dáng cực đỉnh...', 'Chất vải đũi lụa cao cấp mềm mịn, mặc lên nhẹ tênh...', 'Thiết kế chiết eo tinh tế giúp che khuyết điểm hoàn hảo...', 'Bấm ngay vào giỏ hàng góc trái để rinh ngay em này về nhé').
+11. {persona_prompt_block}
+12. VIDEO MOTION PROMPT FOR VEO 3.1:
+    - Must start with: `PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC.`
+    - Model motion: Elegant Turnaround / Boutique Walk / Catwalk poise / gentle fabric rustle.
+    - Camera: Cinematic Push-in, Head-to-Toe Scan, Slow Orbit, or Gimbal Track.
+    - End with: `Say: \"[exact audio_dialogue]\" in {voice_info['veo_prompt']}`.
+13. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
 {skeleton_json}
@@ -2208,6 +2528,13 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
             if bg_file and bg_file.exists() and bg_file.name == "background.jpg":
                 bg_mid = upload_to_flowkit(bg_file, job_id=job_id)
                 ref_ids.append(bg_mid)
+        elif flow_mode == "fashion":
+            update_job(job_id, status="KEYFRAMING", message="Giai đoạn 2: Khóa Nhân Dạng Người Mẫu (Tầng 1) + Chi Tiết Trang Phục Thời Trang (Tầng 2) trên Banana Pro 2...", step=3)
+            model_mid = upload_to_flowkit(model_file, job_id=job_id)
+            ref_ids = [model_mid, prod_mid]
+            if bg_file and bg_file.exists() and bg_file.name == "background.jpg":
+                bg_mid = upload_to_flowkit(bg_file, job_id=job_id)
+                ref_ids.append(bg_mid)
         else: # store_review
             update_job(job_id, status="KEYFRAMING", message="Giai đoạn 2: Khóa Chân Dung KOL (Ưu tiên số 1) + Sản Phẩm trên Banana Pro 2...", step=3)
             model_mid = upload_to_flowkit(model_file, job_id=job_id)
@@ -2220,18 +2547,16 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
         # ─── GIAI ĐOẠN 2 & 3: BĂNG CHUYỀN SẢN XUẤT (PIPELINED KEYFRAME & VEO 3) ──────
         update_job(job_id, status="KEYFRAMING", message=f"Khởi động Băng Chuyền Sản Xuất: Chuẩn bị âm thanh TTS và xử lý {num_scenes} phân cảnh liên tục...", step=3)
 
-        # 1. Sinh trước toàn bộ TTS Audio (1-2 giây, chạy song song)
-        def _gen_tts(item):
-            i, sc = item
+        # 1. Sinh trước toàn bộ TTS Audio (tuần tự, giãn cách 0.3s chống Edge-TTS websocket throttling)
+        for i, sc in enumerate(scenes_data, start=1):
             tts_path = job_dir / f"tts_{i}.mp3"
-            if not tts_path.exists() or tts_path.stat().st_size < 1000:
+            dlg = (sc.get("audio_dialogue") or "").strip()
+            if dlg and (not tts_path.exists() or tts_path.stat().st_size < 1000):
                 try:
-                    generate_edge_tts(sc.get("audio_dialogue", ""), tts_path, voice=voice_info["edge_voice"], rate=voice_info["rate"])
+                    generate_edge_tts(dlg, tts_path, voice=voice_info["edge_voice"], rate=voice_info.get("rate", "+0%"))
                 except Exception as tts_err:
                     print(f"Job {job_id}: Warning generating TTS for scene {i}: {tts_err}")
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_scenes, 5)) as tts_executor:
-            list(tts_executor.map(_gen_tts, enumerate(scenes_data, start=1)))
+                time.sleep(0.3)
 
         keyframes = [None] * num_scenes
         clips = [None] * num_scenes
@@ -2325,7 +2650,8 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                         done_count = len([k for k in keyframes if k is not None])
                         update_job(job_id, status="RENDERING", message=f"Đã hoàn tất {done_count}/{num_scenes} Keyframe. Chuyển sang {grok_display} ({scene_duration}s)...", step=4, scenes=scenes_data)
                 else:
-                    # Zero-wait submit: Đẩy ngay vào hàng đợi GPU Veo 3 trên Google Cloud ngay khi Keyframe của cảnh này hoàn thành!
+                    # Pacing 2.0s: Chống RATE_BURST giữa bước tạo Keyframe và nạp Video Veo 3
+                    time.sleep(2.0)
                     op_name = submit_video_flowkit(kf_mid, sc["video_motion_prompt"], i, job_id=job_id, duration_s=scene_duration)
                     with state_lock:
                         pending_ops[i] = op_name
@@ -2342,7 +2668,7 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                     update_job(job_id, scenes=scenes_data)
                 kf_errors.append(f"Cảnh {i}: {err}")
 
-        max_kf_workers = max(1, min(num_scenes, num_threads, 5))
+        max_kf_workers = max(1, min(num_scenes, num_threads, 20))
         print(f"Job {job_id}: Generating {num_scenes} keyframes concurrently with {max_kf_workers} workers...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_kf_workers) as kf_executor:
             futures = [kf_executor.submit(_process_scene_keyframe, i, sc) for i, sc in enumerate(scenes_data, start=1)]
@@ -2459,11 +2785,19 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
         has_failures = any(sc.get("status") == "FAILED" for sc in scenes_data) or (len(valid_clips) < num_scenes)
 
         if not has_failures and len(valid_clips) == num_scenes:
-            # Ensure all clips have their Edge-TTS audio muxed before concatenating
-            for idx, c in enumerate(valid_clips, start=1):
-                t_f = job_dir / f"tts_{idx}.mp3"
-                if t_f.exists() and t_f.stat().st_size > 500:
-                    mux_tts_to_video(c, t_f, target_duration=scene_duration)
+            # If any clip has no audio (e.g. silent video), apply Edge-TTS fallback (except fashion mode which is zero-dialogue)
+            if flow_mode != "fashion":
+                for idx, c in enumerate(valid_clips, start=1):
+                    if not check_video_has_audio(c):
+                        t_f = job_dir / f"tts_{idx}.mp3"
+                        if not t_f.exists() or t_f.stat().st_size < 1000:
+                            sc_data = scenes_data[idx - 1] if idx - 1 < len(scenes_data) else {}
+                            dlg = (sc_data.get("audio_dialogue") or "").strip()
+                            if dlg:
+                                print(f"Job {job_id}: Recovering missing TTS for silent scene {idx} before concatenation...")
+                                generate_edge_tts(dlg, t_f, voice=voice_info["edge_voice"], rate=voice_info.get("rate", "+0%"))
+                        if t_f.exists() and t_f.stat().st_size > 500:
+                            mux_tts_to_video(c, t_f, target_duration=scene_duration)
 
             smart_concat_videos(
                 valid_clips,
@@ -2493,11 +2827,21 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
             update_job(
                 job_id,
                 status="PARTIAL_SUCCESS",
-                message=f"Đã hoàn thành {len(valid_clips)}/{num_scenes} phân cảnh ({fail_count} cảnh chưa xong hoặc bị lỗi). Vui lòng bấm 'Render lại Video' trên cảnh lỗi để hoàn tất và tự động xuất video final!",
+                message=f"Đã hoàn thành {len(valid_clips)}/{num_scenes} phân cảnh ({fail_count} cảnh chưa xong hoặc bị lỗi). Đang tự động thử lại cảnh thiếu để xuất video final...",
                 final_video_url=None,
                 completed_at=time.time(),
                 scenes=scenes_data
             )
+            # Auto-rescue: If exactly 1 scene failed/timed out, automatically attempt 1 background retry
+            failed_scene_ids = [sc.get("scene_id") for sc in scenes_data if sc.get("status") == "FAILED"]
+            if len(failed_scene_ids) == 1:
+                auto_sc_id = failed_scene_ids[0]
+                print(f"Job {job_id}: Automatically triggering background rescue for single failed scene {auto_sc_id}...")
+                threading.Thread(
+                    target=run_scene_regeneration_worker,
+                    args=(job_id, auto_sc_id, "", "", "", False),
+                    daemon=True
+                ).start()
         else:
             if final_mp4.exists():
                 try:
@@ -2557,7 +2901,7 @@ def run_keyframe_regeneration_worker(job_id: str, scene_id: int, image_prompt: s
                 if "PRODUCT REFERENCE LOCK — HIGHEST PRIORITY:" in p_text:
                     canonical_anchor = p_text.split("PRODUCT REFERENCE LOCK — HIGHEST PRIORITY:", 1)[1].split(". ", 1)[0].strip()
                     break
-        if not canonical_model_anchor and flow_mode in ["ugc", "store_review"]:
+        if not canonical_model_anchor and flow_mode in ["ugc", "store_review", "fashion"]:
             for s in scenes:
                 p_text = s.get("image_generation_prompt", "")
                 if "CREATOR REFERENCE LOCK — HIGHEST PRIORITY:" in p_text:
@@ -2565,6 +2909,9 @@ def run_keyframe_regeneration_worker(job_id: str, scene_id: int, image_prompt: s
                     break
                 elif "KOL REFERENCE LOCK — HIGHEST PRIORITY:" in p_text:
                     canonical_model_anchor = p_text.split("KOL REFERENCE LOCK — HIGHEST PRIORITY:", 1)[1].split(". ", 1)[0].strip()
+                    break
+                elif "FASHION MODEL REFERENCE LOCK — HIGHEST PRIORITY:" in p_text:
+                    canonical_model_anchor = p_text.split("FASHION MODEL REFERENCE LOCK — HIGHEST PRIORITY:", 1)[1].split(". ", 1)[0].strip()
                     break
 
         canonical_anchor = sanitize_safety_content(canonical_anchor)
@@ -2647,6 +2994,9 @@ def run_scene_regeneration_worker(
         sc_idx = scene_id - 1
         sc = scenes[sc_idx]
 
+        voice_key = job.get("voice", "female_north")
+        voice_info = VOICE_PROFILES.get(voice_key, VOICE_PROFILES["female_north"])
+
         # Update scene prompts if provided
         if image_prompt:
             sc["image_generation_prompt"] = image_prompt
@@ -2690,7 +3040,7 @@ def run_scene_regeneration_worker(
                 if "PRODUCT REFERENCE LOCK — HIGHEST PRIORITY:" in p_text:
                     canonical_anchor = p_text.split("PRODUCT REFERENCE LOCK — HIGHEST PRIORITY:", 1)[1].split(". ", 1)[0].strip()
                     break
-        if not canonical_model_anchor and flow_mode in ["ugc", "store_review"]:
+        if not canonical_model_anchor and flow_mode in ["ugc", "store_review", "fashion"]:
             for s in scenes:
                 p_text = s.get("image_generation_prompt", "")
                 if "CREATOR REFERENCE LOCK — HIGHEST PRIORITY:" in p_text:
@@ -2699,12 +3049,13 @@ def run_scene_regeneration_worker(
                 elif "KOL REFERENCE LOCK — HIGHEST PRIORITY:" in p_text:
                     canonical_model_anchor = p_text.split("KOL REFERENCE LOCK — HIGHEST PRIORITY:", 1)[1].split(". ", 1)[0].strip()
                     break
+                elif "FASHION MODEL REFERENCE LOCK — HIGHEST PRIORITY:" in p_text:
+                    canonical_model_anchor = p_text.split("FASHION MODEL REFERENCE LOCK — HIGHEST PRIORITY:", 1)[1].split(". ", 1)[0].strip()
+                    break
 
         canonical_anchor = sanitize_safety_content(canonical_anchor)
         canonical_model_anchor = sanitize_safety_content(canonical_model_anchor)
 
-        voice_key = job.get("voice", "female_north")
-        voice_info = VOICE_PROFILES.get(voice_key, VOICE_PROFILES["female_north"])
         scene_duration = job.get("scene_duration", 8)
 
         # 1. Regenerate Keyframe if requested
@@ -2811,8 +3162,8 @@ def run_scene_regeneration_worker(
             }
         )
         tts_path = job_dir / f"tts_{scene_id}.mp3"
-        generate_edge_tts(sc.get("audio_dialogue", ""), tts_path, voice=voice_info["edge_voice"], rate=voice_info["rate"])
-        if tts_path.exists() and tts_path.stat().st_size > 500:
+        generate_edge_tts(sc.get("audio_dialogue", ""), tts_path, voice=voice_info["edge_voice"], rate=voice_info.get("rate", "+0%"))
+        if not check_video_has_audio(clip_path) and tts_path.exists() and tts_path.stat().st_size > 500:
             mux_tts_to_video(clip_path, tts_path, target_duration=job.get("scene_duration", 8))
 
         # Update scene in scenes list
@@ -2969,9 +3320,17 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
         # API Rotate Proxies manually
         if p == "api/diagnostics/rotate-proxies":
-            res_a = rotate_profile_proxy("nick-a")
-            res_b = rotate_profile_proxy("Nick-b")
-            data = {"ok": True, "nick-a": res_a, "Nick-b": res_b}
+            results = {}
+            try:
+                from agent.services.accounts import load_accounts
+                accs = load_accounts()
+                for acc in accs:
+                    if acc.get("enabled", True):
+                        aid = acc["id"]
+                        results[aid] = rotate_profile_proxy(aid)
+            except Exception as e:
+                results = {"error": str(e)}
+            data = {"ok": True, "rotations": results, "nick-a": results.get("nick-a"), "Nick-b": results.get("Nick-b")}
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -3089,11 +3448,11 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             data = {
                 "ok": True,
                 "active_workers": max(1, workers_count),
-                "max_concurrency": max(2, workers_count * 2),
-                "default_threads": 5,
+                "max_concurrency": max(10, workers_count * 10),
+                "default_threads": 10,
                 "min_threads": 1,
-                "max_threads": 10,
-                "recommended_threads": 5,
+                "max_threads": 30,
+                "recommended_threads": 15,
                 "description": "Số luồng xử lý song song tối ưu cho cụm Google AI."
             }
             self.send_response(200)
@@ -3213,6 +3572,75 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             if not head_only:
                 self.wfile.write(json.dumps({"batches": batch_list}).encode("utf-8"))
             return
+
+        # Fashion Lookbook API Endpoints (Decoupled from TVC)
+        if p == "api/fashion-lookbook/templates":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(json.dumps({"ok": True, "templates": fls.get_public_templates()}, ensure_ascii=False).encode("utf-8"))
+            return
+
+        if p == "api/fashion-lookbook/models":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(json.dumps({"ok": True, "models": fls.get_public_models()}, ensure_ascii=False).encode("utf-8"))
+            return
+
+        if p == "api/fashion-lookbook/music":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(json.dumps({"ok": True, "music": fls.get_public_music()}, ensure_ascii=False).encode("utf-8"))
+            return
+
+        if p.startswith("api/fashion-lookbook/status/"):
+            jid = p.replace("api/fashion-lookbook/status/", "").strip()
+            job = fls.recover_lookbook_job(jid) or fls.LOOKBOOK_JOBS.get(jid)
+            if not job:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                if not head_only:
+                    self.wfile.write(json.dumps({"ok": False, "error": f"Lookbook Job {jid} not found"}, ensure_ascii=False).encode("utf-8"))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(json.dumps(job, ensure_ascii=False).encode("utf-8"))
+            return
+
+        if p.startswith("api/fashion-lookbook/"):
+            parts = p.split("/")
+            if len(parts) >= 4:
+                jid = parts[2]
+                action = parts[3]
+                jdir = fls.WORK_DIR / f"lookbook_{jid}"
+                if action == "final":
+                    fpath = jdir / "final_lookbook.mp4"
+                    if fpath.exists():
+                        self.send_file(fpath, "video/mp4", head_only=head_only)
+                        return
+                elif action == "clip" and len(parts) >= 5:
+                    fpath = jdir / f"clip_{parts[4]}.mp4"
+                    if fpath.exists():
+                        self.send_file(fpath, "video/mp4", head_only=head_only)
+                        return
+                elif action == "kf" and len(parts) >= 5:
+                    fpath = jdir / f"keyframe_{parts[4]}.jpg"
+                    if fpath.exists():
+                        self.send_file(fpath, "image/jpeg", head_only=head_only)
+                        return
 
         if p in ["api/tvc/list", "api/jobs/list"]:
             # Parse tenant_id from query string or X-Tenant-Id header
@@ -4010,6 +4438,164 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             }).encode("utf-8"))
             return
 
+        # Fashion Lookbook Create & Regen Endpoints
+        if p == "api/fashion-lookbook/create":
+            content_type = self.headers.get("Content-Type", "")
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length > 0 else b""
+
+            outfit_bytes = None
+            outfit_url = ""
+            model_bytes = None
+            model_url = ""
+            model_preset_id = "asian_elegance_24"
+            template_id = "runway_catwalk"
+            aspect_ratio = "9:16"
+            num_scenes = 3
+            scene_duration = 8
+            bgm_id = "vogue_runway"
+
+            if "boundary=" in content_type:
+                boundary = content_type.split("boundary=")[1].strip().encode()
+                fields, files = bis.parse_multipart_form(body, boundary)
+                outfit_files = files.get("outfit_file") or files.get("outfit_files") or []
+                if outfit_files:
+                    outfit_bytes = outfit_files[0][1]
+                model_files = files.get("model_file") or files.get("model_files") or []
+                if model_files:
+                    model_bytes = model_files[0][1]
+
+                outfit_url = fields.get("outfit_image_url") or fields.get("outfit_url") or ""
+                model_url = fields.get("model_image_url") or fields.get("model_url") or ""
+                model_preset_id = fields.get("model_preset_id") or model_preset_id
+                template_id = fields.get("template_id") or template_id
+                aspect_ratio = fields.get("aspect_ratio") or aspect_ratio
+                try:
+                    num_scenes = int(fields.get("num_scenes") or num_scenes)
+                except Exception:
+                    pass
+                try:
+                    scene_duration = int(fields.get("scene_duration") or scene_duration)
+                except Exception:
+                    pass
+                bgm_id = (
+                    fields.get("bgm_id") or
+                    fields.get("music_id") or
+                    fields.get("music") or
+                    fields.get("bgm") or
+                    fields.get("audio_id") or
+                    fields.get("sound") or
+                    bgm_id
+                )
+            else:
+                try:
+                    req_json = json.loads(body.decode("utf-8")) if body else {}
+                except Exception as e:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": False, "error": f"Invalid JSON: {e}"}).encode("utf-8"))
+                    return
+                outfit_url = req_json.get("outfit_image_url") or req_json.get("outfit_url") or ""
+                model_url = req_json.get("model_image_url") or req_json.get("model_url") or ""
+                model_preset_id = req_json.get("model_preset_id") or model_preset_id
+                template_id = req_json.get("template_id") or template_id
+                aspect_ratio = req_json.get("aspect_ratio") or aspect_ratio
+                try:
+                    num_scenes = int(req_json.get("num_scenes") or num_scenes)
+                except Exception:
+                    pass
+                try:
+                    scene_duration = int(req_json.get("scene_duration") or scene_duration)
+                except Exception:
+                    pass
+                outfit_b64 = req_json.get("outfit_base64") or req_json.get("outfit_file_base64")
+                if outfit_b64:
+                    if "," in outfit_b64:
+                        outfit_b64 = outfit_b64.split(",", 1)[1]
+                    try:
+                        outfit_bytes = base64.b64decode(outfit_b64)
+                    except Exception:
+                        pass
+                model_b64 = req_json.get("model_base64") or req_json.get("model_file_base64")
+                if model_b64:
+                    if "," in model_b64:
+                        model_b64 = model_b64.split(",", 1)[1]
+                    try:
+                        model_bytes = base64.b64decode(model_b64)
+                    except Exception:
+                        pass
+                bgm_id = (
+                    req_json.get("bgm_id") or
+                    req_json.get("music_id") or
+                    req_json.get("music") or
+                    req_json.get("bgm") or
+                    req_json.get("audio_id") or
+                    req_json.get("sound") or
+                    bgm_id
+                )
+
+            if not outfit_bytes and not outfit_url:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": "Vui lòng tải lên file ảnh trang phục hoặc truyền link outfit_image_url!"}, ensure_ascii=False).encode("utf-8"))
+                return
+
+            job_id = fls.create_lookbook_job(
+                outfit_bytes=outfit_bytes,
+                outfit_url=outfit_url,
+                model_bytes=model_bytes,
+                model_url=model_url,
+                model_preset_id=model_preset_id,
+                template_id=template_id,
+                aspect_ratio=aspect_ratio,
+                num_scenes=num_scenes,
+                scene_duration=scene_duration,
+                bgm_id=bgm_id
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "ok": True,
+                "job_id": job_id,
+                "status": "QUEUED",
+                "message": "Đang khởi tạo pipeline Lookbook điện ảnh...",
+                "template_id": template_id,
+                "num_scenes": num_scenes,
+                "total_duration_seconds": num_scenes * scene_duration,
+                "aspect_ratio": aspect_ratio,
+                "created_at": time.time()
+            }, ensure_ascii=False).encode("utf-8"))
+            return
+
+        if p.startswith("api/fashion-lookbook/scene/") and p.endswith("/regen"):
+            parts = p.split("/")
+            if len(parts) >= 6:
+                jid = parts[3]
+                try:
+                    sid = int(parts[4])
+                except Exception:
+                    sid = 1
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    req_json = json.loads(body.decode("utf-8")) if body else {}
+                except Exception:
+                    req_json = {}
+                override = req_json.get("camera_motion_override", "")
+                result = fls.regen_lookbook_scene(jid, sid, override)
+                self.send_response(200 if result.get("ok") else 400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+                return
+
         content_type = self.headers.get("Content-Type", "")
         if "boundary=" not in content_type:
             self.send_response(400)
@@ -4062,9 +4648,14 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
                     tenant_id = t_val
             elif b'name="flow_mode"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
-                m_str = val.strip().decode(errors="ignore")
-                if m_str in ["pov", "unboxing", "demo", "ugc", "store_review", "tvc"]:
-                    flow_mode = "store_review" if m_str == "tvc" else m_str
+                m_str = val.strip().decode(errors="ignore").lower()
+                if m_str in ["pov", "unboxing", "demo", "ugc", "store_review", "tvc", "fashion", "fashion_lookbook", "lookbook", "tryon", "virtual_tryon"]:
+                    if m_str == "tvc":
+                        flow_mode = "store_review"
+                    elif m_str in ["fashion_lookbook", "lookbook", "tryon", "virtual_tryon"]:
+                        flow_mode = "fashion"
+                    else:
+                        flow_mode = m_str
             elif b'name="script_style"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 s_style = val.strip().decode(errors="ignore")
@@ -4091,21 +4682,17 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             elif b'name="video_engine"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 ve_str = val.strip().decode(errors="ignore").lower()
-                if "veo" in ve_str:
-                    video_engine = "veo"
-                elif "10" in ve_str or "v1" in ve_str:
-                    video_engine = "grok_10"
+                if "grok" in ve_str:
+                    video_engine = "grok_10" if ("10" in ve_str or "v1" in ve_str) else "grok_15"
                 else:
-                    video_engine = "grok_15"
+                    video_engine = "veo"
             elif b'name="video_model"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 vm_str = val.strip().decode(errors="ignore").lower()
-                if "veo" in vm_str:
-                    video_engine = "veo"
-                elif "10" in vm_str or "v1" in vm_str:
-                    video_engine = "grok_10"
+                if "grok" in vm_str:
+                    video_engine = "grok_10" if ("10" in vm_str or "v1" in vm_str) else "grok_15"
                 else:
-                    video_engine = "grok_15"
+                    video_engine = "veo"
             elif b'name="resolution"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 r_str = val.strip().decode(errors="ignore").lower()
@@ -4201,6 +4788,7 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             "num_scenes": num_scenes,
             "scene_duration": scene_duration,
             "voice": voice,
+            "voice_bible": VOICE_BIBLE.get(voice, VOICE_BIBLE["female_north"]),
             "bgm": bgm,
             "num_threads": num_threads,
             "step": 0,
@@ -4256,14 +4844,15 @@ HTML_UI = r"""<!DOCTYPE html>
         .btn-submit { width: 100%; padding: 16px; background: linear-gradient(135deg, #0284c7, #0369a1); color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 700; cursor: pointer; transition: 0.2s; box-shadow: 0 4px 15px rgba(2,132,199,0.4); }
         .btn-submit:hover { opacity: 0.95; transform: translateY(-1px); }
         
-        /* 5 Modes Tab Switcher */
-        .mode-container { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }
+        /* 6 Modes Tab Switcher */
+        .mode-container { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 20px; }
         .mode-tab { padding: 14px 8px; border-radius: 12px; border: 2px solid var(--border); background: #0f172a; color: #94a3b8; font-size: 13px; font-weight: 700; cursor: pointer; transition: 0.2s; text-align: center; }
         .mode-tab:hover { border-color: var(--accent); color: #fff; }
         .mode-tab.active { background: linear-gradient(135deg, #0284c7, #0369a1); color: #fff; border-color: #38bdf8; box-shadow: 0 4px 15px rgba(2,132,199,0.4); }
         .mode-tab.active-unboxing { background: linear-gradient(135deg, #15803d, #166534); color: #fff; border-color: #4ade80; box-shadow: 0 4px 15px rgba(34,197,94,0.4); }
         .mode-tab.active-ugc { background: linear-gradient(135deg, #7c3aed, #6d28d9); color: #fff; border-color: #c084fc; box-shadow: 0 4px 15px rgba(124,58,237,0.4); }
         .mode-tab.active-demo { background: linear-gradient(135deg, #d97706, #b45309); color: #fff; border-color: #fbbf24; box-shadow: 0 4px 15px rgba(217,119,6,0.4); }
+        .mode-tab.active-fashion { background: linear-gradient(135deg, #c026d3, #9333ea); color: #fff; border-color: #f0abfc; box-shadow: 0 4px 15px rgba(192,38,211,0.4); }
         @media (max-width: 990px) { .mode-container { grid-template-columns: repeat(3, 1fr); } }
         @media (max-width: 600px) { .mode-container { grid-template-columns: 1fr; } }
         
@@ -4390,6 +4979,10 @@ HTML_UI = r"""<!DOCTYPE html>
                 <div id="tabReview" class="mode-tab" onclick="setFlowMode('store_review')">
                     🏪 5. REVIEW CỬA HÀNG<br>
                     <small style="font-weight:normal;opacity:0.85;">1 SP + 1 Mẫu &bull; Showroom &bull; Uy tín</small>
+                </div>
+                <div id="tabFashion" class="mode-tab" onclick="setFlowMode('fashion')">
+                    👗 6. THỜI TRANG AI LOOKBOOK<br>
+                    <small style="font-weight:normal;opacity:0.85;">1 Trang phục (+ Mẫu) &bull; 15 Dáng Studio &bull; Try-On</small>
                 </div>
             </div>
 
@@ -5414,6 +6007,18 @@ HTML_UI = r"""<!DOCTYPE html>
                 modelLabel: '2. Ảnh Người Mẫu KOL (Bắt buộc)',
                 modelSubtext: 'Chân dung KOL / Chuyên gia mặc trang phục lịch sự',
                 bgSubtext: 'Bỏ trống: AI tự sinh showroom sang trọng, kệ trưng bày hiện đại'
+            },
+            fashion: {
+                tabClass: 'active-fashion',
+                noticeBg: '#3b0764',
+                noticeBorder: '#c026d3',
+                noticeColor: '#f5d0fe',
+                noticeHtml: '👗 <strong>Chế độ 6: Thời Trang AI (Fashion Lookbook & Virtual Try-On):</strong> Cần <strong>1 ảnh sản phẩm thời trang/quần áo</strong> (hoặc tải thêm ảnh người mẫu tùy chọn). Tự động kích hoạt 15 Studio Poses điện ảnh, giữ trọn form dáng, chất vải và chuyển động sàn catwalk high-fashion cực chuẩn. (Bỏ trống ảnh mẫu: Tự động dùng siêu mẫu chuẩn AI studio)!',
+                needModel: false,
+                optionalModel: true,
+                modelLabel: '2. Ảnh Người Mẫu (Tùy chọn - Tự động có mẫu mặc định)',
+                modelSubtext: 'Bỏ trống: Hệ thống dùng ảnh siêu mẫu chuẩn studio. Tải lên: Mẫu riêng của bạn',
+                bgSubtext: 'Bỏ trống: AI tự tạo studio lookbook tối giản cao cấp (Cyclorama trắng / sàn gỗ tối)'
             }
         };
 
@@ -5424,6 +6029,7 @@ HTML_UI = r"""<!DOCTYPE html>
             const tabDemo = document.getElementById('tabDemo');
             const tabUgc = document.getElementById('tabUgc');
             const tabReview = document.getElementById('tabReview');
+            const tabFashion = document.getElementById('tabFashion');
             const modelBox = document.getElementById('modelBox');
             const modelInput = document.getElementById('modelInput');
             const modelLabel = document.getElementById('modelLabel');
@@ -5432,12 +6038,13 @@ HTML_UI = r"""<!DOCTYPE html>
             const modeNotice = document.getElementById('modeNotice');
             const uploadGrid = document.getElementById('uploadGrid');
 
-            [tabPov, tabUnboxing, tabDemo, tabUgc, tabReview].forEach(t => {
+            [tabPov, tabUnboxing, tabDemo, tabUgc, tabReview, tabFashion].forEach(t => {
                 if (t) {
                     t.classList.remove('active');
                     t.classList.remove('active-unboxing');
                     t.classList.remove('active-demo');
                     t.classList.remove('active-ugc');
+                    t.classList.remove('active-fashion');
                 }
             });
 
@@ -5450,6 +6057,8 @@ HTML_UI = r"""<!DOCTYPE html>
                 tabDemo?.classList.add(cfg.tabClass);
             } else if (mode === 'ugc') {
                 tabUgc?.classList.add(cfg.tabClass);
+            } else if (mode === 'fashion') {
+                tabFashion?.classList.add(cfg.tabClass);
             } else {
                 tabReview?.classList.add(cfg.tabClass);
             }
@@ -5488,6 +6097,7 @@ HTML_UI = r"""<!DOCTYPE html>
             else if (mode === 'demo') modeName = '✨ Demo Công Dụng (Thao tác & Hiệu quả)';
             else if (mode === 'ugc') modeName = '📱 UGC Người Thật (1 SP + 1 Mẫu)';
             else if (mode === 'store_review') modeName = '🏪 Review Cửa Hàng (1 SP + 1 Mẫu)';
+            else if (mode === 'fashion') modeName = '👗 Thời Trang AI Lookbook & Try-On (1 Trang phục)';
 
             const v = document.getElementById('selVoice');
             const vText = v ? v.options[v.selectedIndex].text.split('(')[0].trim() : 'Nữ Miền Bắc';
@@ -5576,6 +6186,17 @@ HTML_UI = r"""<!DOCTYPE html>
                                 <div class="label" style="font-size:12px;font-weight:600;">Bối Cảnh AI</div>
                             </div>
                         `;
+                    } else if (data.flow_mode === 'fashion') {
+                        assetHtml += `
+                            <div class="asset-card">
+                                <img src="/job/${jid}/model" alt="Model" onerror="this.parentElement.style.display='none'">
+                                <div class="label" style="font-size:12px;font-weight:600;">Mẫu Lookbook</div>
+                            </div>
+                            <div class="asset-card">
+                                <img src="/job/${jid}/bg" alt="Background" onerror="this.parentElement.style.display='none'">
+                                <div class="label" style="font-size:12px;font-weight:600;">Bối Cảnh Studio</div>
+                            </div>
+                        `;
                     } else if (data.flow_mode === 'demo') {
                         assetHtml += `
                             <div class="asset-card">
@@ -5616,6 +6237,9 @@ HTML_UI = r"""<!DOCTYPE html>
                     } else if (data.flow_mode === 'store_review') {
                         modeBadge = '🏪 Review Cửa Hàng';
                         badgeBg = '#0369a1';
+                    } else if (data.flow_mode === 'fashion') {
+                        modeBadge = '👗 Thời Trang AI Lookbook';
+                        badgeBg = '#9333ea';
                     }
 
                     scriptHtml += `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;">
@@ -6400,13 +7024,10 @@ if __name__ == "__main__":
                     pass
     print(f"Loaded {len(JOBS)} past jobs from {WORK_DIR}")
     bis.load_all_batch_jobs()
+    fls.load_all_lookbook_jobs()
 
-    try:
-        import agent.services.proxy_checker as pc
-        pc.start_proxy_health_daemon(interval_seconds=180)
-        print("[PROXY DAEMON] 🛡️ Auto-Revival & Pre-flight Health Daemon started (Interval: 180s)")
-    except Exception as e_daemon:
-        print(f"[PROXY DAEMON] Failed to start daemon: {e_daemon}")
+    # Proxy Health Daemon is already managed by FlowKit API Service (port 8100).
+    # We do not start a duplicate daemon here to avoid doubling network probes on the proxy pool.
 
     server = HTTPServer(("0.0.0.0", 8089), AutoTvcHandler)
     print("Auto-TVC Studio running at http://0.0.0.0:8089")

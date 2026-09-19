@@ -49,15 +49,15 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 VIDEO_POLL_INTERVAL = int(os.environ.get("VIDEO_POLL_INTERVAL", "10"))  # polling interval for video/upscale status
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 VIDEO_POLL_TIMEOUT = int(os.environ.get("VIDEO_POLL_TIMEOUT", "420"))
-API_COOLDOWN = int(os.environ.get("API_COOLDOWN", "10"))  # seconds between API calls (anti-spam)
-MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "5"))  # Google Flow max parallel requests
+API_COOLDOWN = int(os.environ.get("API_COOLDOWN", "1"))  # seconds between API calls (anti-spam)
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "30"))  # Google Flow max parallel requests
 STALE_PROCESSING_TIMEOUT = int(os.environ.get("STALE_PROCESSING_TIMEOUT", "600"))  # 10 min
 
 # ─── Multi-nick gate ─────────────────────────────────────────
 # Nova (and everything else) still talks to one URL on :8100. Behind it, each
 # Chrome profile is one Flow nick + one sticky proxy + one Flow project.
 # Concurrent slots are per nick; credits are not multiplied.
-PROFILE_MAX_CONCURRENT = int(os.environ.get("PROFILE_MAX_CONCURRENT", "2"))
+PROFILE_MAX_CONCURRENT = int(os.environ.get("PROFILE_MAX_CONCURRENT", "10"))
 PROFILES_FILE = Path(os.environ.get("FLOW_PROFILES_FILE", Path(__file__).parent / "profiles.json"))
 # Live nick + proxy store. Secrets stay here, not in the committed profiles.json.
 ACCOUNTS_FILE = Path(os.environ.get("FLOW_ACCOUNTS_FILE", Path(__file__).parent / "accounts.json"))
