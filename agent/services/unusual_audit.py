@@ -85,6 +85,7 @@ class ProxyHealthRecord:
         self.successful_requests += 1
         self.consecutive_successes += 1
         self.consecutive_errors = 0
+        self.last_error_reason = None
         self.last_used_at = time.time()
 
     def record_error(self, reason: str = "PUBLIC_ERROR_UNUSUAL_ACTIVITY") -> None:
@@ -304,8 +305,8 @@ class UnusualAuditManager:
         # 4. Rotation Outcome Clue
         if rotation_result and rotation_result.get("retry_success"):
             reasons.append(
-                f"CONFIRMED_IP_REPUTATION: Đổi sang proxy mới ({rotation_result.get('new_proxy_ip')}) và retry THÀNH CÔNG ngay lập tức. "
-                "Xác nhận 100% nguyên nhân là do IP proxy cũ bị Google chặn."
+                "RECOVERY_SUCCEEDED_CAUSE_UNCONFIRMED: Retry thành công sau phục hồi. "
+                "Đổi proxy và làm mới phiên có thể cùng diễn ra; chưa tách được nguyên nhân IP, phiên hay token."
             )
         elif rotation_result and rotation_result.get("retry_attempted") and not rotation_result.get("retry_success"):
             reasons.append(
@@ -336,19 +337,21 @@ class UnusualAuditManager:
         call_duration_ms: int = 0,
         payload_summary: Optional[dict] = None,
         rotation_info: Optional[dict] = None,
+        proxy_url: Optional[str] = None,
     ) -> dict:
         """Constructs, logs, and persists a complete diagnostic audit record."""
         now = time.time()
         event_id = f"unusual_{int(now * 1000)}_{worker_id}"
 
         # Resolve active proxy for this worker
-        proxy_url = ""
-        try:
-            account = get_account(worker_id)
-            if account and account.get("proxy_url"):
-                proxy_url = account["proxy_url"]
-        except Exception:
-            pass
+        if proxy_url is None:
+            proxy_url = ""
+            try:
+                account = get_account(worker_id)
+                if account and account.get("proxy_url"):
+                    proxy_url = account["proxy_url"]
+            except Exception:
+                pass
 
         proxy_record: Optional[ProxyHealthRecord] = None
         if proxy_url:
@@ -391,6 +394,7 @@ class UnusualAuditManager:
                 "burst_in_last_30s": burst_metrics.get("burst_30s", 1),
                 "burst_in_last_60s": burst_metrics.get("burst_60s", 1),
                 "global_burst_10s": burst_metrics.get("global_burst_10s", 1),
+                "rpc_in_flight_at_dispatch": burst_metrics.get("rpc_in_flight"),
             },
             "payload_summary": payload_summary or {},
             "raw_error": str(raw_error)[:800],

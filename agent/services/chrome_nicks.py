@@ -347,11 +347,11 @@ async def restore_nick_bridge(nick_id: str) -> Optional[LocalProxyBridge]:
 
 
 async def restore_all_bridges() -> dict[str, int]:
-    """Ensure proxy bridges are actively listening for ALL enabled accounts on startup."""
+    """Ensure proxy bridges are actively listening for ALL accounts with proxy_url on startup."""
     from agent.services.accounts import load_accounts
     restored = {}
     for acc in load_accounts():
-        if acc.get("enabled", True) and acc.get("proxy_url"):
+        if acc.get("proxy_url"):
             try:
                 bridge = await restore_nick_bridge(acc["id"])
                 if bridge and bridge.port:
@@ -440,8 +440,8 @@ async def launch_nick(nick_id: str) -> dict:
     local_bridge = False
     if not account.get("proxy_url"):
         try:
-            from agent.services.proxy_pool import get_next_proxy_for_nick
-            auto_proxy = get_next_proxy_for_nick(nick_id)
+            from agent.services.proxy_pool import get_verified_proxy_for_nick
+            auto_proxy = await asyncio.to_thread(get_verified_proxy_for_nick, nick_id)
             if auto_proxy:
                 account["proxy_url"] = auto_proxy
                 from agent.services.accounts import upsert_account

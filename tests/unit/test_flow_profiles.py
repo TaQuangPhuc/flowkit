@@ -1,6 +1,7 @@
 """Multi-nick gate: least-busy routing, project pin, per-nick r2v session."""
 import json
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -46,14 +47,22 @@ def attach(client, profile_id, project_id, *, in_flight=0, recency=None, chat=No
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, tmp_path):
     import agent.services.flow_client as module
     monkeypatch.setattr(module, "USE_BATCH_RPC", True)
     monkeypatch.setattr(module, "FLOW_PROJECT_ID", PA)
     monkeypatch.setattr(module, "FLOW_ALLOW_DEGRADED", False)
 
+    # Routing drops nicks whose account row is disabled. These tests are about
+    # pin/least-busy order only, so keep them off the real agent/accounts.json.
+    acc_path = tmp_path / "fixture-accounts.json"
+    acc_path.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr("agent.services.accounts.ACCOUNTS_FILE", acc_path)
+
     c = FlowClient()
-    c.responses = {}
+    # Handshake tests exercise routing/session binding, not background DB tier sync.
+    c._sync_tier = AsyncMock()
+    c.responses = {fb.RPC_PROJECT_SETTINGS: {"data": envelope(fb.RPC_PROJECT_SETTINGS, [])}}
     c.calls = []
 
     async def fake_batch_rpc(rpcid, freq, captcha_action=None, match=None,
@@ -115,6 +124,33 @@ class TestSelectProfile:
 
 
 class TestRunOnProfile:
+    @pytest.mark.parametrize("message", ["Extension disconnected", "YhhmEf: Failed to fetch", "eb1hJf failed: [13]"])
+    async def test_ambiguous_video_submit_does_not_move_to_another_nick(self, client, message):
+        attach(client, "nick-a", PA, recency=20)
+        attach(client, "nick-b", PB, recency=10)
+        client.responses[fb.RPC_GEN_T2V] = {"error": message}
+        result = await client.generate_video(None, "go", "0", "scene-1")
+        assert result["retryable"] is False
+        assert result["error_code"] == "upstream_submission_unknown"
+        assert len(client.calls) == 1
+
+    async def test_mixed_reference_owners_fail_before_google_submission(self, client):
+        attach(client, "nick-a", PA)
+        attach(client, "nick-b", PB)
+        client._media_profiles.update({MEDIA: "nick-a", OPERATION: "nick-b"})
+        result = await client.generate_video_from_references([MEDIA, OPERATION], "go", "0", "scene-1")
+        assert result["error_code"] == "media_profile_mismatch"
+        assert result["retryable"] is False
+        assert not client.calls
+
+    async def test_explicit_profile_cannot_use_another_nicks_image(self, client):
+        attach(client, "nick-a", PA)
+        attach(client, "nick-b", PB)
+        client._media_profiles[MEDIA] = "nick-a"
+        result = await client.generate_video(MEDIA, "go", "0", "scene-1", profile_id="nick-b")
+        assert result["error_code"] == "media_profile_mismatch"
+        assert not client.calls
+
     async def test_unpinned_rewrites_to_the_nicks_project(self, client):
         attach(client, "nick-a", PA, in_flight=2)
         attach(client, "nick-b", PB, in_flight=0)
@@ -143,6 +179,44 @@ class TestRunOnProfile:
         assert not result.get("error")
         assert client._last_route["profile_id"] == "nick-b"
         assert t2v_project(client.calls[-1]["freq"]) == PB
+
+    async def test_unpinned_failsover_on_401_and_no_envelope(self, client):
+        attach(client, "nick-a", PA, recency=20)
+        attach(client, "nick-b", PB, recency=10)
+        client.responses[fb.RPC_GEN_T2V] = _t2v_ok()
+
+        original = client.batch_rpc
+
+        async def fail_401(rpcid, freq, captcha_action=None, match=None,
+                           timeout=300, path=None):
+            if t2v_project(freq) == PA:
+                client.calls.append({"rpcid": rpcid, "freq": freq})
+                return {"error": "FlowBatchError: no YhhmEf envelope in response (0 others)", "status": 401}
+            return await original(rpcid, freq, captcha_action, match, timeout, path)
+
+        client.batch_rpc = fail_401
+        result = await client.generate_video(None, "go", "0", "scene-1")
+        assert not result.get("error")
+        assert client._last_route["profile_id"] == "nick-b"
+        assert t2v_project(client.calls[-1]["freq"]) == PB
+
+    async def test_disabled_account_excluded_from_candidates(self, client, monkeypatch):
+        attach(client, "nick-a", PA, recency=20)
+        attach(client, "nick-b", PB, recency=10)
+
+        # Mock get_account so nick-a is disabled
+        from agent.services import accounts
+        orig_get_acc = accounts.get_account
+        def mock_get_account(sid):
+            if sid == "nick-a":
+                return {"id": "nick-a", "enabled": False}
+            return {"id": "nick-b", "enabled": True}
+        monkeypatch.setattr(accounts, "get_account", mock_get_account)
+
+        _pin, candidates = client._profile_candidates()
+        prof_ids = [c["profile_id"] for c in candidates]
+        assert "nick-a" not in prof_ids
+        assert "nick-b" in prof_ids
 
     async def test_pinned_project_does_not_failover(self, client):
         attach(client, "nick-a", PA, recency=20)
@@ -331,3 +405,101 @@ class TestLoadProfiles:
 
     def test_missing_file_is_empty(self, tmp_path):
         assert load_flow_profiles(tmp_path / "nope.json") == []
+
+
+class TestFairLoadBalancing:
+    def test_least_dispatched_wins_among_idle_workers(self, client):
+        ws_a = attach(client, "nick-a", PA, recency=100)
+        ws_b = attach(client, "nick-b", PB, recency=50)
+        # Manually give nick-a higher dispatched_count
+        client._extensions[ws_a]["dispatched_count"] = 10
+        client._extensions[ws_b]["dispatched_count"] = 2
+        route = client._select_profile()
+        assert route["profile_id"] == "nick-b"
+
+
+class TestOperationPolling:
+    @pytest.mark.asyncio
+    async def test_poll_normalizes_operation_prefix_and_times_out(self, client):
+        op_uuid = "1d82709e-d4a9-4302-97cc-e785bee4439a"
+        raw_op_name = f"operations/{op_uuid}"
+        client._remember_operation(op_uuid, PA)
+        assert client._operation_projects.get(raw_op_name) == PA
+        assert client._operation_projects.get(op_uuid) == PA
+
+        # Timeout uses elapsed time, regardless of client polling frequency.
+        from agent.config import VIDEO_POLL_TIMEOUT
+        client._operation_start_time[op_uuid] = time.time() - VIDEO_POLL_TIMEOUT - 1
+        res = await client._poll_batch_operation(raw_op_name)
+        assert res["status"] == "MEDIA_GENERATION_STATUS_FAILED"
+        assert res["operation"]["name"] == raw_op_name
+        assert "upstream_timeout" in res["error"]
+
+
+async def test_anchored_upload_uses_existing_owner_and_cannot_fail_over(client):
+    from unittest.mock import AsyncMock
+    client._media_profiles[MEDIA] = "nick-b"
+    client._run_on_profile = AsyncMock(return_value={"status": 200})
+    await client.upload_image("fixture", reference_media_id=MEDIA)
+    kwargs = client._run_on_profile.call_args.kwargs
+    assert kwargs["profile_id"] == "nick-b"
+    assert kwargs["allow_failover"] is False
+    client._run_on_profile.reset_mock()
+    result = await client.upload_image("fixture", reference_media_id=MEDIA, profile_id="nick-a")
+    assert result["status"] == 400
+    client._run_on_profile.assert_not_called()
+
+
+async def test_unknown_upload_anchor_fails_before_upload(client):
+    from unittest.mock import AsyncMock
+    client._run_on_profile = AsyncMock()
+    result = await client.upload_image("fixture", reference_media_id=MEDIA)
+    assert result["status"] == 400
+    client._run_on_profile.assert_not_called()
+
+
+async def test_per_worker_video_pacing_and_cooldown(client, monkeypatch):
+    import asyncio
+    import time
+    from agent import config as _cfg
+    monkeypatch.setattr(_cfg, "PER_WORKER_VIDEO_COOLDOWN_MIN", 0.10)
+    monkeypatch.setattr(_cfg, "PER_WORKER_VIDEO_COOLDOWN_MAX", 0.15)
+
+    ws1 = object()
+    ws2 = object()
+    client.set_extension(ws1)
+    client.set_extension(ws2)
+    client._extensions[ws1]["profile_id"] = "worker-1"
+    client._extensions[ws1]["project_id"] = PA
+    client._extensions[ws1]["token_captured_at"] = time.time()
+    client._extensions[ws2]["profile_id"] = "worker-2"
+    client._extensions[ws2]["project_id"] = PB
+    client._extensions[ws2]["token_captured_at"] = time.time()
+
+    timestamps = []
+
+    async def fake_builder(_pid):
+        timestamps.append(time.monotonic())
+        return {"status": 200, "operation": {"name": "op_test"}}
+
+    # Dispatches on the same worker should be spaced by at least 0.10s
+    t0 = time.monotonic()
+    await client._run_on_profile(fake_builder, PA, profile_id="worker-1", video_submission=True)
+    await client._run_on_profile(fake_builder, PA, profile_id="worker-1", video_submission=True)
+    t1 = time.monotonic()
+
+    assert len(timestamps) == 2
+    gap = timestamps[1] - timestamps[0]
+    assert gap >= 0.09, f"Expected gap >= 0.09s, got {gap:.3f}s"
+
+    # Dispatches on different workers should NOT block each other
+    timestamps.clear()
+    t_start = time.monotonic()
+    await asyncio.gather(
+        client._run_on_profile(fake_builder, PA, profile_id="worker-1", video_submission=True),
+        client._run_on_profile(fake_builder, PB, profile_id="worker-2", video_submission=True),
+    )
+    t_end = time.monotonic()
+    # Since worker-1 and worker-2 are distinct, they should run nearly simultaneously
+    assert (t_end - t_start) < 0.25
+

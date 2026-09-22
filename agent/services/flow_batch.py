@@ -255,28 +255,15 @@ def resolve_image_model(key: Optional[str]) -> str:
 
 
 def resolve_video_model(key: Optional[str]) -> str:
-    """Map a REST-era model key onto one the batch path accepts.
-
-    The old keys encoded tier, quality, aspect and chaining in the name
-    (``veo_3_1_i2v_s_fast_ultra_relaxed``, ``…_portrait``, ``…_fl``). Aspect
-    and chaining are their own slots now and the suffixed names are rejected,
-    so the tier/quality intent is all that survives: anything that asked for
-    "ultra" gets the ultra model, anything else lands on the lite default.
-    """
-    if isinstance(key, str):
-        if key in VIDEO_MODELS:
-            return key
-        # t2v is a different RPC and a different model family; do not fold
-        # a t2v key onto an i2v wire name.
-        if "t2v" in key:
-            return VIDEO_T2V_MODEL
-        if "ultra" in key:
-            return "veo_3_1_i2v_s_fast_ultra"
-        if "lite_low_priority" in key:
-            return "veo_3_1_i2v_lite_low_priority"
-        if "lite" in key:
-            return "veo_3_1_i2v_lite"
+    """Old tier settings cannot opt these accounts into credit models."""
+    if isinstance(key, str) and "t2v" in key:
+        return VIDEO_T2V_MODEL
     return VIDEO_MODEL
+
+
+def require_low_priority_model(model: str, expected: str) -> None:
+    if model != expected:
+        raise ValueError("LOW_PRIORITY_ONLY: paid video models are disabled")
 
 
 def resolve_aspect(aspect: Any) -> int:
@@ -476,6 +463,7 @@ def video_request(prompt: str, project_id: str, source_media_id: str,
                   crop: Optional[list] = None,
                   aspect: Any = VIDEO_ASPECT_LANDSCAPE,
                   model: str = VIDEO_MODEL) -> str:
+    require_low_priority_model(model, VIDEO_MODEL)
     inner = [
         [[[None, None, [[[prompt]]]], model, resolve_video_aspect(aspect), None,
           [None, source_media_id, None, None, None,
@@ -500,6 +488,7 @@ def t2v_request(prompt: str, project_id: str,
     """
     ratio = resolve_video_aspect(aspect)
     variants = []
+    require_low_priority_model(model, VIDEO_T2V_MODEL)
     for _ in range(max(1, count)):
         variants.append([
             [None, None, [[[prompt]]]],
@@ -573,6 +562,7 @@ def set_video_defaults_request(project_id: str,
     [["default_generation_settings.video_defaults"]]]``. StreamChat itself has
     no model slot; this setting is how low-priority r2v stays free.
     """
+    require_low_priority_model(model, VIDEO_R2V_MODEL)
     ratio = resolve_video_aspect(aspect)
     return build_envelope(RPC_PROJECT_SETTINGS, [
         f"projects/{project_id}",
@@ -931,6 +921,26 @@ def read_operations(payload: Any) -> list[Operation]:
     if not operations:
         raise FlowBatchError("operation payload carried no record")
     return operations
+
+
+def submitted_video_media(payload: Any, operation_id: str, project_id: str) -> Optional[str]:
+    """Bind only a submit ack containing mutually matching workflow and CAE rows."""
+    if not isinstance(payload, list) or len(payload) < 4:
+        return None
+    workflows, media = payload[2], payload[3]
+    if not isinstance(workflows, list) or not isinstance(media, list):
+        return None
+    for row in workflows:
+        if not isinstance(row, list) or len(row) < 5 or row[0] != operation_id or row[4] != project_id:
+            continue
+        detail = row[3]
+        if not isinstance(detail, list) or len(detail) < 5 or not _valid_uuid(detail[4]):
+            continue
+        mid = detail[4]
+        if any(isinstance(m, list) and len(m) >= 4 and
+               m[:4] == [mid, project_id, operation_id, "CAE"] for m in media):
+            return mid
+    return None
 
 
 def read_operation(payload: Any) -> Operation:

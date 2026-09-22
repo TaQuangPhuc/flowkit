@@ -10,6 +10,8 @@ const source = fs.readFileSync(
 
 const lifecycleListeners = { alarm: [], installed: [], startup: [] };
 const sockets = [];
+const networkListeners = { before: [], error: [] };
+const networkPosts = [];
 let storageReads = 0;
 
 class FakeWebSocket {
@@ -68,20 +70,26 @@ const chrome = {
   },
   webRequest: {
     onBeforeSendHeaders: event(),
-    onBeforeRequest: event(),
+    onBeforeRequest: event(networkListeners.before),
     onCompleted: event(),
-    onErrorOccurred: event(),
+    onErrorOccurred: event(networkListeners.error),
   },
 };
 
 const context = vm.createContext({
+  importScripts(file) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'extension', file), 'utf8'), context);
+  },
   URL,
   WebSocket: FakeWebSocket,
   chrome,
   clearInterval() {},
   clearTimeout() {},
   console,
-  fetch: async () => ({ ok: true }),
+  fetch: async (url, options) => {
+    if (url.endsWith('/api/ext/netlog')) networkPosts.push(JSON.parse(options.body));
+    return { ok: true };
+  },
   navigator: { userAgent: 'FlowkitBootstrapTest/1.0' },
   setInterval() { return 1; },
   setTimeout() { return 1; },
@@ -113,6 +121,24 @@ setImmediate(async () => {
     type: 'token_captured',
     flowKey: 'persisted-flow-key',
   });
+
+  const request = { requestId: '123.4', method: 'POST', timeStamp: 1000,
+    url: 'https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=ogiZ0b&at=secret#private',
+    requestBody: { formData: { 'f.req': ['private-prompt'] } } };
+  networkListeners.before[0](request);
+  networkListeners.error[0]({ ...request, timeStamp: 1250, error: 'net::ERR_CONNECTION_RESET' });
+  const failure = networkPosts.at(-1);
+  assert.equal(failure.networkError, 'net::ERR_CONNECTION_RESET');
+  assert.equal(failure.requestId, '123.4');
+  assert.equal(failure.rpcid, 'ogiZ0b');
+  assert.equal(failure.elapsedMs, 250);
+  assert.equal(failure.url, 'https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute');
+  assert.equal(JSON.stringify(failure).includes('secret'), false);
+  assert.equal(JSON.stringify(failure).includes('private'), false);
+  assert.equal('freq' in failure, false);
+  networkListeners.error[0]({ ...request, requestId: 'lost', timeStamp: 1400, error: 'sensitive arbitrary error' });
+  assert.equal(networkPosts.at(-1).networkError, 'UNKNOWN_NETWORK_ERROR');
+  assert.equal(networkPosts.at(-1).elapsedMs, null);
 
   console.log('Flowkit MV3 cold-start bootstrap regression test passed');
 });

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from agent.services.proxy_url import resolve_known_proxy
+from agent.services.surfshark import is_surfshark_url, monitored_proxy_urls
 
 logger = logging.getLogger(__name__)
 
@@ -190,20 +191,32 @@ QUARANTINE_FILE = Path(__file__).resolve().parent.parent / "proxy_quarantine.jso
 _PROXY_LIFECYCLE: dict[str, dict] = {}
 _LIFECYCLE_LOCK = threading.Lock()
 _DAEMON_THREAD: Optional[threading.Thread] = None
+_last_quarantine_mtime: float = 0.0
+_cached_quarantine_disk: dict = {}
 
 
 def load_quarantine_state() -> dict:
+    global _last_quarantine_mtime, _cached_quarantine_disk
     if not QUARANTINE_FILE.exists():
         return {}
     try:
-        return json.loads(QUARANTINE_FILE.read_text(encoding="utf-8"))
+        mtime = QUARANTINE_FILE.stat().st_mtime
+        if mtime == _last_quarantine_mtime and _cached_quarantine_disk:
+            return _cached_quarantine_disk
+        data = json.loads(QUARANTINE_FILE.read_text(encoding="utf-8"))
+        _last_quarantine_mtime = mtime
+        _cached_quarantine_disk = data
+        return data
     except Exception:
-        return {}
+        return _cached_quarantine_disk or {}
 
 
 def save_quarantine_state(state: dict) -> None:
+    global _last_quarantine_mtime, _cached_quarantine_disk
     try:
         QUARANTINE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        _last_quarantine_mtime = QUARANTINE_FILE.stat().st_mtime
+        _cached_quarantine_disk = dict(state)
     except Exception as e:
         logger.warning("Failed to save quarantine state: %s", e)
 
@@ -229,6 +242,7 @@ def quarantine_proxy(proxy_url: str, reason: str = "PUBLIC_ERROR_UNUSUAL_ACTIVIT
 
 def is_quarantined(proxy_url: str) -> bool:
     clean_p = proxy_url.strip()
+    now = time.time()
     with _LIFECYCLE_LOCK:
         disk_state = load_quarantine_state()
         if disk_state:
@@ -237,7 +251,9 @@ def is_quarantined(proxy_url: str) -> bool:
         if not item:
             return False
         if item.get("status") == "QUARANTINED":
-            return True
+            if now < item.get("release_after", 0):
+                return True
+            return False
     return False
 
 
@@ -266,36 +282,79 @@ def get_lifecycle_summary() -> dict:
         }
 
 
-def run_revival_cycle() -> dict:
-    """Check all quarantined proxies whose cooldown expired and restore clean ones."""
+def run_revival_cycle(probe_interval: int = 300) -> dict:
+    """Check quarantined proxies every probe_interval seconds (default 5m) against Google Labs and restore clean ones."""
     now = time.time()
     restored = []
     still_blocked = []
+    from agent.services.accounts import load_accounts
+    active = {a.get("proxy_url") for a in load_accounts() if a.get("proxy_url")}
+    from agent.services.proxy_pool import load_proxy_pool
+    pool_proxies = set(load_proxy_pool().get("proxies") or [])
+    relevant = active | pool_proxies
 
     with _LIFECYCLE_LOCK:
-        targets = [
-            (p, dict(data))
-            for p, data in _PROXY_LIFECYCLE.items()
-            if data.get("status") == "QUARANTINED" and now >= data.get("release_after", 0)
-        ]
+        disk_state = load_quarantine_state()
+        if disk_state:
+            _PROXY_LIFECYCLE.update(disk_state)
+        # Purge dead/stale proxies that are no longer configured anywhere
+        for stale in list(_PROXY_LIFECYCLE.keys()):
+            if stale not in relevant:
+                _PROXY_LIFECYCLE.pop(stale, None)
+        save_quarantine_state(_PROXY_LIFECYCLE)
+
+        targets = []
+        for p, data in _PROXY_LIFECYCLE.items():
+            if data.get("status") == "QUARANTINED":
+                last_probe = data.get("last_probe_at", data.get("quarantined_at", 0))
+                # Probe every 5m or when cooldown expired
+                if (now - last_probe >= probe_interval) or (now >= data.get("release_after", 0)):
+                    targets.append((p, dict(data)))
 
     for p, meta in targets:
         masked = p.split("@")[-1] if "@" in p else p
-        logger.info("⏳ [REVIVAL PROBE] Checking if Google unblocked proxy %s...", masked)
+        logger.info("⏳ [REVIVAL PROBE] Probing quarantined proxy %s against Google Labs...", masked)
         probe = check_single_proxy(p, timeout=5)
         with _LIFECYCLE_LOCK:
+            _PROXY_LIFECYCLE[p]["last_probe_at"] = now
             if probe.get("status") == "CLEAN":
-                # Google lifted the block! Restore to healthy
+                # Google lifted the block! Restore to healthy and return to pool with 0 extra proxy cost
                 _PROXY_LIFECYCLE[p]["status"] = "RESTORED"
-                _PROXY_LIFECYCLE[p]["restored_at"] = time.time()
+                _PROXY_LIFECYCLE[p]["restored_at"] = now
                 restored.append({"masked": masked, "latency_ms": probe.get("latency_ms")})
-                logger.info("🎉 [REVIVAL SUCCESS] Google has unblocked proxy %s! Restored to pool.", masked)
+                logger.info("🎉 [REVIVAL SUCCESS] Google has unblocked proxy %s! Restoring to pool.", masked)
+
+                # Reset failure counts
+                _CONSECUTIVE_FAILURES[p] = 0
+
+                # Return to proxy pool
+                try:
+                    from agent.services.proxy_pool import add_proxies_to_pool
+                    add_proxies_to_pool([p])
+                except Exception as pool_err:
+                    logger.warning("Could not re-add restored proxy %s to pool: %s", masked, pool_err)
+
+                # Log incident resolution
+                try:
+                    from agent.services.incident_manager import get_incident_manager
+                    get_incident_manager().record_incident(
+                        module="proxy",
+                        sub_id=masked,
+                        severity="HEALED",
+                        error_code="PROXY_LEAKY_BUCKET_CLEARED",
+                        message=f"Proxy {masked} restored after Google cooldown. Returned to pool with 0 extra proxy cost.",
+                        action_taken="RESTORED_TO_POOL",
+                        status="RESOLVED",
+                    )
+                except Exception:
+                    pass
             else:
-                # Still blocked, extend cooldown by 10 minutes
-                _PROXY_LIFECYCLE[p]["release_after"] = time.time() + 600
+                # Still blocked, extend cooldown by 10 minutes if passed release_after
+                if now >= meta.get("release_after", 0):
+                    _PROXY_LIFECYCLE[p]["release_after"] = now + 600
                 _PROXY_LIFECYCLE[p]["recheck_attempts"] = _PROXY_LIFECYCLE[p].get("recheck_attempts", 0) + 1
                 still_blocked.append({"masked": masked, "status": probe.get("status"), "error": probe.get("error")})
-                logger.warning("❌ [STILL BLOCKED] Proxy %s is still blocked by Google: %s. Cooldown extended 10m.", masked, probe.get("status"))
+                logger.warning("❌ [STILL BLOCKED] Proxy %s is still blocked by Google: %s. Recheck attempts: %d.", masked, probe.get("status"), _PROXY_LIFECYCLE[p]["recheck_attempts"])
 
         save_quarantine_state(_PROXY_LIFECYCLE)
 
@@ -315,7 +374,7 @@ def check_temporary_proxies_expiration() -> bool:
 # ─── Global Health Registry & Monitoring Task ────────────────────────────────
 
 _PROXY_HEALTH_REGISTRY: dict[str, dict] = {}
-_HEALTH_LOCK = threading.Lock()
+_HEALTH_LOCK = threading.RLock()
 _LAST_CHECK_TIME: float = 0.0
 _IS_CHECKING: bool = False
 _MONITOR_INTERVAL_S: int = 180
@@ -338,15 +397,7 @@ def check_all_proxies_health(timeout: int = 5, reveal: bool = False) -> dict:
         pool_proxies = pool.get("proxies") or []
         accounts = load_accounts()
 
-        all_proxies: set[str] = set()
-        for p in pool_proxies:
-            clean = p.strip()
-            if clean:
-                all_proxies.add(clean)
-        for acc in accounts:
-            p = (acc.get("proxy_url") or "").strip()
-            if p:
-                all_proxies.add(p)
+        all_proxies = monitored_proxy_urls(pool_proxies, accounts)
 
         if not all_proxies:
             with _HEALTH_LOCK:
@@ -449,11 +500,7 @@ def get_proxy_health_report(reveal: bool = False) -> dict:
         from agent.services.proxy_pool import load_proxy_pool
         pool_proxies = load_proxy_pool().get("proxies") or []
         accounts = load_accounts()
-        known = set(pool_proxies) | {
-            (acc.get("proxy_url") or "").strip()
-            for acc in accounts
-            if (acc.get("proxy_url") or "").strip()
-        }
+        known = monitored_proxy_urls(pool_proxies, accounts)
         for p in known:
             clean = p.strip()
             if not clean:
@@ -574,6 +621,4 @@ def stop_proxy_health_daemon() -> None:
     if _DAEMON_THREAD and _DAEMON_THREAD.is_alive():
         _DAEMON_THREAD.join(timeout=2)
     _DAEMON_THREAD = None
-
-
 

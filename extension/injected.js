@@ -12,6 +12,8 @@
  * so we stash that session on the window for the extension's batch runner.
  */
 const SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
+const FLOW_DOCUMENT_ID = crypto.randomUUID();
+const flowBatchRequests = new Map();
 
 function _bodyToText(body) {
   if (body == null) return null;
@@ -96,7 +98,7 @@ XMLHttpRequest.prototype.send = function (body) {
   return _xhrSend.call(this, body);
 };
 
-window.__flowRunBatch = async function (rpcid, freqStr, maxText, match, customPath) {
+window.__flowRunBatch = async function (rpcid, freqStr, maxText, match, customPath, timeoutMs = 120000) {
   try {
     const wiz = window.WIZ_global_data || {};
     const at = wiz.SNlM0e;
@@ -117,8 +119,7 @@ window.__flowRunBatch = async function (rpcid, freqStr, maxText, match, customPa
         return null;
       };
       const found = window.__FLOW_CHAT_SESSION__
-        || fromBag(localStorage, true) || fromBag(sessionStorage, true)
-        || fromBag(localStorage, false) || fromBag(sessionStorage, false);
+        || fromBag(localStorage, true) || fromBag(sessionStorage, true);
       if (!found) return { error: 'NO_CHAT_SESSION' };
       freqStr = freqStr.split('__CHAT_SESSION__').join(found);
     }
@@ -145,6 +146,8 @@ window.__flowRunBatch = async function (rpcid, freqStr, maxText, match, customPa
         xhr.setRequestHeader('x-same-domain', '1');
         xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText || '' });
         xhr.onerror = () => reject(new Error('XHR_FAILED'));
+        xhr.timeout = timeoutMs;
+        xhr.ontimeout = () => reject(new Error('SUBMISSION_OUTCOME_UNKNOWN: XHR_TIMEOUT'));
         xhr.send(body);
       });
       status = xhrResult.status;
@@ -158,6 +161,7 @@ window.__flowRunBatch = async function (rpcid, freqStr, maxText, match, customPa
           'x-same-domain': '1',
         },
         body,
+        signal: AbortSignal.timeout(timeoutMs),
       });
       status = resp.status;
       text = await resp.text();
@@ -177,13 +181,43 @@ window.__flowRunBatch = async function (rpcid, freqStr, maxText, match, customPa
   }
 };
 
+window.__flowExecuteBatchOnce = function (request) {
+  if (request.documentId && request.documentId !== FLOW_DOCUMENT_ID) {
+    return Promise.resolve({ error: 'FLOW_DOCUMENT_CHANGED_NOT_SUBMITTED' });
+  }
+  if (Date.now() >= (request.expiresAt || Infinity)) {
+    return Promise.resolve({ error: 'FLOW_DEADLINE_NOT_SUBMITTED' });
+  }
+  const run = () => window.__flowRunBatch(request.rpcid, request.freq,
+    request.maxText, request.match, request.path,
+    Math.max(1, Math.min(120000, (request.expiresAt || (Date.now() + 60000)) - Date.now())));
+  // Read-only lookups need no replay cache (some listings exceed 17 MB).
+  if (!request.documentId) return run();
+  const prior = flowBatchRequests.get(request.requestId);
+  if (prior) return prior.promise;
+  for (const [id, entry] of flowBatchRequests) {
+    if (entry.finishedAt && Date.now() - entry.finishedAt > 300000) flowBatchRequests.delete(id);
+  }
+  if (flowBatchRequests.size >= 256) return Promise.resolve({ error: 'FLOW_BUSY_NOT_SUBMITTED' });
+  const entry = { promise: null, finishedAt: 0 };
+  entry.promise = Promise.resolve().then(run);
+  flowBatchRequests.set(request.requestId, entry);
+  entry.promise.then((result) => {
+    entry.finishedAt = Date.now();
+    if ((result?.text || '').length > 65536) {
+      entry.promise = Promise.resolve({ error: 'DUPLICATE_REQUEST_ALREADY_SUBMITTED' });
+    }
+  }, () => { entry.finishedAt = Date.now(); });
+  return entry.promise;
+};
+
 window.addEventListener('message', async (event) => {
   if (event.source !== window) return;
   const data = event.data;
-  if (!data || data.type !== 'FLOW_BATCH_RPC') return;
-  const result = await window.__flowRunBatch(
-    data.rpcid, data.freq, data.maxText, data.match, data.path,
-  );
+  if (!data || !['FLOW_BATCH_RPC', 'FLOW_PAGE_STATUS'].includes(data.type)) return;
+  const result = data.type === 'FLOW_PAGE_STATUS'
+    ? { ready: !!window.WIZ_global_data?.SNlM0e, documentId: FLOW_DOCUMENT_ID }
+    : await window.__flowExecuteBatchOnce(data);
   window.postMessage({
     type: 'FLOW_BATCH_RPC_RESULT',
     requestId: data.requestId,
@@ -199,7 +233,7 @@ window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
       action: pageAction,
     });
     window.dispatchEvent(new CustomEvent('CAPTCHA_RESULT', {
-      detail: { requestId, token },
+      detail: { requestId, token, documentId: FLOW_DOCUMENT_ID },
     }));
   } catch (e) {
     window.dispatchEvent(new CustomEvent('CAPTCHA_RESULT', {

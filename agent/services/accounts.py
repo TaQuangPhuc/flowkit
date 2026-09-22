@@ -4,13 +4,27 @@ from __future__ import annotations
 import json
 import logging
 import re
+import os
+import tempfile
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
 
 from agent.config import ACCOUNTS_FILE, PROFILES_FILE, load_flow_profiles
 from agent.services.proxy_url import ProxyURLError, parse_proxy_url, redact_proxy_url
+from agent.services.surfshark import bind_nick_proxy
 
 logger = logging.getLogger(__name__)
+_ACCOUNTS_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    @wraps(fn)
+    def call(*args, **kwargs):
+        with _ACCOUNTS_LOCK:
+            return fn(*args, **kwargs)
+    return call
 
 _ID_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9._@+-]{0,127}$")
 _UUID_RE = re.compile(
@@ -36,6 +50,7 @@ def _normalize(row: dict, *, require_id: bool = True) -> dict:
     proxy = str(row.get("proxy_url") or "").strip()
     if proxy:
         parse_proxy_url(proxy)
+        proxy = bind_nick_proxy(proxy, nick_id)
     return {
         "id": nick_id,
         "label": str(row.get("label") or nick_id).strip() or nick_id,
@@ -46,6 +61,7 @@ def _normalize(row: dict, *, require_id: bool = True) -> dict:
     }
 
 
+@_locked
 def load_accounts(path: Path | None = None) -> list[dict]:
     target = _path(path)
     if not target.exists():
@@ -69,6 +85,7 @@ def load_accounts(path: Path | None = None) -> list[dict]:
     return out
 
 
+@_locked
 def save_accounts(rows: list[dict], path: Path | None = None) -> list[dict]:
     normalized = []
     seen = set()
@@ -81,10 +98,21 @@ def save_accounts(rows: list[dict], path: Path | None = None) -> list[dict]:
     target = _path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"accounts": normalized}
-    target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as tmp:
+            temp_path = tmp.name
+            tmp.write(json.dumps(payload, indent=2) + "\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(temp_path, target)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
     return normalized
 
 
+@_locked
 def upsert_account(row: dict, path: Path | None = None, old_id: str | None = None) -> dict:
     rows = load_accounts(path)
     nick_id = str(row.get("id") or "").strip()
@@ -130,8 +158,8 @@ def upsert_account(row: dict, path: Path | None = None, old_id: str | None = Non
             row["proxy_url"] = existing_acc["proxy_url"]
         else:
             try:
-                from agent.services.proxy_pool import get_next_proxy_for_nick
-                auto_proxy = get_next_proxy_for_nick(nick_id)
+                from agent.services.proxy_pool import get_verified_proxy_for_nick
+                auto_proxy = get_verified_proxy_for_nick(nick_id)
                 if auto_proxy:
                     row["proxy_url"] = auto_proxy
                     logger.info("Auto-assigned proxy from pool for nick %s: %s", nick_id, auto_proxy)
@@ -259,8 +287,27 @@ def public_account(row: dict, *, reveal: bool = False) -> dict:
 _PORTED = ("image", "upload", "t2v", "i2v")
 
 
+def _disabled_reason(row: dict) -> str | None:
+    """Why an enabled=False nick is off: auth expiry vs a manual toggle."""
+    if row.get("enabled", True):
+        return None
+    try:
+        from agent.services.incident_manager import get_incident_manager
+        for inc in get_incident_manager().get_incidents(module="worker", status="OPEN"):
+            if inc.get("job_id") == row.get("id") and inc.get("error_code") in (
+                "ACCOUNT_AUTH_EXPIRED", "ACCOUNT_SESSION_FLAGGED",
+            ):
+                return "need_relogin"
+    except Exception:
+        pass
+    return "disabled"
+
+
 def nick_next_action(row: dict) -> str | None:
     """First setup step still owed on this nick, or None when r2v is ready too."""
+    blocked = _disabled_reason(row)
+    if blocked:
+        return blocked
     if not row.get("chrome_running"):
         return "need_chrome"
     if not row.get("has_proxy"):
@@ -278,6 +325,14 @@ def nick_next_action(row: dict) -> str | None:
 def nick_api_status(row: dict) -> list[dict]:
     """Per-API readiness for the nicks page. status: ok | need | blocked."""
     from agent.config import FLOW_ALLOW_DEGRADED
+
+    blocked = _disabled_reason(row)
+    if blocked:
+        status = "need" if blocked == "need_relogin" else "blocked"
+        return [
+            {"id": key, "status": status, "reason": blocked}
+            for key in (*_PORTED, "r2v", "upscale", "chain", "omni")
+        ]
 
     chrome = bool(row.get("chrome_running"))
     connected = bool(row.get("connected"))

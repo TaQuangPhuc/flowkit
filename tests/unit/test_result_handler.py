@@ -7,6 +7,13 @@ from agent.sdk.services.result_handler import parse_result, apply_scene_result, 
 from agent.sdk.models.media import GenerationResult
 
 
+@pytest.fixture(autouse=True)
+def scene_lookup():
+    # These tests isolate field updates; do not open the shared live DB.
+    with patch("agent.sdk.services.result_handler.crud.get_scene", new_callable=AsyncMock, return_value=None):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # parse_result tests
 # ---------------------------------------------------------------------------

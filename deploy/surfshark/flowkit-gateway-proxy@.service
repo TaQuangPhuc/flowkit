@@ -1,0 +1,9 @@
+[Unit]
+Description=Forward gateway port %i into isolated network
+Requires=surfshark-gateway.service
+After=surfshark-gateway.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 10.203.255.2:%i
+PrivateTmp=yes
+NoNewPrivileges=yes

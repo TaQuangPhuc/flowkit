@@ -487,11 +487,11 @@ class TestResolvers:
         assert fb.resolve_image_model("SOMETHING_ELSE") == fb.IMAGE_MODEL
 
     @pytest.mark.parametrize("legacy,expected", [
-        ("veo_3_1_i2v_s_fast_ultra_relaxed", "veo_3_1_i2v_s_fast_ultra"),
+        ("veo_3_1_i2v_s_fast_ultra_relaxed", fb.VIDEO_MODEL),
         ("veo_3_1_i2v_s_fast_portrait", fb.VIDEO_MODEL),
         ("veo_3_1_i2v_s_fast_fl", fb.VIDEO_MODEL),
-        ("veo_3_1_r2v_fast_landscape_ultra_relaxed", "veo_3_1_i2v_s_fast_ultra"),
-        ("veo_3_1_i2v_lite", "veo_3_1_i2v_lite"),
+        ("veo_3_1_r2v_fast_landscape_ultra_relaxed", fb.VIDEO_MODEL),
+        ("veo_3_1_i2v_lite", fb.VIDEO_MODEL),
         ("veo_3_1_t2v_lite_low_priority", fb.VIDEO_T2V_MODEL),
         ("veo_3_1_t2v_s_fast_ultra", fb.VIDEO_T2V_MODEL),
         (None, fb.VIDEO_MODEL),
@@ -549,3 +549,13 @@ class TestVisionAnalyze:
         resp_text = envelope("agJzFb", inner_payload)
         result = fb.read_vision_analysis(resp_text)
         assert result["raw_text"] == inner_content
+
+
+@pytest.mark.parametrize("model", ["veo_3_1_i2v_lite", "veo_3_1_i2v_s_fast_ultra", "abra_r2v_8s"])
+def test_paid_models_cannot_be_encoded(model):
+    with pytest.raises(ValueError, match="LOW_PRIORITY_ONLY"):
+        fb.video_request("go", "pid", "mid", model=model)
+    with pytest.raises(ValueError, match="LOW_PRIORITY_ONLY"):
+        fb.t2v_request("go", "pid", model=model)
+    with pytest.raises(ValueError, match="LOW_PRIORITY_ONLY"):
+        fb.set_video_defaults_request("pid", model=model)

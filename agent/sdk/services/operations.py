@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import ssl
+import time
 from typing import TYPE_CHECKING, Optional
 
 
@@ -112,11 +113,9 @@ def _extract_operations(result: dict) -> list[dict]:
 
     # NEW schema: workflows + media → synthesize operation entries
     workflows = data.get("workflows", [])
-    media_list = data.get("media", [])
-    if not workflows or not media_list:
+    if not workflows:
         return []
 
-    media_by_id = {m.get("name"): m for m in media_list if m.get("name")}
     synthesized = []
     for wf in workflows:
         wf_name = wf.get("name", "")
@@ -159,18 +158,24 @@ async def _poll_workflows(
     import os as _os
 
     poll_interval = VIDEO_POLL_INTERVAL
-    elapsed = 0
+    deadline = time.monotonic() + timeout
     completed = {}  # media_id → local_path
 
-    while elapsed < timeout:
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
+    while time.monotonic() < deadline:
+        await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
 
         for op in operations:
             mid = op.get("_primary_media_id", "")
             if not mid or mid in completed:
                 continue
-            media_resp = await client.get_media(mid)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                media_resp = await asyncio.wait_for(client.get_media(mid), timeout=remaining)
+            except Exception as exc:
+                logger.debug("Workflow media %s poll error: %s", mid[:8], exc)
+                continue
             status = media_resp.get("status")
             if status != 200:
                 logger.debug("Workflow media %s not ready (status=%s)", mid[:8], status)
@@ -219,12 +224,54 @@ async def _poll_workflows(
                     },
                     "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
                 })
-            logger.info("All %d workflow(s) completed after %ds", len(operations), elapsed)
+            logger.info("All %d workflow(s) completed", len(operations))
             return {"data": {"operations": synth_ops}}
 
     logger.warning("Workflow polling timed out after %ds. Done=%d/%d",
                    timeout, len(completed), len(operations))
-    return {"error": f"Workflow polling timeout after {timeout}s"}
+    return {"error": f"Workflow polling timeout after {timeout}s",
+            "error_code": "upstream_timeout", "retryable": False}
+
+
+def _operation_failure(op: dict) -> dict:
+    """Keep the upstream reason intact; a terminal operation cannot be retried."""
+    detail = op.get("error") or op.get("operation", {}).get("error") or op.get("complaint")
+    if isinstance(detail, dict):
+        detail = json.dumps(detail, ensure_ascii=False)
+    return {"error": detail or f"Operation failed: {op.get('operation', {}).get('name', '?')}",
+            "error_code": op.get("error_code") or "upstream_rejected", "retryable": False}
+
+
+async def _resume_video_request(client: FlowClient, request_id: str,
+                                timeout: int = VIDEO_POLL_TIMEOUT) -> dict | None:
+    if not request_id:
+        return None
+    row = await crud.get_request(request_id)
+    saved = row.get("request_id") if row else None
+    if not saved:
+        return None
+    if saved.startswith("["):
+        try:
+            operations = json.loads(saved)
+            if not operations or not all(isinstance(op, dict) and op.get("operation", {}).get("name")
+                                         for op in operations):
+                raise ValueError("missing operation handles")
+        except (ValueError, TypeError):
+            return {"error": "Invalid saved video operation; generation was not resubmitted", "retryable": False}
+    elif not USE_BATCH_RPC and _is_uuid(saved):
+        # Old workflow records did not store primaryMediaId. Do not duplicate
+        # an accepted render when recovery information is unavailable.
+        return {"error": "Legacy workflow has no saved media handle; generation was not resubmitted",
+                "retryable": False}
+    else:
+        operations = [{"operation": {"name": saved}, "status": "MEDIA_GENERATION_STATUS_PENDING"}]
+    return await _poll_operations(client, operations, timeout=timeout)
+
+
+async def _save_video_operations(request_id: str, operations: list[dict]) -> None:
+    if request_id:
+        # Preserve workflow media ids and every handle across retries/restarts.
+        await crud.update_request(request_id, request_id=json.dumps(operations))
 
 
 async def _poll_operations(
@@ -246,18 +293,23 @@ async def _poll_operations(
         return await _poll_workflows(client, operations, timeout)
 
     poll_interval = VIDEO_POLL_INTERVAL
-    elapsed = 0
+    deadline = time.monotonic() + timeout
     current_ops = operations
     # The batch path attaches the operation's own grumble ("Media not found.")
     # to a still-pending round. It is a diagnostic, not a verdict — finished
     # jobs report it too — so it is only worth quoting if we time out.
     last_complaint = None
 
-    while elapsed < timeout:
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-
-        status_result = await client.check_video_status(current_ops)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            status_result = await asyncio.wait_for(client.check_video_status(current_ops), timeout=remaining)
+        except Exception as exc:
+            logger.warning("Status poll transport error: %s", exc)
+            continue
         if _is_error(status_result):
             logger.warning("Status poll error: %s", status_result.get("error"))
             continue
@@ -267,10 +319,10 @@ async def _poll_operations(
         if not ops:
             continue
 
-        current_ops = ops
+        by_name = {op.get("operation", {}).get("name"): op for op in ops}
+        current_ops = [by_name.get(op.get("operation", {}).get("name"), op) for op in current_ops]
+        ops = current_ops
         all_done = True
-        has_error = False
-        error_msg = ""
 
         for op in ops:
             if op.get("complaint"):
@@ -283,23 +335,20 @@ async def _poll_operations(
                 # Log full operation for debugging failure reason
                 import json as _json
                 logger.error("Operation FAILED: name=%s full=%s", op_name, _json.dumps(op)[:1000])
-                error_msg = f"Operation failed: {op_name}"
-                has_error = True
-                break
+                return _operation_failure(op)
             else:
                 all_done = False
 
-        if has_error:
-            return {"error": error_msg}
         if all_done:
-            logger.info("All %d operations completed after %ds", len(ops), elapsed)
-            return {"data": data}
+            logger.info("All %d operations completed", len(ops))
+            return {"data": {**data, "operations": ops}}
 
         done_count = sum(1 for o in ops if o.get("status") == "MEDIA_GENERATION_STATUS_SUCCESSFUL")
-        logger.debug("Poll %ds/%ds: %d/%d done", elapsed, timeout, done_count, len(ops))
+        logger.debug("Poll: %d/%d done, %.1fs remaining", done_count, len(ops), deadline - time.monotonic())
 
     detail = f": {last_complaint}" if last_complaint else ""
-    return {"error": f"Polling timeout after {timeout}s{detail}"}
+    return {"error": f"Polling timeout after {timeout}s{detail}",
+            "error_code": "upstream_timeout", "retryable": False}
 
 
 class OperationService:
@@ -429,6 +478,9 @@ class OperationService:
     async def generate_scene_video(self, scene: dict, orientation: str,
                                    request_id: str = "") -> dict:
         """Generate video from a scene image (i2v). Submits + polls."""
+        resumed = await _resume_video_request(self._client, request_id)
+        if resumed is not None:
+            return resumed
         prefix = "vertical" if orientation == "VERTICAL" else "horizontal"
         image_media_id = scene.get(f"{prefix}_image_media_id")
         if not image_media_id:
@@ -447,29 +499,6 @@ class OperationService:
             base_prompt = scene.get("video_prompt") or scene.get("prompt", "")
         prompt = await _build_video_prompt(base_prompt, scene, pid)
 
-        # Check if already submitted (op_name saved from previous attempt)
-        # OLD schema (Lite/Fast/Ultra): op_name is "models/.../operations/..." → re-poll via check_video_status
-        # NEW schema (Low Priority workflow): op_name is bare UUID → cannot recover (need primary_media_id
-        # which isn't persisted yet); fall through and resubmit (Low Priority is free, duplicate is OK)
-        existing_op = None
-        if request_id:
-            req_row = await crud.get_request(request_id)
-            existing_op = req_row.get("request_id") if req_row else None
-
-        # A bare uuid means different things on the two transports. On the
-        # legacy path it is a Low Priority workflow name that cannot be
-        # re-polled, so the retry resubmits. On the batch path it is the
-        # operation id, and looking it up in the project listing is exactly
-        # what the status poll does — resubmitting there would abandon a
-        # running render and pay for a second one.
-        bare_uuid = bool(existing_op and len(existing_op) == 36 and existing_op.count("-") == 4)
-        looks_like_workflow_uuid = bare_uuid and not USE_BATCH_RPC
-        if existing_op and not looks_like_workflow_uuid:
-            logger.info("Video gen already submitted (op=%s), re-polling", existing_op[:30])
-            operations = [{"operation": {"name": existing_op}, "status": "MEDIA_GENERATION_STATUS_PENDING"}]
-            return await _poll_operations(self._client, operations)
-        # else: workflow UUID — fall through and resubmit fresh
-
         submit_result = await self._client.generate_video(
             start_image_media_id=image_media_id,
             prompt=prompt,
@@ -487,18 +516,16 @@ class OperationService:
         operations = _extract_operations(submit_result)
         if not operations:
             logger.error("[DEBUG] Video gen NO_OPERATIONS submit_result: %s", str(submit_result)[:2000])
-            return {"error": "Video gen returned no operations"}
+            return {"error": "Video gen returned no operations", "retryable": False}
 
-        op_name = operations[0].get("operation", {}).get("name", "")
-        if request_id:
-            await crud.update_request(request_id, request_id=op_name)
+        await _save_video_operations(request_id, operations)
 
-        status = operations[0].get("status", "")
-        if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+        if all(op.get("status") == "MEDIA_GENERATION_STATUS_SUCCESSFUL" for op in operations):
             logger.info("Video gen completed immediately")
             return submit_result
-        if status == "MEDIA_GENERATION_STATUS_FAILED":
-            return {"error": "Video generation failed immediately"}
+        for op in operations:
+            if op.get("status") == "MEDIA_GENERATION_STATUS_FAILED":
+                return _operation_failure(op)
 
         logger.info("Video gen submitted, polling %d operations...", len(operations))
         return await _poll_operations(self._client, operations)
@@ -512,6 +539,9 @@ class OperationService:
         face refs.  Collect all matching entity media_ids and optionally include
         the scene's end_scene image.
         """
+        resumed = await _resume_video_request(self._client, request_id)
+        if resumed is not None:
+            return resumed
         project = await crud.get_project(scene.get("_project_id", "0"))
         aspect = "VIDEO_ASPECT_RATIO_PORTRAIT" if orientation == "VERTICAL" else "VIDEO_ASPECT_RATIO_LANDSCAPE"
         tier = project.get("user_paygate_tier", "PAYGATE_TIER_TWO") if project else "PAYGATE_TIER_TWO"
@@ -573,17 +603,6 @@ class OperationService:
         if not ref_ids:
             return {"error": "No valid reference media_ids for r2v"}
 
-        # Check if already submitted (op_name saved from previous attempt)
-        existing_op = None
-        if request_id:
-            req_row = await crud.get_request(request_id)
-            existing_op = req_row.get("request_id") if req_row else None
-
-        if existing_op:
-            logger.info("R2V already submitted (op=%s), re-polling", existing_op[:30])
-            operations = [{"operation": {"name": existing_op}, "status": "MEDIA_GENERATION_STATUS_PENDING"}]
-            return await _poll_operations(self._client, operations)
-
         submit_result = await self._client.generate_video_from_references(
             reference_media_ids=ref_ids,
             prompt=prompt,
@@ -598,18 +617,16 @@ class OperationService:
 
         operations = _extract_operations(submit_result)
         if not operations:
-            return {"error": "R2V returned no operations"}
+            return {"error": "R2V returned no operations", "retryable": False}
 
-        op_name = operations[0].get("operation", {}).get("name", "")
-        if request_id:
-            await crud.update_request(request_id, request_id=op_name)
+        await _save_video_operations(request_id, operations)
 
-        status = operations[0].get("status", "")
-        if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+        if all(op.get("status") == "MEDIA_GENERATION_STATUS_SUCCESSFUL" for op in operations):
             logger.info("R2V completed immediately")
             return submit_result
-        if status == "MEDIA_GENERATION_STATUS_FAILED":
-            return {"error": "R2V failed immediately"}
+        for op in operations:
+            if op.get("status") == "MEDIA_GENERATION_STATUS_FAILED":
+                return _operation_failure(op)
 
         logger.info("R2V submitted with %d refs, polling %d operations...", len(ref_ids), len(operations))
         return await _poll_operations(self._client, operations)
@@ -621,24 +638,15 @@ class OperationService:
         If a previous attempt already submitted (op_name saved in DB), skip
         submit and just re-poll — avoids duplicate API calls on retry.
         """
+        resumed = await _resume_video_request(self._client, request_id, timeout=300)
+        if resumed is not None:
+            return resumed
         prefix = "vertical" if orientation == "VERTICAL" else "horizontal"
         video_media_id = scene.get(f"{prefix}_video_media_id")
         if not video_media_id:
             return {"error": f"No {prefix} video media_id for scene"}
 
         aspect = "VIDEO_ASPECT_RATIO_PORTRAIT" if orientation == "VERTICAL" else "VIDEO_ASPECT_RATIO_LANDSCAPE"
-
-        # Check if already submitted (op_name saved from previous attempt)
-        existing_op = None
-        if request_id:
-            req_row = await crud.get_request(request_id)
-            existing_op = req_row.get("request_id") if req_row else None
-
-        if existing_op:
-            # Already submitted — just re-poll
-            logger.info("Upscale already submitted (op=%s), re-polling", existing_op[:30])
-            operations = [{"operation": {"name": existing_op}, "status": "MEDIA_GENERATION_STATUS_PENDING"}]
-            return await _poll_operations(self._client, operations, timeout=300)
 
         submit_result = await self._client.upscale_video(
             media_id=video_media_id,
@@ -651,7 +659,7 @@ class OperationService:
 
         operations = _extract_operations(submit_result)
         if not operations:
-            return {"error": "Upscale returned no operations"}
+            return {"error": "Upscale returned no operations", "retryable": False}
 
         # Check for inline rawBytes (4K video data returned directly)
         project = await crud.get_project(scene.get("_project_id", "0"))
@@ -667,16 +675,14 @@ class OperationService:
             operations[0]["status"] = "MEDIA_GENERATION_STATUS_SUCCESSFUL"
             return {"data": {"operations": operations}}
 
-        op_name = operations[0].get("operation", {}).get("name", "")
-        if request_id:
-            await crud.update_request(request_id, request_id=op_name)
+        await _save_video_operations(request_id, operations)
 
-        status = operations[0].get("status", "")
-        if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+        if all(op.get("status") == "MEDIA_GENERATION_STATUS_SUCCESSFUL" for op in operations):
             logger.info("Upscale completed immediately")
             return submit_result
-        if status == "MEDIA_GENERATION_STATUS_FAILED":
-            return {"error": "Upscale failed immediately"}
+        for op in operations:
+            if op.get("status") == "MEDIA_GENERATION_STATUS_FAILED":
+                return _operation_failure(op)
 
         logger.info("Upscale submitted, polling %d operations...", len(operations))
         poll_result = await _poll_operations(self._client, operations, timeout=300)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 import logging
 from typing import Optional
 
@@ -34,6 +35,7 @@ class LocalProxyBridge:
         self._server: Optional[asyncio.AbstractServer] = None
         token = f"{upstream.username}:{upstream.password}".encode()
         self._auth = "Basic " + base64.b64encode(token).decode()
+        self._active_writers: set[asyncio.StreamWriter] = set()
 
     @property
     def listen_url(self) -> str:
@@ -45,9 +47,17 @@ class LocalProxyBridge:
         self.upstream = new_upstream
         token = f"{new_upstream.username}:{new_upstream.password}".encode()
         self._auth = "Basic " + base64.b64encode(token).decode()
+        closed_count = 0
+        for w in list(self._active_writers):
+            try:
+                w.close()
+                closed_count += 1
+            except Exception:
+                pass
+        self._active_writers.clear()
         logger.info(
-            "proxy bridge 127.0.0.1:%d switched upstream to %s",
-            self.port, self.upstream.redacted,
+            "proxy bridge 127.0.0.1:%d switched upstream to %s (closed %d active client sockets)",
+            self.port or 0, self.upstream.redacted, closed_count,
         )
 
     async def start(self) -> int:
@@ -64,6 +74,12 @@ class LocalProxyBridge:
     async def stop(self) -> None:
         if self._server is None:
             return
+        for w in list(self._active_writers):
+            try:
+                w.close()
+            except Exception:
+                pass
+        self._active_writers.clear()
         self._server.close()
         await self._server.wait_closed()
         self._server = None
@@ -72,6 +88,7 @@ class LocalProxyBridge:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self._active_writers.add(writer)
         try:
             head = await _read_http_head(reader)
             if not head:
@@ -86,70 +103,52 @@ class LocalProxyBridge:
         except Exception as exc:
             logger.debug("proxy bridge client error: %s", exc)
         finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            self._active_writers.discard(writer)
+            await _close_writer(writer)
 
-    async def _connect(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        host: str,
-        port: int,
-        version: str,
-    ) -> None:
-        if _is_local_host(host):
-            remote_r, remote_w = await asyncio.open_connection(host, port)
-        else:
-            remote_r, remote_w = await asyncio.open_connection(
-                self.upstream.host, self.upstream.port
-            )
-            req = (
-                f"CONNECT {host}:{port} HTTP/1.1\r\n"
-                f"Host: {host}:{port}\r\n"
-                f"Proxy-Authorization: {self._auth}\r\n"
-                f"Proxy-Connection: Keep-Alive\r\n"
-                f"\r\n"
-            ).encode()
-            remote_w.write(req)
-            await remote_w.drain()
-            reply = await _read_http_head(remote_r)
-            status = _status_line(reply)
-            if not status.startswith("HTTP/") or " 200 " not in status:
-                writer.write(reply or b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                await writer.drain()
-                remote_w.close()
-                return
-        writer.write(f"{version} 200 Connection Established\r\n\r\n".encode())
-        await writer.drain()
-        await _pipe(reader, writer, remote_r, remote_w)
+    @asynccontextmanager
+    async def _remote(self, host: str, port: int):
+        remote_r, remote_w = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=20)
+        self._active_writers.add(remote_w)
+        try:
+            yield remote_r, remote_w
+        finally:
+            self._active_writers.discard(remote_w)
+            await _close_writer(remote_w)
 
-    async def _http(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        head: bytes,
-        method: str,
-        target: str,
-    ) -> None:
-        # Absolute-form URL from an HTTP proxy client.
+    async def _connect(self, reader, writer, host: str, port: int, version: str) -> None:
+        local = _is_local_host(host)
+        upstream_host, upstream_port = (host, port) if local else (self.upstream.host, self.upstream.port)
+        auth = self._auth
+        async with self._remote(upstream_host, upstream_port) as (remote_r, remote_w):
+            if not local:
+                remote_w.write((
+                    f"CONNECT {host}:{port} HTTP/1.1\r\n"
+                    f"Host: {host}:{port}\r\n"
+                    f"Proxy-Authorization: {auth}\r\n"
+                    "Proxy-Connection: Keep-Alive\r\n\r\n"
+                ).encode())
+                await remote_w.drain()
+                reply = await _read_http_head(remote_r)
+                status = _status_line(reply)
+                if not status.startswith("HTTP/") or " 200 " not in status:
+                    writer.write(reply or b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    await writer.drain()
+                    return
+            writer.write(f"{version} 200 Connection Established\r\n\r\n".encode())
+            await writer.drain()
+            await _pipe(reader, writer, remote_r, remote_w)
+
+    async def _http(self, reader, writer, head: bytes, method: str, target: str) -> None:
         host, port = _origin_from_target(target)
-        if _is_local_host(host):
-            remote_r, remote_w = await asyncio.open_connection(host, port)
-            # Chrome sends absolute-form (`POST http://127.0.0.1:8100/path`)
-            # to the proxy. Origin servers (uvicorn) treat that as the path
-            # (`POST http%3A//...`) and 404. Rewrite to origin-form.
-            remote_w.write(_origin_form_head(head, target))
+        local = _is_local_host(host)
+        upstream_host, upstream_port = (host, port) if local else (self.upstream.host, self.upstream.port)
+        outgoing = _origin_form_head(head, target) if local else _inject_proxy_auth(head, self._auth)
+        async with self._remote(upstream_host, upstream_port) as (remote_r, remote_w):
+            remote_w.write(outgoing)
             await remote_w.drain()
-        else:
-            remote_r, remote_w = await asyncio.open_connection(
-                self.upstream.host, self.upstream.port
-            )
-            remote_w.write(_inject_proxy_auth(head, self._auth))
-            await remote_w.drain()
-        await _pipe(reader, writer, remote_r, remote_w)
+            await _pipe(reader, writer, remote_r, remote_w)
 
 
 async def _read_http_head(reader: asyncio.StreamReader) -> bytes:
@@ -258,4 +257,20 @@ async def _pipe(
             except Exception:
                 pass
 
-    await asyncio.gather(one(client_r, remote_w), one(remote_r, client_w))
+    tasks = [asyncio.create_task(one(client_r, remote_w)),
+             asyncio.create_task(one(remote_r, client_w))]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(_close_writer(client_w), _close_writer(remote_w))
+
+
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=5)
+    except (Exception, asyncio.CancelledError):
+        writer.transport.abort()

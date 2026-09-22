@@ -12,6 +12,9 @@
  * for USE_BATCH_RPC=0 and for an old pinned labs.google tab.
  */
 
+importScripts('flow_guard.js');
+const flowGate = new FlowRequestGate();
+const FLOW_GUARD_VERSION = '2026-09-21.2';
 const AGENT_WS_URL = 'ws://127.0.0.1:9222';
 // Nick copies rewrite this to "nick-a" so handshake does not wait on profile.json.
 const BAKED_PROFILE_ID = null;
@@ -220,7 +223,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 // Observes the signed-in tab's POSTs under /_/. Polls / project listing /
 // media fetches are skipped so the log stays readable. GN0Bre / StreamChat
 // session ids are stashed on the page and forwarded to the agent.
-const NETLOG_HOSTS = ['https://flow.google.com/_/*'];
+const NETLOG_HOSTS = ['https://flow.google.com/_/*', 'https://labs.google/_/*'];
 const NETLOG_SKIP = /rpcids=(jwpduf|Zzl0ze|as29s)|rpcids%3D(jwpduf|Zzl0ze|as29s)/;
 const NETLOG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NETLOG_FREQ_MAX = 24000;
@@ -438,6 +441,8 @@ chrome.webRequest.onBeforeRequest.addListener((d) => {
   if (session) reportChatSession(session);
   if (netlogPending.size > 80) netlogPending.clear();
   netlogPending.set(d.requestId, {
+    requestId: d.requestId,
+    startedAt: d.timeStamp,
     ts: new Date().toISOString(),
     url,
     rpcid: netlogRpcid(url),
@@ -454,8 +459,29 @@ chrome.webRequest.onCompleted.addListener((d) => {
 }, { urls: NETLOG_HOSTS });
 
 chrome.webRequest.onErrorOccurred.addListener((d) => {
+  const rec = netlogPending.get(d.requestId);
   netlogPending.delete(d.requestId);
+  if (!rec && d.method !== 'POST') return;
+  const failure = networkFailureRecord(d, rec);
+  if (failure) postNetlog(failure);
 }, { urls: NETLOG_HOSTS });
+
+function networkFailureRecord(d, rec) {
+  try {
+    const url = new URL(d.url);
+    if (!['https://flow.google.com', 'https://labs.google'].includes(url.origin)) return null;
+    const elapsed = rec && Number.isFinite(rec.startedAt) ? d.timeStamp - rec.startedAt : null;
+    return {
+      event: 'network_error', diagnosticVersion: 1,
+      ts: new Date(d.timeStamp).toISOString(),
+      requestId: String(d.requestId).slice(0, 128),
+      url: url.origin + url.pathname,
+      rpcid: netlogRpcid(d.url),
+      networkError: /^net::ERR_[A-Z0-9_]+$/.test(d.error || '') ? d.error : 'UNKNOWN_NETWORK_ERROR',
+      elapsedMs: Number.isFinite(elapsed) ? Math.max(0, Math.min(3600000, Math.round(elapsed))) : null,
+    };
+  } catch { return null; }
+}
 
 let _openingFlowTab = false;
 
@@ -527,6 +553,7 @@ function connectToAgent() {
     // worker is ready before the first RPC.
     ws.send(JSON.stringify({
       type: 'extension_ready',
+      flowGuardVersion: FLOW_GUARD_VERSION,
       flowKeyPresent: !!flowKey,
       tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
       profileId,
@@ -541,17 +568,25 @@ function connectToAgent() {
   };
 
   ws.onmessage = async ({ data }) => {
+    let msg;
     try {
-      const msg = JSON.parse(data);
+      msg = JSON.parse(data);
 
       if (msg.method === 'batch_rpc') {
-        await handleBatchRpc(msg);
+        await flowGate.run(() => handleBatchRpc(msg), { submit: !!msg.params?.captchaAction, expiresAt: msg.expiresAt });
       } else if (msg.method === 'api_request') {
-        await handleApiRequest(msg);
+        await flowGate.run(() => handleApiRequest(msg), { submit: !!msg.params?.captchaAction, expiresAt: msg.expiresAt });
       } else if (msg.method === 'trpc_request') {
-        await handleTrpcRequest(msg);
+        await flowGate.run(() => handleTrpcRequest(msg), { expiresAt: msg.expiresAt });
       } else if (msg.method === 'solve_captcha') {
-        await handleSolveCaptcha(msg);
+        await flowGate.run(() => handleSolveCaptcha(msg), { submit: true, expiresAt: msg.expiresAt });
+      } else if (msg.method === 'prepare_proxy_rotation') {
+        await flowGate.pause(msg.params?.leaseId);
+        sendToAgent({ id: msg.id, result: { ok: true } });
+      } else if (msg.method === 'finish_proxy_rotation') {
+        const result = await flowGate.resume(msg.params?.leaseId, async () =>
+          msg.params?.reload ? reloadFlowTab() : { ok: true });
+        sendToAgent({ id: msg.id, result });
       } else if (msg.method === 'reload_flow_tab') {
         await handleReloadFlowTab(msg);
       } else if (msg.method === 'get_status') {
@@ -565,6 +600,8 @@ function connectToAgent() {
             metrics,
             profileId,
             flowProjectId,
+            flowGuardVersion: FLOW_GUARD_VERSION,
+            flowGate: flowGate.snapshot(),
           },
         });
       } else if (msg.type === 'callback_secret') {
@@ -576,6 +613,7 @@ function connectToAgent() {
       }
     } catch (e) {
       console.error('[FlowAgent] Message error:', e);
+      if (msg?.id) sendToAgent({ id: msg.id, status: 503, error: e?.message || 'FLOW_REQUEST_FAILED' });
     }
   };
 
@@ -718,14 +756,21 @@ async function reviveTabIfNeeded(tab) {
   }
 }
 
-function captchaFromTab(tabId, requestId, captchaAction) {
-  return Promise.race([
-    requestCaptchaFromTab(tabId, requestId, captchaAction),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
-  ]);
+async function captchaFromTab(tabId, requestId, captchaAction) {
+  let timer;
+  try {
+    return await Promise.race([
+      requestCaptchaFromTab(tabId, requestId, captchaAction),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000); }),
+    ]);
+  } finally { clearTimeout(timer); }
 }
 
-async function solveCaptcha(requestId, captchaAction) {
+async function solveCaptcha(requestId, captchaAction, tabId = null) {
+  if (tabId !== null) {
+    // A generation token must be minted in the exact tab used for its POST.
+    return captchaFromTab(tabId, requestId, captchaAction);
+  }
   let tabs = await chrome.tabs.query({ url: flowUrls });
 
   // If no Flow tab, check if any tab was knocked to chrome-error:// or chromewebdata
@@ -831,26 +876,40 @@ async function handleSolveCaptcha(msg) {
 async function handleReloadFlowTab(msg) {
   const { id } = msg;
   try {
-    const tabs = await chrome.tabs.query({ url: flowUrls });
-    let reloadedCount = 0;
-    for (const tab of tabs) {
-      if (!tab.discarded) {
-        try {
-          await chrome.tabs.reload(tab.id);
-          reloadedCount++;
-        } catch (_) {}
-      }
-    }
-    if (reloadedCount === 0) {
-      await chrome.tabs.create({ url: FLOW_TAB_URL, active: false });
-      reloadedCount = 1;
-    }
-    // Give page 3.5 seconds to reload DOM, WIZ_global_data, and re-init grecaptcha
-    await sleep(3500);
-    sendToAgent({ id, result: { ok: true, reloaded: reloadedCount } });
+    await flowGate.pause(id);
+    const result = await flowGate.resume(id, reloadFlowTab);
+    sendToAgent({ id, result });
   } catch (err) {
     sendToAgent({ id, result: { ok: false, error: err?.message || String(err) } });
   }
+}
+
+async function reloadFlowTab() {
+    const tabs = await chrome.tabs.query({ url: flowUrls });
+    const primary = tabs.find(t => t.active && !t.discarded) || tabs.find(t => !t.discarded) || tabs[0];
+    let tabId;
+    let previousDocument = null;
+    if (primary) {
+      tabId = primary.id;
+      try {
+        const previous = await chrome.tabs.sendMessage(tabId, { type: 'FLOW_PAGE_STATUS', requestId: `before-${Date.now()}` });
+        previousDocument = previous?.documentId || null;
+      } catch (_) {}
+      await chrome.tabs.reload(tabId);
+    } else {
+      tabId = (await chrome.tabs.create({ url: FLOW_TAB_URL, active: false })).id;
+    }
+    const loaded = await waitForTabLoad(tabId, 12000);
+    if (!loaded) return { ok: false, error: 'FLOW_TAB_NOT_READY' };
+    const deadline = Date.now() + 12000;
+    while (Date.now() < deadline) {
+      try {
+        const page = await chrome.tabs.sendMessage(tabId, { type: 'FLOW_PAGE_STATUS', requestId: `ready-${Date.now()}` });
+        if (page?.ready && page.documentId && page.documentId !== previousDocument) return { ok: true, reloaded: 1 };
+      } catch (_) {}
+      await sleep(250);
+    }
+    return { ok: false, error: 'FLOW_PAGE_NOT_READY' };
 }
 
 // ─── Page-context RPC runner (the current path) ─────────────
@@ -894,13 +953,18 @@ async function runBatchRpc(cmd) {
   if (!tab) return { error: 'FLOW_TAB_DISCARDED' };
 
   let freq = cmd.freq;
+  let documentId = null;
   if (cmd.captchaAction) {
-    const solved = await solveCaptcha(cmd.id, cmd.captchaAction);
+    const solved = await solveCaptcha(cmd.id, cmd.captchaAction, tab.id);
     if (!solved?.token) return { error: `CAPTCHA_FAILED: ${solved?.error || 'no token'}` };
+    if (!solved.documentId) return { error: 'FLOW_DOCUMENT_NOT_SUBMITTED' };
+    documentId = solved.documentId;
     freq = freq.split(CAPTCHA_SLOT).join(solved.token);
   }
 
-  const args = [cmd.rpcid, freq, MAX_RPC_TEXT, cmd.match || null, cmd.path || null];
+  const request = { requestId: cmd.id, rpcid: cmd.rpcid, freq, maxText: MAX_RPC_TEXT,
+    match: cmd.match || null, path: cmd.path || null, documentId, expiresAt: cmd.expiresAt };
+  if (Date.now() >= (cmd.expiresAt || Infinity)) return { error: 'FLOW_DEADLINE_NOT_SUBMITTED' };
 
   // Prefer the content-script bridge: Chrome 152 seeded unpacked copies often
   // resolve executeScript with an empty result, which became NO_INJECTION_RESULT
@@ -908,18 +972,18 @@ async function runBatchRpc(cmd) {
   try {
     const viaContent = await chrome.tabs.sendMessage(tab.id, {
       type: 'BATCH_RPC',
-      requestId: cmd.id,
-      rpcid: cmd.rpcid,
-      freq,
-      maxText: MAX_RPC_TEXT,
-      match: cmd.match || null,
-      path: cmd.path || null,
+      ...request,
     });
     if (viaContent && (viaContent.text || viaContent.error || viaContent.status)) {
       return viaContent;
     }
-  } catch (_) {
-    // no content script on this tab — fall through to executeScript
+    return { error: 'SUBMISSION_OUTCOME_UNKNOWN: empty content response' };
+  } catch (error) {
+    const message = error?.message || String(error);
+    if (!message.includes('Receiving end does not exist') && !message.includes('Could not establish connection')) {
+      return { error: `SUBMISSION_OUTCOME_UNKNOWN: ${message}` };
+    }
+    // Only a missing receiver proves the page has not started this request.
   }
 
   let results;
@@ -927,40 +991,17 @@ async function runBatchRpc(cmd) {
     results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: 'MAIN',
-      args,
-      func: async (rpcid, freqStr, maxText, match, customPath) => {
-        if (typeof globalThis.__flowRunBatch === 'function') {
-          return globalThis.__flowRunBatch(rpcid, freqStr, maxText, match, customPath);
+      args: [request],
+      func: async (request) => {
+        if (typeof globalThis.__flowExecuteBatchOnce === 'function') {
+          return globalThis.__flowExecuteBatchOnce(request);
         }
         return { error: 'NO_BATCH_RUNNER' };
       },
     });
   } catch (e) {
     const execErr = e?.message || '';
-    if (execErr.includes('Frame with ID 0 is showing error page') || execErr.includes('cannot be scripted')) {
-      // Auto-recover error page
-      try { await chrome.tabs.update(tab.id, { url: FLOW_TAB_URL }); } catch {}
-      // Retry once on a freshly loaded Flow tab
-      const fallbackTab = await ensureLoadedFlowTab(7000);
-      if (fallbackTab && fallbackTab.id !== tab.id) {
-        try {
-          const retryResults = await chrome.scripting.executeScript({
-            target: { tabId: fallbackTab.id },
-            world: 'MAIN',
-            args,
-            func: async (rpcid, freqStr, maxText, match, customPath) => {
-              if (typeof globalThis.__flowRunBatch === 'function') {
-                return globalThis.__flowRunBatch(rpcid, freqStr, maxText, match, customPath);
-              }
-              return { error: 'NO_BATCH_RUNNER' };
-            },
-          });
-          const injectedRetry = (retryResults || []).find((row) => row && row.result != null);
-          if (injectedRetry?.result) return injectedRetry.result;
-        } catch (_) {}
-      }
-    }
-    return { error: execErr || 'INJECT_FAILED' };
+    return { error: `SUBMISSION_OUTCOME_UNKNOWN: ${execErr || 'INJECT_FAILED'}` };
   }
   const injected = (results || []).find((row) => row && row.result != null);
   return injected?.result || { error: 'NO_INJECTION_RESULT' };
@@ -989,7 +1030,7 @@ async function handleBatchRpc(msg) {
   }
 
   try {
-    const out = await runBatchRpc({ id, rpcid, freq, captchaAction, match, path });
+    const out = await runBatchRpc({ id, rpcid, freq, captchaAction, match, path, expiresAt: msg.expiresAt });
     if (out.error) {
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = out.error; }
       if (visible) updateRequestLog(id, { status: 'failed', error: out.error });
@@ -1293,7 +1334,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === 'TEST_CAPTCHA') {
-    solveCaptcha(`test-${Date.now()}`, msg.pageAction || 'IMAGE_GENERATION')
+    flowGate.run(() => solveCaptcha(`test-${Date.now()}`, msg.pageAction || 'IMAGE_GENERATION'), { submit: true })
       .then((r) => reply(r))
       .catch((e) => reply({ error: e.message }));
     return true;

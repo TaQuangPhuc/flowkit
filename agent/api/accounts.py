@@ -59,6 +59,10 @@ class ProxyCheckBody(BaseModel):
     proxy_url: str = ""
 
 
+class RotateProxyBody(BaseModel):
+    target_proxy: str | None = None
+
+
 def _reload_router() -> None:
     get_flow_client().reload_configured_profiles()
 
@@ -105,14 +109,18 @@ def _decorate(rows: list[dict], *, reveal: bool = False) -> list[dict]:
         public.update(launch_status(row["id"]))
         publics.append(public)
     _attach_workers(publics)
+    from agent.services.nick_metrics import get_nick_metrics_tracker
+    tracker = get_nick_metrics_tracker()
     for public in publics:
         public["apis"] = nick_api_status(public)
         public["next"] = nick_next_action(public)
+        public["metrics"] = tracker.get_metrics(public["id"])
         worker = public.get("worker") or {}
         if not public.get("project_id") and worker.get("project_id"):
             public["detected_project_id"] = str(worker.get("project_id")).strip()
         # Proactively trigger r2v auto-bind if connected but missing chat session
-        if public.get("connected") and public.get("project_id") and not worker.get("chat_session"):
+        if (public.get("enabled", True) and public.get("connected")
+                and public.get("project_id") and not worker.get("chat_session")):
             client = get_flow_client()
             if hasattr(client, "bind_chat_session"):
                 asyncio.create_task(client.bind_chat_session(public["id"]))
@@ -220,6 +228,22 @@ async def get_accounts_unusual_threshold():
     return audit_mgr.compute_threshold_analysis()
 
 
+@router.get("/metrics")
+async def get_accounts_metrics():
+    """Real-time concurrency and RPM telemetry for all Flow nicks and cluster aggregates."""
+    from agent.services.nick_metrics import get_nick_metrics_tracker
+    return get_nick_metrics_tracker().get_all_metrics()
+
+
+@router.post("/metrics/reset")
+async def reset_accounts_metrics(body: dict | None = None):
+    """Reset historical peak metrics and request counters (optional worker_id)."""
+    from agent.services.nick_metrics import get_nick_metrics_tracker
+    worker_id = (body or {}).get("worker_id") if body else None
+    get_nick_metrics_tracker().reset(worker_id=worker_id)
+    return {"ok": True, "message": f"Metrics reset for {worker_id or 'all workers'}"}
+
+
 @router.get("/{nick_id}")
 async def get_one(nick_id: str, reveal: bool = True):
     row = get_account(nick_id)
@@ -270,12 +294,35 @@ async def stop(nick_id: str):
 
 
 @router.post("/{nick_id}/rotate-proxy")
-async def rotate_proxy(nick_id: str):
-    res = await rotate_nick_proxy(nick_id)
+async def rotate_proxy(nick_id: str, body: RotateProxyBody | None = None):
+    target = body.target_proxy if body else None
+    res = await rotate_nick_proxy(nick_id, target_proxy=target)
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "Failed to rotate proxy"))
     _reload_router()
     return res
+
+
+@router.post("/{nick_id}/reload-tab")
+async def reload_nick_tab(nick_id: str):
+    """Gracefully reload the Google Flow tab in this nick's Chrome browser."""
+    client = get_flow_client()
+    res = await client.profile_control(nick_id, "reload_flow_tab", {})
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "Failed to reload Flow tab"))
+    return {"ok": True, "id": nick_id, "result": res}
+
+
+@router.post("/reload-all-tabs")
+async def reload_all_tabs():
+    """Gracefully reload Google Flow tabs across all connected nick profiles."""
+    client = get_flow_client()
+    results = {}
+    for worker in client.workers():
+        pid = worker.get("profile_id")
+        if pid:
+            results[pid] = await client.profile_control(pid, "reload_flow_tab", {})
+    return {"ok": True, "results": results}
 
 
 @router.post("/{nick_id}/bind-r2v")
@@ -310,6 +357,14 @@ async def rename_nick(nick_id: str, body: RenameBody):
         raise HTTPException(400, str(exc)) from exc
     _reload_router()
     return _live_row(saved, reveal=True)
+
+
+@router.get("/{nick_id}/metrics")
+async def get_nick_metrics(nick_id: str):
+    """Get real-time concurrency, peak concurrency, current RPM, and peak RPM for one nick."""
+    from agent.services.nick_metrics import get_nick_metrics_tracker
+    return get_nick_metrics_tracker().get_metrics(nick_id)
+
 
 
 

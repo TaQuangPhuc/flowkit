@@ -1,0 +1,61 @@
+{
+  "job_id": "nova_job_70f7907295b5c5c67400096f",
+  "request_id": "nova_req_f0b766f2585c33ecfbb0",
+  "operation_id": "d5129819-0bff-4460-a7a9-69b8cc8ba59a",
+  "media_id": "2f508452-a50a-45d7-ad33-7e5564e94f02",
+  "nova_created_utc": "2026-09-21T12:19:54.447950Z",
+  "nova_failed_utc": "2026-09-21T12:29:10.139203Z",
+  "measured_flowkit_clock_ahead_seconds": 82.55,
+  "max_worker_queue_ms": 1,
+  "rpc_error_fingerprint_decoded": {
+    "323571664f1e6c7b": "as29s failed: [5]"
+  },
+  "rpc_error_count": 102,
+  "poll_rounds": 49,
+  "key_events": [
+    {
+      "ts": "2026-09-21T12:21:17.796559+00:00",
+      "v": 1,
+      "event": "extension.dispatch",
+      "trace_id": "nova_req_f0b766f2585c33ecfbb0",
+      "extension_request_id": "89ae2b54-bdb5-4504-a9cb-7a14afbcf278",
+      "method": "batch_rpc",
+      "rpc_id": "maseQ",
+      "timeout_s": 120,
+      "attempt": 1,
+      "profile_hash": "21815b01c5fd3a97",
+      "pending_count": 0
+    },
+    {
+      "ts": "2026-09-21T12:21:26.149452+00:00",
+      "v": 1,
+      "event": "extension.dispatch",
+      "trace_id": "nova_req_f0b766f2585c33ecfbb0",
+      "extension_request_id": "49af308c-255f-4a75-a8b2-ac00a93d5931",
+      "method": "batch_rpc",
+      "rpc_id": "eb1hJf",
+      "timeout_s": 120,
+      "attempt": 1,
+      "profile_hash": "21815b01c5fd3a97",
+      "pending_count": 0
+    },
+    {
+      "ts": "2026-09-21T12:30:32.917878+00:00",
+      "v": 1,
+      "event": "video.poll.end",
+      "trace_id": "nova_req_f0b766f2585c33ecfbb0",
+      "elapsed_ms": 342,
+      "result": {
+        "payload_bytes": 164,
+        "fingerprint": "a4fbbf2678d1ffcd",
+        "markers": [
+          "upstream_timeout",
+          "timeout"
+        ],
+        "status": "MEDIA_GENERATION_STATUS_FAILED",
+        "operation_id": "d5129819-0bff-4460-a7a9-69b8cc8ba59a",
+        "has_error": true
+      }
+    }
+  ]
+}

@@ -22,6 +22,9 @@ _BYPASS_SHIELD_PATHS = {
     "/api/health",
     "/api/system/shield-status",
     "/api/accounts/proxy-health",
+    # Responses from already-dispatched work must survive draining.
+    "/api/ext/callback",
+    "/api/ext/netlog",
     "/favicon.ico",
 }
 
@@ -119,7 +122,7 @@ class ClientRequestShield:
         }
 
 
-_GLOBAL_SHIELD: Optional[ClientRequestShield] = None
+_GLOBAL_SHIELD: Optional[ClientRequestShield] = globals().get("_GLOBAL_SHIELD")
 
 
 def get_request_shield() -> ClientRequestShield:
@@ -148,6 +151,9 @@ class RequestShieldMiddleware(BaseHTTPMiddleware):
                     status_code=503,
                     headers={"Retry-After": "3"},
                     content={
+                        "error": "FLOW_REQUEST_NOT_SUBMITTED",
+                        "retryable": True,
+                        "retry_after_s": 3,
                         "detail": "Server is performing a zero-disruption graceful reload. Please retry in 3 seconds.",
                         "draining": True,
                         "retry_after": 3,

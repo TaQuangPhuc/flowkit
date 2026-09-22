@@ -537,6 +537,45 @@ class TestNickApiStatus:
         by_id = {a["id"]: a for a in nick_api_status(row)}
         assert by_id["r2v"]["status"] == "ok"
 
+    def test_disabled_manually(self):
+        from agent.services.accounts import nick_api_status, nick_next_action
+        row = {
+            "id": "ghost-nick",
+            "enabled": False,
+            "chrome_running": True,
+            "has_proxy": True,
+            "project_id": PA,
+            "connected": True,
+            "worker": {"chat_session": True},
+        }
+        assert nick_next_action(row) == "disabled"
+        by_id = {a["id"]: a for a in nick_api_status(row)}
+        assert by_id["t2v"]["status"] == "blocked"
+        assert by_id["t2v"]["reason"] == "disabled"
+
+    def test_disabled_auth_expired_needs_relogin(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from agent.services.accounts import nick_api_status, nick_next_action
+        incidents = MagicMock()
+        incidents.get_incidents.return_value = [
+            {"job_id": "ghost-nick", "error_code": "ACCOUNT_AUTH_EXPIRED", "status": "OPEN"},
+        ]
+        monkeypatch.setattr("agent.services.incident_manager.get_incident_manager",
+                            lambda: incidents)
+        row = {
+            "id": "ghost-nick",
+            "enabled": False,
+            "chrome_running": True,
+            "has_proxy": True,
+            "project_id": PA,
+            "connected": True,
+            "worker": {"chat_session": True},
+        }
+        assert nick_next_action(row) == "need_relogin"
+        by_id = {a["id"]: a for a in nick_api_status(row)}
+        assert by_id["t2v"]["status"] == "need"
+        assert by_id["t2v"]["reason"] == "need_relogin"
+
 
 class TestNetlogSession:
     def test_streamchat_envelope(self):

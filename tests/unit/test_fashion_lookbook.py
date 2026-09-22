@@ -119,3 +119,37 @@ def test_save_lookbook_job_signatures():
     assert j3["job_id"] == "sig_3"
     assert j3["status"] == "COMPLETED"
 
+
+def test_lookbook_threads_api():
+    """Verify Lookbook threads configuration GET and POST endpoints."""
+    # GET threads
+    resp = client.get("/api/fashion-lookbook/threads")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert "num_threads" in data
+    assert 1 <= data["num_threads"] <= 10
+
+    # POST set threads
+    resp = client.post("/api/fashion-lookbook/threads", json={"num_threads": 6})
+    assert resp.status_code == 200
+    assert resp.json()["num_threads"] == 6
+
+    # Verify updated GET
+    resp2 = client.get("/api/fashion-lookbook/threads")
+    assert resp2.json()["num_threads"] == 6
+
+    # Reset back to default
+    client.post("/api/fashion-lookbook/threads", json={"num_threads": 4})
+
+
+def test_lookbook_jobs_api():
+    """Verify GET /api/fashion-lookbook/jobs lists recent jobs."""
+    resp = client.get("/api/fashion-lookbook/jobs")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert "jobs" in data
+    assert isinstance(data["jobs"], list)
+
+

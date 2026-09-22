@@ -18,7 +18,7 @@ window.addEventListener('message', (event) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
-  if (msg.type === 'BATCH_RPC') {
+  if (msg.type === 'BATCH_RPC' || msg.type === 'FLOW_PAGE_STATUS') {
     const requestId = msg.requestId || `batch-${Date.now()}`;
     const handler = (event) => {
       if (event.source !== window) return;
@@ -31,16 +31,18 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     const timer = setTimeout(() => {
       window.removeEventListener('message', handler);
       reply({ error: 'BATCH_TIMEOUT' });
-    }, 60000);
+    }, msg.type === 'FLOW_PAGE_STATUS' ? 1000 : Math.max(1000, Math.min(125000, (msg.expiresAt || (Date.now() + 60000)) - Date.now())));
     window.addEventListener('message', handler);
     window.postMessage({
-      type: 'FLOW_BATCH_RPC',
+      type: msg.type === 'FLOW_PAGE_STATUS' ? 'FLOW_PAGE_STATUS' : 'FLOW_BATCH_RPC',
       requestId,
       rpcid: msg.rpcid,
       freq: msg.freq,
       maxText: msg.maxText,
       match: msg.match || null,
       path: msg.path || null,
+      documentId: msg.documentId || null,
+      expiresAt: msg.expiresAt,
     }, '*');
     return true;
   }
@@ -53,7 +55,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     if (e.detail?.requestId === requestId) {
       window.removeEventListener('CAPTCHA_RESULT', handler);
       clearTimeout(timer);
-      reply({ token: e.detail.token, error: e.detail.error });
+      reply({ token: e.detail.token, error: e.detail.error, documentId: e.detail.documentId });
     }
   };
 

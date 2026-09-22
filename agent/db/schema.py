@@ -153,11 +153,53 @@ CREATE TABLE IF NOT EXISTS request (
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS incident (
+    id            TEXT PRIMARY KEY,
+    module        TEXT NOT NULL,
+    job_id        TEXT,
+    sub_id        TEXT,
+    severity      TEXT NOT NULL CHECK(severity IN ('INFO','WARNING','CRITICAL','HEALED')),
+    error_code    TEXT NOT NULL,
+    message       TEXT NOT NULL,
+    root_cause    TEXT,
+    action_taken  TEXT,
+    status        TEXT NOT NULL CHECK(status IN ('OPEN','AUTO_HEALING','RESOLVED','FAILED')),
+    retry_count   INTEGER NOT NULL DEFAULT 0,
+    created_at    REAL NOT NULL,
+    resolved_at   REAL
+);
+
+CREATE TABLE IF NOT EXISTS flow_operation_replay (
+    operation_id      TEXT PRIMARY KEY,
+    request_type      TEXT NOT NULL,
+    payload           TEXT NOT NULL,
+    worker_id         TEXT,
+    retry_count       INTEGER NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'PENDING',
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS flow_operation_failover (
+    original_op_id      TEXT PRIMARY KEY,
+    new_op_id           TEXT NOT NULL,
+    original_worker_id  TEXT,
+    failover_worker_id  TEXT,
+    failover_at         REAL NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+    created_at          REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_scene_video ON scene(video_id);
 CREATE INDEX IF NOT EXISTS idx_scene_order ON scene(video_id, display_order);
 CREATE INDEX IF NOT EXISTS idx_request_status ON request(status);
 CREATE INDEX IF NOT EXISTS idx_request_scene ON request(scene_id);
 CREATE INDEX IF NOT EXISTS idx_video_project ON video(project_id);
+CREATE INDEX IF NOT EXISTS idx_incident_status ON incident(status);
+CREATE INDEX IF NOT EXISTS idx_incident_created ON incident(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_incident_module ON incident(module);
+CREATE INDEX IF NOT EXISTS idx_flow_replay_status ON flow_operation_replay(status);
+CREATE INDEX IF NOT EXISTS idx_flow_failover_new ON flow_operation_failover(new_op_id);
 """
 
 
@@ -302,6 +344,23 @@ CREATE INDEX IF NOT EXISTS idx_request_scene ON request(scene_id);
     negative_prompt TEXT, scene_prefix TEXT, lighting TEXT DEFAULT 'Studio lighting, highly detailed',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))""")
             logger.info("Migrated: created material table")
+        # Migration: create flow_operation_replay and flow_operation_failover if missing
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='flow_operation_replay'")
+        if not await cursor.fetchone():
+            await db.execute("""CREATE TABLE flow_operation_replay (
+    operation_id TEXT PRIMARY KEY, request_type TEXT NOT NULL, payload TEXT NOT NULL,
+    worker_id TEXT, retry_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING',
+    created_at REAL NOT NULL, updated_at REAL NOT NULL)""")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_flow_replay_status ON flow_operation_replay(status)")
+            logger.info("Migrated: created flow_operation_replay table")
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='flow_operation_failover'")
+        if not await cursor.fetchone():
+            await db.execute("""CREATE TABLE flow_operation_failover (
+    original_op_id TEXT PRIMARY KEY, new_op_id TEXT NOT NULL, original_worker_id TEXT,
+    failover_worker_id TEXT, failover_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+    created_at REAL NOT NULL)""")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_flow_failover_new ON flow_operation_failover(new_op_id)")
+            logger.info("Migrated: created flow_operation_failover table")
         await db.commit()
     logger.info("Database initialized at %s", DB_PATH)
 

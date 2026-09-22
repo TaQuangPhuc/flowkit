@@ -182,7 +182,9 @@ async def _prerequisites_met(req: dict, orientation: str) -> bool:
         scene = await crud.get_scene(req.get("scene_id"))
         if not scene:
             return True  # let _dispatch handle "scene not found"
-        if req_type in ("GENERATE_VIDEO", "REGENERATE_VIDEO", "GENERATE_VIDEO_REFS"):
+        if req.get("request_id"):
+            return True  # Resume accepted work even if its source image changed.
+        if req_type in ("GENERATE_VIDEO", "REGENERATE_VIDEO"):
             if not scene.get(f"{prefix}_image_media_id"):
                 logger.info("VIDEO prereq deferred: scene=%s no %s_image_media_id", req.get("scene_id","")[:12], prefix)
                 return False
@@ -434,23 +436,31 @@ async def _handle_failure(rid: str, req: dict, result: dict, retry_after: dict =
     if isinstance(error_msg, dict):
         error_msg = json.dumps(error_msg)[:200]
 
-    # Auto-recover expired media by re-uploading
-    if "not found" in str(error_msg).lower():
-        recovered = await _recover_entity_not_found(req)
-        if recovered:
-            logger.info("Request %s: recovered expired media, retrying", rid[:8])
-            await crud.update_request(rid, status="PENDING", error_message=f"recovered: {error_msg}")
-            return
-
     error_lower = str(error_msg).lower()
-
-    # A capability the batch path does not have, or a missing Flow project, is
-    # a configuration answer — not something a retry can reach. Fail it once.
-    if "unsupported_on_batch_api" in error_lower or "no_flow_project" in error_lower:
+    terminal_codes = {"low_priority_only", "content_policy_violation", "upstream_rejected",
+                      "upstream_timeout", "media_profile_mismatch"}
+    if (result.get("retryable") is False
+            or result.get("error_code") in terminal_codes
+            or any(marker in error_lower for marker in (
+                "ask_for_permission", "low_priority_only", "public_error_unsafe_generation",
+                "media_profile_mismatch", "unsupported_on_batch_api", "no_flow_project"))):
         await crud.update_request(rid, status="FAILED", error_message=str(error_msg))
         await _mark_scene_failed(req)
         logger.error("Request %s FAILED (not retryable): %s", rid[:8], error_msg)
         return
+
+    # A missing output on an accepted job must never cause a source re-upload.
+    # Re-upload failures still consume the normal retry budget.
+    retry = req.get("retry_count", 0) + 1
+    if "not found" in error_lower and not req.get("request_id") and retry < MAX_RETRIES:
+        recovered = await _recover_entity_not_found(req)
+        if recovered:
+            logger.info("Request %s: recovered expired media, retrying", rid[:8])
+            if retry_after is not None:
+                retry_after[rid] = time.time() + min(2 ** retry * 10, 300)
+            await crud.update_request(rid, status="PENDING", retry_count=retry,
+                                      error_message=f"recovered: {error_msg}")
+            return
 
     # WS transient errors (extension disconnect/reconnect): retry without incrementing count
     if "extension reconnected" in error_lower or "extension disconnected" in error_lower or "extension not connected" in error_lower:

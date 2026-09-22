@@ -1,0 +1,10 @@
+[Unit]
+Description=Stable host listener for FlowKit gateway port %i
+After=flowkit-gateway-netns.service
+
+[Socket]
+ListenStream=%i
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

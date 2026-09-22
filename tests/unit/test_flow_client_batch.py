@@ -48,7 +48,7 @@ def client(monkeypatch):
     monkeypatch.setattr(module, "FLOW_ALLOW_DEGRADED", False)
 
     c = FlowClient()
-    c.responses = {}
+    c.responses = {fb.RPC_PROJECT_SETTINGS: {"data": envelope(fb.RPC_PROJECT_SETTINGS, [])}}
     c.calls = []
 
     async def fake_batch_rpc(rpcid, freq, captcha_action=None, match=None,
@@ -671,3 +671,38 @@ class TestRefreshProjectUrls:
 
         result = await client.refresh_project_urls(PROJECT)
         assert result["found"] == 3 and result["refreshed"] == 2
+
+
+class TestLowPriorityGuard:
+    @pytest.mark.parametrize("response", [
+        {"data": ""},
+        {"data": json.dumps([["wrb.fr", fb.RPC_PROJECT_SETTINGS, None, None, None, [7]]])},
+        {"error": "Failed to fetch"},
+    ])
+    async def test_settings_must_be_acknowledged_before_streamchat(self, client, response):
+        client.responses[fb.RPC_PROJECT_SETTINGS] = response
+        stub_create_session(client)
+        result = await client.generate_video_from_references([MEDIA], "walk", PROJECT, "s")
+        assert result.get("error")
+        assert not any(call["rpcid"] in (fb.RPC_STREAM_CHAT, fb.RPC_CREATE_SESSION) for call in client.calls)
+
+    async def test_permission_beats_queued_media_id(self, client):
+        client._operation_chat_sessions[OPERATION] = CHAT_SESSION
+        client._operation_projects[OPERATION] = PROJECT
+        client.responses[fb.RPC_CHAT_SESSION] = {"data": envelope(fb.RPC_CHAT_SESSION,
+            {"ask_for_permission": {"media_id": MEDIA}, "generate_video_with_references": {"media_id": MEDIA}})}
+        assert await client._media_id_from_chat_session(OPERATION, PROJECT) is None
+        assert "LOW_PRIORITY_ONLY" in client._operation_complaints[OPERATION]
+        assert not any(call["rpcid"] == fb.RPC_MEDIA for call in client.calls)
+
+    async def test_streamchat_permission_never_becomes_pending_render(self, client):
+        stub_create_session(client)
+        client.responses[fb.RPC_STREAM_CHAT] = {"data": envelope(fb.RPC_STREAM_CHAT, {"ask_for_permission": True})}
+        result = await client.generate_video_from_references([MEDIA], "walk", PROJECT, "s")
+        assert "LOW_PRIORITY_ONLY" in result["error"]
+        assert result["status"] == 400
+
+    async def test_legacy_paid_model_is_blocked_before_transport(self, client):
+        result = await client._send("api_request", {"body": {"requests": [{"videoModelKey": "abra_r2v_8s"}]}})
+        assert result["status"] == 400
+        assert "LOW_PRIORITY_ONLY" in result["error"]

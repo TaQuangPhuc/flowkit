@@ -103,3 +103,70 @@ This project has reusable skills in `skills/`. When the user says `/fk-<name>`, 
 | `/fk-thumbnail` | Generate 4 YouTube-optimized thumbnail variants for a project video. |
 | `/fk-youtube-seo` | fk-youtube-seo — Generate YouTube Metadata (SEO-Optimized) |
 | `/fk-youtube-upload` | fk-youtube-upload — Upload Video to YouTube (Shorts + Long-form) |
+
+## Context Engine (CCE)
+
+This project uses Code Context Engine for intelligent code retrieval and
+cross-session memory.
+
+### Searching the codebase
+
+**Use `context_search` instead of reading files directly** when exploring
+the codebase, answering questions about code, or understanding how things
+work. `context_search` returns the most relevant code chunks with
+confidence scores instead of whole files.
+
+When to use `context_search`:
+- Answering questions about the codebase ("how does X work?", "where is Y?")
+- Exploring structure or architecture
+- Finding related code, functions, or patterns
+
+Other tools:
+- `expand_chunk` for full source of a compressed result
+- `related_context` for what calls/imports a function
+- `session_recall` to recall past decisions
+
+### Cross-session memory
+
+Call `session_recall("topic phrase")` before answering non-trivial questions.
+Call `record_decision(decision="...", reason="...")` after making choices.
+Call `record_code_area(file_path="...", description="...")` after meaningful work.
+
+### Output style
+
+Respond in compressed style. Drop articles (a, an, the) in prose. Use
+sentence fragments over full sentences. Use short synonyms (fix not resolve,
+check not investigate). Pattern: [thing] [action] [reason]. [next step].
+No filler, hedging, pleasantries, trailing summaries, or restating what
+the user said. One sentence if one sentence is enough.
+
+When suggesting code changes, show only the changed lines with 3 lines of
+context. Never rewrite entire files. Multiple changes in one file: show each
+change separately. Never echo back unchanged code the user already has.
+
+Code blocks, file paths, commands, error messages: always written in full.
+Security warnings and destructive action confirmations: use full clarity.
+
+## Language Server Intelligence (LSP via cclsp)
+
+Language Server Protocol (LSP) intelligence is enabled via cclsp (supporting Go via gopls, Python via pyright, and TypeScript).
+
+Prioritize LSP tools for precise code navigation and verification:
+- `find_definition`: Use when locating the exact definition of a function, method, struct, or type.
+- `find_references`: Use before modifying a function or variable to find all usages across the entire workspace.
+- `get_hover`: Use to inspect type information, signatures, and docstrings of a symbol.
+- `get_diagnostics`: Call immediately after editing a file to verify compiler/type correctness (zero build errors).
+- `rename_symbol`: Use for safe, workspace-wide refactoring and symbol renaming.
+
+## Deep Reasoning (sequentialthinking)
+
+Use `sequentialthinking` for complex multi-step reasoning:
+- Financial, billing, or quota calculations (wallets, transactions, refunds, clawbacks).
+- Architecture and system design tradeoffs before writing code.
+- Debugging obscure concurrency, proxy rotation, or rate-limiting bugs.
+
+## Database Access (PostgreSQL MCP)
+
+Use the `postgres` MCP server (`query` tool) to inspect database schema and verify queries directly:
+- Read-only SQL queries (`SELECT ...`) to inspect live tables, verify relations, or check column constraints.
+- Inspect schemas and foreign keys before writing migrations or ORM queries.

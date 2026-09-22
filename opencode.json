@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "context-engine": {
+      "type": "local",
+      "command": [
+        "/home/pc/.local/bin/cce",
+        "serve",
+        "--project-dir",
+        "/home/pc/flowkit"
+      ]
+    }
+  }
+}

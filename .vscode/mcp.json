@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "context-engine": {
+      "command": "/home/pc/.local/bin/cce",
+      "args": [
+        "serve",
+        "--project-dir",
+        "/home/pc/flowkit"
+      ]
+    }
+  }
+}

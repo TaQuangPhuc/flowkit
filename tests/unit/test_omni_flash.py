@@ -24,10 +24,15 @@ from agent.services.omni_flash import (
 )
 
 
+_REAL_VIDEO_POLICY = omni_flash._low_priority_policy_error
+
+
 @pytest.fixture(autouse=True)
 def legacy_transport(monkeypatch):
     """Omni is only reachable on the pre-migration path; assert it there."""
     monkeypatch.setattr(omni_flash, "USE_BATCH_RPC", False)
+    # Isolate historical wire-format tests; real public policy is tested below.
+    monkeypatch.setattr(omni_flash, "_low_priority_policy_error", omni_flash._batch_path_blocks_omni)
 
 
 @pytest.mark.parametrize(
@@ -485,6 +490,7 @@ class TestBatchPathIsRefusedRatherThanAttempted:
     @pytest.fixture(autouse=True)
     def batch_transport(self, monkeypatch):
         monkeypatch.setattr(omni_flash, "USE_BATCH_RPC", True)
+        monkeypatch.setattr(omni_flash, "_low_priority_policy_error", _REAL_VIDEO_POLICY)
 
     @pytest.fixture
     def client(self):
@@ -497,20 +503,20 @@ class TestBatchPathIsRefusedRatherThanAttempted:
     async def test_first_frame_names_the_gap_and_sends_nothing(self, client):
         result = await generate_omni_flash_first_frame_video(
             start_image_media_id="mid", prompt="go", project_id="pid")
-        assert "UNSUPPORTED_ON_BATCH_API" in result["error"]
+        assert "LOW_PRIORITY_ONLY" in result["error"]
         client._send.assert_not_called()
 
     async def test_first_last_names_the_gap_and_sends_nothing(self, client):
         result = await generate_omni_flash_first_last_video(
             start_image_media_id="a", end_image_media_id="b",
             prompt="go", project_id="pid")
-        assert "UNSUPPORTED_ON_BATCH_API" in result["error"]
+        assert "LOW_PRIORITY_ONLY" in result["error"]
         client._send.assert_not_called()
 
     async def test_reference_to_video_names_the_gap_and_sends_nothing(self, client):
         result = await generate_omni_flash_video(
             reference_media_ids=["a"], prompt="go", project_id="pid")
-        assert "UNSUPPORTED_ON_BATCH_API" in result["error"]
+        assert "LOW_PRIORITY_ONLY" in result["error"]
         client._send.assert_not_called()
 
     async def test_polling_names_the_gap_and_sends_nothing(self, client):
@@ -519,8 +525,10 @@ class TestBatchPathIsRefusedRatherThanAttempted:
         assert "UNSUPPORTED_ON_BATCH_API" in result["error"]
         client._send.assert_not_called()
 
-    async def test_the_message_points_at_both_ways_out(self, client):
+    @pytest.mark.parametrize("batch", [True, False])
+    async def test_transport_flag_cannot_enable_paid_video(self, client, monkeypatch, batch):
+        monkeypatch.setattr(omni_flash, "USE_BATCH_RPC", batch)
         result = await generate_omni_flash_video(
             reference_media_ids=["a"], prompt="go", project_id="pid")
-        assert "docs/CAPTURE.md" in result["error"]
-        assert "USE_BATCH_RPC=0" in result["error"]
+        assert "LOW_PRIORITY_ONLY" in result["error"]
+        client._send.assert_not_called()

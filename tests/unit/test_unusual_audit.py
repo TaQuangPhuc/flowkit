@@ -52,10 +52,11 @@ def test_audit_manager_heuristic_diagnosis():
     diag2 = mgr.diagnose_root_cause("ogiZ0b", burst_normal, rec, "PUBLIC_ERROR_UNUSUAL_ACTIVITY")
     assert "BURNED_PROXY_IP" in diag2["primary_cause"]
 
-    # Case 3: Confirmed IP reputation (retry succeeded)
+    # Case 3: Combined recovery succeeds without isolating the root cause.
     rot_info = {"retry_attempted": True, "retry_success": True, "new_proxy_ip": "161.248.213.53"}
     diag3 = mgr.diagnose_root_cause("ogiZ0b", burst_normal, None, "PUBLIC_ERROR_UNUSUAL_ACTIVITY", rotation_result=rot_info)
-    assert any("CONFIRMED_IP_REPUTATION" in r for r in diag3["reasons"])
+    assert any("RECOVERY_SUCCEEDED_CAUSE_UNCONFIRMED" in r for r in diag3["reasons"])
+    assert not any("100%" in r or "CONFIRMED_IP_REPUTATION" in r for r in diag3["reasons"])
 
 
 def test_audit_manager_record_and_summary(tmp_path):

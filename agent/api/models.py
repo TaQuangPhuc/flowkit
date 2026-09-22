@@ -3,7 +3,7 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from agent import config
 
@@ -47,26 +47,18 @@ async def get_models():
 
 @router.patch("")
 async def patch_models(body: dict):
-    """Update model keys. Merges provided keys into existing config.
-
-    Example body to change video model for TIER_TWO i2v portrait:
-    {
-      "video_models": {
-        "PAYGATE_TIER_TWO": {
-          "frame_2_video": {
-            "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_i2v_s_fast_portrait_ultra"
-          }
-        }
-      }
-    }
-
-    Omni Flash duration keys are configurable too:
-    {
-      "omni_flash_models": {
-        "reference_to_video": {"10": "abra_r2v_10s"}
-      }
-    }
-    """
+    """Merge model settings; video generation is restricted to low priority."""
+    if "omni_flash_models" in body:
+        raise HTTPException(400, "LOW_PRIORITY_ONLY: Omni Flash is disabled")
+    for gen_types in body.get("video_models", {}).values():
+        for ratios in gen_types.values():
+            for model in ratios.values():
+                if model not in {
+                    "veo_3_1_i2v_lite_low_priority",
+                    "veo_3_1_t2v_lite_low_priority",
+                    "veo_3_1_lite_low_priority",
+                }:
+                    raise HTTPException(400, "LOW_PRIORITY_ONLY: paid video models are disabled")
     current = _read_models()
 
     if "default_image_model" in body:

@@ -140,7 +140,12 @@ async def _background_graceful_restart():
         pass
 
     logger.info("All client requests drained. Executing systemctl restart...")
-    os.system("systemctl --user restart flowkit")
+    # Waiting for restart completion from inside the service deadlocks:
+    # systemd waits for this process to exit while it waits for systemd.
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", "--user", "--no-block", "restart", "flowkit",
+    )
+    await proc.wait()
 
 
 @router.post("/graceful-restart")

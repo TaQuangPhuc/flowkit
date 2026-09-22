@@ -1,0 +1,14 @@
+[Unit]
+Description=Persistent isolated network for FlowKit Surfshark gateway
+After=network-online.target
+Wants=network-online.target
+Before=surfshark-gateway.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/pc/flowkit/deploy/surfshark/setup-netns.sh
+RemainAfterExit=yes
+# No ExecStop: retain the host uplink so Chrome never sees worker rotations.
+
+[Install]
+WantedBy=multi-user.target

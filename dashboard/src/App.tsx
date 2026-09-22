@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { BrowserRouter, NavLink, Routes, Route, useLocation, useParams, useSearchParams } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, Film, ScrollText, BookOpen, Users } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Film, ScrollText, BookOpen, Users, ShieldAlert } from 'lucide-react'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { WebSocketProvider } from './api/WebSocketContext'
 import { useWebSocketContext } from './api/useWebSocketContext'
@@ -16,6 +16,7 @@ import LogsPage from './pages/LogsPage'
 import GalleryPage from './pages/GalleryPage'
 import GuidePage from './pages/GuidePage'
 import NicksPage from './pages/NicksPage'
+import IncidentsPage from './pages/IncidentsPage'
 
 const NAV: { to: string; icon: typeof LayoutDashboard; labelKey: TranslationKey; exact: boolean }[] = [
   { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard', exact: true },
@@ -23,6 +24,7 @@ const NAV: { to: string; icon: typeof LayoutDashboard; labelKey: TranslationKey;
   { to: '/gallery', icon: Film, labelKey: 'nav.gallery', exact: false },
   { to: '/logs', icon: ScrollText, labelKey: 'nav.logs', exact: false },
   { to: '/nicks', icon: Users, labelKey: 'nav.nicks', exact: false },
+  { to: '/incidents', icon: ShieldAlert, labelKey: 'nav.incidents', exact: false },
   { to: '/guide', icon: BookOpen, labelKey: 'nav.guide', exact: false },
 ]
 
@@ -67,6 +69,7 @@ function useBreadcrumbs() {
   } else if (loc.pathname.startsWith('/gallery')) crumbs.push(t('app.breadcrumb.gallery'))
   else if (loc.pathname.startsWith('/logs')) crumbs.push(t('app.breadcrumb.logs'))
   else if (loc.pathname.startsWith('/nicks')) crumbs.push(t('app.breadcrumb.nicks'))
+  else if (loc.pathname.startsWith('/incidents')) crumbs.push(t('nav.incidents'))
   else if (loc.pathname.startsWith('/guide')) crumbs.push(t('app.breadcrumb.guide'))
 
   return crumbs
@@ -144,6 +147,38 @@ function Sidebar() {
   )
 }
 
+function IncidentIndicator() {
+  const [summary, setSummary] = useState<{ unresolved_count: number; system_health: string } | null>(null)
+
+  useEffect(() => {
+    const check = () => {
+      fetchAPI<{ unresolved_count: number; system_health: string }>('/api/system/incidents/summary')
+        .then(setSummary)
+        .catch(() => {})
+    }
+    check()
+    const id = setInterval(check, 10000)
+    return () => clearInterval(id)
+  }, [])
+
+  if (!summary) return null
+  const hasErrors = summary.unresolved_count > 0
+
+  return (
+    <NavLink
+      to="/incidents"
+      className="flex items-center gap-1.5 px-2.5 py-1 rounded border transition-colors hover:opacity-90"
+      style={{
+        borderColor: hasErrors ? (summary.system_health === 'CRITICAL' ? 'var(--red)' : 'var(--amber)') : 'var(--border)',
+        color: hasErrors ? (summary.system_health === 'CRITICAL' ? 'var(--red)' : 'var(--amber)') : 'var(--muted)'
+      }}
+    >
+      <ShieldAlert size={12} />
+      <span>{hasErrors ? `${summary.unresolved_count} sự cố` : 'Hệ thống OK'}</span>
+    </NavLink>
+  )
+}
+
 function Header() {
   const { t } = useTranslation()
   const { isConnected } = useWebSocketContext()
@@ -162,7 +197,8 @@ function Header() {
         ))}
       </div>
       <span className="ml-auto" />
-      <div className="flex items-center gap-3.5 text-[10px]" style={{ color: 'var(--muted)' }}>
+      <div className="flex items-center gap-3 text-[10px]" style={{ color: 'var(--muted)' }}>
+        <IncidentIndicator />
         <span className="tracking-wide">{clock.toLocaleTimeString()}</span>
         <span className="flex items-center gap-1.5 px-2.5 py-1 rounded border" style={{ borderColor: 'var(--border)', color: isConnected ? 'var(--green)' : 'var(--red)' }}>
           <span
@@ -190,6 +226,7 @@ function Layout() {
             <Route path="/gallery" element={<GalleryPage />} />
             <Route path="/logs" element={<LogsPage />} />
             <Route path="/nicks" element={<NicksPage />} />
+            <Route path="/incidents" element={<IncidentsPage />} />
             <Route path="/guide" element={<GuidePage />} />
           </Routes>
         </main>

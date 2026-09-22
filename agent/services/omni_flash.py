@@ -46,8 +46,13 @@ _UNSUPPORTED_ON_BATCH = (
 )
 
 
+def _low_priority_policy_error() -> dict | None:
+    """These accounts may only generate low-priority Veo video."""
+    return {"status": 400, "error": "LOW_PRIORITY_ONLY: Omni Flash is disabled; use low-priority Veo"}
+
+
 def _batch_path_blocks_omni() -> dict | None:
-    """The error to return instead of reaching for auth that is gone."""
+    """Legacy transport availability, retained for existing poll tooling."""
     return {"error": _UNSUPPORTED_ON_BATCH} if USE_BATCH_RPC else None
 
 OMNI_FLASH_VALID_DURATIONS = (4, 6, 8, 10)
@@ -230,7 +235,7 @@ async def _submit_omni_frame_video(
     seed: int | None = None,
 ) -> dict:
     """Submit Omni first-frame or First+Last generation."""
-    blocked = _batch_path_blocks_omni()
+    blocked = _low_priority_policy_error()
     if blocked:
         return blocked
     _validate_frame_inputs(
@@ -352,7 +357,7 @@ async def generate_omni_flash_video(
     the workflow names and primary media IDs required by the Omni polling path.
     Do not feed Omni operation handles to ``check_video_status``.
     """
-    blocked = _batch_path_blocks_omni()
+    blocked = _low_priority_policy_error()
     if blocked:
         return blocked
     refs = _validate_reference_inputs(reference_media_ids, duration_s, aspect_ratio)

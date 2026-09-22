@@ -9,12 +9,36 @@ import {
   Copy,
   Check,
   RotateCw,
+  Zap,
+  TrendingUp,
+  RotateCcw,
+  Gauge,
 } from 'lucide-react'
 import { fetchAPI } from '../api/client'
 import { useTranslation } from '../i18n/useTranslation'
 import type { TranslationKey } from '../i18n/translations'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '../components/ui/card'
 import { Badge } from '../components/ui/badge'
+
+export interface NickMetrics {
+  worker_id: string
+  current_concurrency: number
+  peak_concurrency: number
+  max_concurrency_limit: number
+  current_rpm: number
+  peak_rpm: number
+  rpm_5m_avg: number
+  total_requests: number
+  successful_requests: number
+  failed_requests: number
+  success_rate_percent: number
+  avg_latency_ms: number
+  last_latency_ms: number
+  last_request_at: number | null
+  last_error: string | null
+  last_error_at: number | null
+  uptime_seconds: number
+}
 
 interface NickWorker {
   profile_id: string | null
@@ -49,6 +73,7 @@ interface Nick {
   connected: boolean
   apis?: NickApi[]
   next?: string | null
+  metrics?: NickMetrics
 }
 
 interface NickDraft {
@@ -212,6 +237,13 @@ export default function NicksPage() {
     }
   }, [load, loadHealth])
 
+  const clusterConcurrency = nicks.reduce((acc, n) => acc + (n.metrics?.current_concurrency || 0), 0)
+  const clusterPeakConcurrency = Math.max(0, ...nicks.map(n => n.metrics?.peak_concurrency || 0))
+  const clusterMaxLimit = nicks.reduce((acc, n) => acc + (n.metrics?.max_concurrency_limit || 20), 0)
+  const clusterRPM = nicks.reduce((acc, n) => acc + (n.metrics?.current_rpm || 0), 0)
+  const clusterPeakRPM = nicks.reduce((acc, n) => acc + (n.metrics?.peak_rpm || 0), 0)
+  const clusterRequests = nicks.reduce((acc, n) => acc + (n.metrics?.total_requests || 0), 0)
+
   function flash(tone: 'ok' | 'err', text: string) {
     setMessage({ tone, text })
     setTimeout(() => {
@@ -231,6 +263,16 @@ export default function NicksPage() {
       flash('err', t('nicks.error', { msg: String((err as Error).message || err) }))
     } finally {
       setHealthChecking(false)
+    }
+  }
+
+  async function resetMetrics() {
+    try {
+      await fetchAPI('/api/accounts/metrics/reset', { method: 'POST' })
+      flash('ok', 'Đã đặt lại chỉ số Concurrency và RPM đỉnh!')
+      load()
+    } catch (err) {
+      flash('err', t('nicks.error', { msg: String((err as Error).message || err) }))
     }
   }
 
@@ -629,6 +671,60 @@ export default function NicksPage() {
         )}
       </Card>
 
+      {/* Real-time Telemetry & Cluster Concurrency Header */}
+      {nicks.some(n => n.metrics) && (
+        <Card className="p-3 border border-[var(--border)] bg-gradient-to-r from-blue-950/20 via-black/30 to-purple-950/20">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Gauge className="w-4 h-4 text-cyan-400 shrink-0" />
+              <div>
+                <div className="text-xs font-semibold text-[var(--text)] flex items-center gap-1.5">
+                  <span>Hạ tầng Tải trọng & RPM Cụm Nick</span>
+                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 font-mono">
+                    Max 20/nick · 3 nick = 60 song song
+                  </span>
+                </div>
+                <div className="text-[11px] text-[var(--muted)]">
+                  Đo lường độ đồng thời (Concurrency) và tốc độ request/phút (RPM) thực tế
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+              <div className="px-2.5 py-1 rounded bg-black/40 border border-[var(--border)] flex items-center gap-1.5">
+                <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span className="text-[var(--muted)]">Concurrency:</span>
+                <span className={`font-bold ${clusterConcurrency > 0 ? 'text-emerald-400' : 'text-[var(--text)]'}`}>
+                  {clusterConcurrency}
+                </span>
+                <span className="text-[var(--muted)]">/ Đỉnh:</span>
+                <span className="text-amber-300 font-bold">{clusterPeakConcurrency}</span>
+                <span className="text-[var(--muted)] text-[10px]">(Cụm: {clusterMaxLimit})</span>
+              </div>
+
+              <div className="px-2.5 py-1 rounded bg-black/40 border border-[var(--border)] flex items-center gap-1.5">
+                <TrendingUp className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                <span className="text-[var(--muted)]">RPM Cụm:</span>
+                <span className={`font-bold ${clusterRPM > 0 ? 'text-cyan-400' : 'text-[var(--text)]'}`}>
+                  {clusterRPM}
+                </span>
+                <span className="text-[var(--muted)]">/ Đỉnh:</span>
+                <span className="text-purple-300 font-bold">{clusterPeakRPM} req/m</span>
+              </div>
+
+              <div className="px-2.5 py-1 rounded bg-black/40 border border-[var(--border)] flex items-center gap-1.5 text-[var(--muted)]">
+                <span>Tổng: {clusterRequests} reqs</span>
+              </div>
+
+              <ActionBtn onClick={resetMetrics} disabled={busy !== null} tone="default" title="Đặt lại thống kê đỉnh">
+                <RotateCcw className="w-3 h-3 inline mr-1" />
+                Reset Đỉnh
+              </ActionBtn>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {/* Accounts Grid */}
       {loading ? (
         <div className="text-xs" style={{ color: 'var(--muted)' }}>{t('nicks.loading')}</div>
@@ -945,6 +1041,64 @@ function NickCard({
 
           {nick.note && <div className="text-[11px] italic" style={{ color: 'var(--muted)' }}>{nick.note}</div>}
 
+          {/* Real-time Concurrency & RPM Telemetry Widget */}
+          {nick.metrics && (
+            <div className="p-2 rounded border border-[var(--border)] bg-black/25 flex flex-col gap-1.5 my-1 font-mono text-[10px]">
+              {/* Concurrency Row */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1 text-[var(--muted)]">
+                  <Zap className="w-3 h-3 text-amber-400 shrink-0" />
+                  <span>{t('nicks.metrics.concurrency')}:</span>
+                </div>
+                <div className="flex items-center gap-1.5 font-semibold">
+                  <span className={nick.metrics.current_concurrency > 0 ? 'text-emerald-400 font-bold' : 'text-[var(--text)]'}>
+                    {nick.metrics.current_concurrency}
+                  </span>
+                  <span className="text-[var(--muted)]">/ {t('nicks.metrics.peak')}:</span>
+                  <span className="text-amber-300 font-bold">{nick.metrics.peak_concurrency}</span>
+                  <span className="text-[var(--muted)] text-[9px]">({t('nicks.metrics.limit')}: {nick.metrics.max_concurrency_limit || 20})</span>
+                </div>
+              </div>
+
+              {/* Concurrency Visual Meter */}
+              <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden flex">
+                <div
+                  className="bg-emerald-400 h-full transition-all duration-300"
+                  style={{ width: `${Math.min(100, (nick.metrics.current_concurrency / (nick.metrics.max_concurrency_limit || 20)) * 100)}%` }}
+                  title={`Đang chạy: ${nick.metrics.current_concurrency}`}
+                />
+                <div
+                  className="bg-amber-400/40 h-full transition-all duration-300"
+                  style={{
+                    width: `${Math.max(0, Math.min(100, ((nick.metrics.peak_concurrency - nick.metrics.current_concurrency) / (nick.metrics.max_concurrency_limit || 20)) * 100))}%`
+                  }}
+                  title={`Đỉnh: ${nick.metrics.peak_concurrency}`}
+                />
+              </div>
+
+              {/* RPM Row */}
+              <div className="flex items-center justify-between pt-0.5">
+                <div className="flex items-center gap-1 text-[var(--muted)]">
+                  <TrendingUp className="w-3 h-3 text-cyan-400 shrink-0" />
+                  <span>{t('nicks.metrics.rpm')}:</span>
+                </div>
+                <div className="flex items-center gap-1.5 font-semibold">
+                  <span className={nick.metrics.current_rpm > 0 ? 'text-cyan-400 font-bold' : 'text-[var(--text)]'}>
+                    {nick.metrics.current_rpm} req/m
+                  </span>
+                  <span className="text-[var(--muted)]">/ {t('nicks.metrics.peak')}:</span>
+                  <span className="text-purple-300 font-bold">{nick.metrics.peak_rpm}</span>
+                </div>
+              </div>
+
+              {/* Requests & Latency row */}
+              <div className="flex items-center justify-between text-[9px] text-[var(--muted)] pt-1 border-t border-white/5">
+                <span>{nick.metrics.total_requests} reqs · {nick.metrics.success_rate_percent}% ok</span>
+                <span>{nick.metrics.avg_latency_ms ? `${nick.metrics.avg_latency_ms}ms avg` : '—'}</span>
+              </div>
+            </div>
+          )}
+
           <ApiChecklist nick={nick} t={t} />
         </div>
       </CardContent>
@@ -999,6 +1153,8 @@ const REASON_TEXT: Record<string, TranslationKey> = {
   blocked_unported: 'nicks.reason.blocked_unported',
   blocked_chain: 'nicks.reason.blocked_chain',
   degraded_chain: 'nicks.reason.degraded_chain',
+  need_relogin: 'nicks.reason.need_relogin',
+  disabled: 'nicks.reason.disabled',
 }
 
 function reasonText(
