@@ -90,6 +90,23 @@ def _respond_flow_result(result: dict):
             headers={"Retry-After": "3"},
         )
 
+    if result.get("error_code") == "model_access_denied" or "PUBLIC_ERROR_MODEL_ACCESS_DENIED" in error_str:
+        # Every nick that could render is parked for lacking model access.
+        # Nothing was submitted, so a retry cannot double-render — but the cure
+        # is a nick whose Google account can render, so retry slowly.
+        retry_after = int(result.get("retry_after_s") or 300)
+        denied = result.get("denied_nicks") or []
+        return JSONResponse(status_code=503, content={
+            "ok": False, "error": "PUBLIC_ERROR_MODEL_ACCESS_DENIED", "detail": error_str,
+            "error_code": "model_access_denied", "retryable": True,
+            "retry_after_s": retry_after, "denied_nicks": denied,
+            "message": (
+                "Flow từ chối model video vì (các) account không có quyền render "
+                f"({', '.join(denied) or 'nick hiện tại'}). Chưa submit gì lên Flow. "
+                "Thêm nick có quyền hoặc xoá nick này."
+            ),
+        }, headers={"Retry-After": str(retry_after)})
+
     if result.get("error_code") == "all_workers_parked":
         # Nothing was submitted upstream, so this is safe to retry — but only
         # once a nick is back, which is minutes away, not seconds.
@@ -250,6 +267,9 @@ async def extension_status():
         "allow_degraded": FLOW_ALLOW_DEGRADED,
         "flow_key_present": client._flow_key is not None,
         "workers": client.workers(),
+        # Nicks taken out of the video rotation for MODEL_ACCESS_DENIED. Empty
+        # is the healthy case; a nick here needs model access or deletion.
+        "model_denied": client.model_denied_report() if hasattr(client, "model_denied_report") else {},
     }
 
 

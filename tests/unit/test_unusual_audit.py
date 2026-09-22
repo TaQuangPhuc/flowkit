@@ -86,3 +86,70 @@ def test_audit_manager_record_and_summary(tmp_path):
     assert summary["total_incidents_recorded"] >= 1
     assert summary["incidents_last_24h"] >= 1
     assert "agJzFb" in summary["breakdown_by_rpc_24h"]
+
+
+class TestProxyErrorDecay:
+    """Error streaks are lifetime counters kept on disk.
+
+    Without a decay window the watchdog re-quarantined the same proxies on every
+    sweep forever — on 22 Sep that took the live surfshark gateway down with a
+    retired pool, parking the nicks behind it for 15 minutes at a time.
+    """
+
+    def _errored(self, age_s: float) -> ProxyHealthRecord:
+        rec = ProxyHealthRecord("http://u:p@10.0.0.9:8000")
+        for _ in range(3):
+            rec.record_error("PUBLIC_ERROR_UNUSUAL_ACTIVITY")
+        rec.last_error_at = time.time() - age_s
+        return rec
+
+    def test_a_fresh_streak_is_kept(self):
+        rec = self._errored(60)
+        assert rec.decay_stale_errors(1800) is False
+        assert rec.consecutive_errors == 3
+
+    def test_a_stale_streak_is_forgotten(self):
+        rec = self._errored(3600)
+        assert rec.decay_stale_errors(1800) is True
+        assert rec.consecutive_errors == 0
+        assert rec.last_error_reason is None
+
+    def test_lifetime_totals_survive_the_decay(self):
+        rec = self._errored(3600)
+        rec.decay_stale_errors(1800)
+        assert rec.failed_requests == 3 and rec.total_requests == 3
+
+    def test_a_clean_record_is_untouched(self):
+        rec = ProxyHealthRecord("http://u:p@10.0.0.9:8000")
+        rec.record_success()
+        assert rec.decay_stale_errors(1800) is False
+
+    def test_a_state_file_written_before_the_decay_existed(self):
+        """No last_error_at: stop punishing it rather than punish it forever."""
+        rec = self._errored(0)
+        rec.last_error_at = None
+        rec.last_used_at = None
+        assert rec.decay_stale_errors(1800) is True
+        assert rec.consecutive_errors == 0
+
+    def test_record_error_stamps_the_time(self):
+        rec = ProxyHealthRecord("http://u:p@10.0.0.9:8000")
+        rec.record_error("X")
+        assert rec.last_error_at is not None
+        assert abs(rec.last_error_at - rec.last_used_at) < 1.0
+        rec.record_success()
+        assert rec.last_error_at is None
+
+    def test_the_timestamp_round_trips_through_disk(self, tmp_path, monkeypatch):
+        import agent.services.unusual_audit as mod
+        monkeypatch.setattr(mod, "FATIGUE_STATE_FILE", tmp_path / "fatigue.json")
+        mgr = UnusualAuditManager()
+        rec = mgr._get_or_create_proxy_record("http://u:p@10.0.0.9:8000")
+        rec.record_error("PUBLIC_ERROR_UNUSUAL_ACTIVITY")
+        mgr._save_proxy_state_to_disk()
+
+        reloaded = UnusualAuditManager()
+        reloaded._proxy_records.clear()
+        reloaded._load_proxy_state_from_disk()
+        back = [r for r in reloaded._proxy_records.values() if r.ip == "10.0.0.9"]
+        assert back and back[0].last_error_at == rec.last_error_at

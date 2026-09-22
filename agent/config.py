@@ -74,6 +74,17 @@ AUTH_STRIKES_BEFORE_DISABLE = int(os.environ.get("AUTH_STRIKES_BEFORE_DISABLE", 
 # disables a nick that was healthy the whole time.
 AUTH_STRIKE_TTL_S = int(os.environ.get("AUTH_STRIKE_TTL_S", "3600"))
 
+# A nick whose Google account was never granted the free low-priority Veo
+# models answers PUBLIC_ERROR_MODEL_ACCESS_DENIED on every video submit. The
+# account, not the session or the IP, is the problem, so the nick is parked for
+# video work this long and the job re-routes to a nick that does have access.
+MODEL_DENIED_PARK_S = int(os.environ.get("MODEL_DENIED_PARK_S", "21600"))
+
+# Proxy error counters are lifetime totals persisted to disk, so without a decay
+# window one bad hour re-quarantines that proxy on every sweep forever — even
+# after the pool it belonged to was retired.
+PROXY_ERROR_DECAY_S = int(os.environ.get("PROXY_ERROR_DECAY_S", "1800"))
+
 # Age at which an unresolved incident is auto-closed. Safe because every sweep
 # re-records a problem that is still live, with a fresh timestamp; without it
 # the ledger keeps rows whose producing code no longer exists.

@@ -194,3 +194,87 @@ class TestCloseStale:
         monkeypatch.setattr("agent.services.accounts.load_accounts", lambda *a, **k: [])
         res = CentralWatchdog().run_sweep()
         assert "stale" in res and "closed" in res["stale"]
+
+
+class TestResolveByNick:
+    """flow_client records nick incidents in job_id, sweeps use sub_id.
+
+    The manual re-enable called resolve_by_sub() only, so ACCOUNT_AUTH_EXPIRED
+    rows raised by flow_client stayed OPEN however many times a nick was fixed.
+    """
+
+    def _job_incident(self, nick_id, error_code):
+        return get_incident_manager().record_incident(
+            module="worker", job_id=nick_id, severity="CRITICAL",
+            error_code=error_code, message=f"{nick_id} down", status="OPEN",
+        )
+
+    def test_resolve_by_sub_misses_a_job_keyed_incident(self):
+        mgr = get_incident_manager()
+        inc = self._job_incident("nick-jobkey", "ACCOUNT_AUTH_EXPIRED")
+        assert mgr.resolve_by_sub("worker", "nick-jobkey", error_code="ACCOUNT_AUTH_EXPIRED") == 0
+        assert _status_of(inc["id"]) == "OPEN"
+
+    def test_resolve_by_nick_matches_either_column(self):
+        mgr = get_incident_manager()
+        by_job = self._job_incident("nick-either", "ACCOUNT_AUTH_EXPIRED")
+        by_sub = _open_worker_incident("nick-either", "ACCOUNT_AUTH_EXPIRED")
+        assert mgr.resolve_by_nick(
+            "worker", "nick-either", error_code="ACCOUNT_AUTH_EXPIRED",
+            action_taken="MANUAL_REENABLE",
+        ) == 2
+        assert _status_of(by_job["id"]) == "RESOLVED"
+        assert _status_of(by_sub["id"]) == "RESOLVED"
+
+    def test_error_code_filter_is_respected(self):
+        mgr = get_incident_manager()
+        denied = self._job_incident("nick-filter", "MODEL_ACCESS_DENIED")
+        auth = self._job_incident("nick-filter", "ACCOUNT_AUTH_EXPIRED")
+        assert mgr.resolve_by_nick("worker", "nick-filter", error_code="MODEL_ACCESS_DENIED") == 1
+        assert _status_of(denied["id"]) == "RESOLVED"
+        assert _status_of(auth["id"]) == "OPEN"
+
+
+class TestSweepProxiesDecay:
+    """The sweep must not re-quarantine a proxy for an hour-old error streak."""
+
+    def _audit_with(self, monkeypatch, age_s):
+        from agent.services import unusual_audit as ua
+        mgr = ua.UnusualAuditManager()
+        mgr._proxy_records.clear()
+        rec = mgr._get_or_create_proxy_record("http://u:p@127.0.0.1:18888")
+        for _ in range(3):
+            rec.record_error("PUBLIC_ERROR_UNUSUAL_ACTIVITY")
+        rec.last_error_at = rec.last_used_at = __import__("time").time() - age_s
+        monkeypatch.setattr(ua, "get_unusual_audit", lambda: mgr)
+        monkeypatch.setattr("agent.services.accounts.load_accounts", lambda *a, **k: [])
+        monkeypatch.setattr("agent.services.proxy_checker.run_revival_cycle", lambda *a, **k: {})
+        quarantined = []
+        monkeypatch.setattr(
+            "agent.services.proxy_checker.quarantine_proxy",
+            lambda url, reason="", cooldown_seconds=0: quarantined.append(url),
+        )
+        return quarantined, rec
+
+    def test_a_stale_streak_is_not_quarantined_again(self, monkeypatch):
+        quarantined, rec = self._audit_with(monkeypatch, age_s=7200)
+        res = CentralWatchdog()._sweep_proxies()
+        assert quarantined == []
+        assert res["failed"] == 0
+        assert rec.consecutive_errors == 0
+
+    def test_a_live_streak_still_quarantines(self, monkeypatch):
+        quarantined, _rec = self._audit_with(monkeypatch, age_s=30)
+        res = CentralWatchdog()._sweep_proxies()
+        assert len(quarantined) == 1
+        assert res["failed"] == 1
+
+    def test_the_decay_resolves_the_open_incident(self, monkeypatch):
+        mgr = get_incident_manager()
+        inc = mgr.record_incident(
+            module="proxy", sub_id="127.0.0.1", severity="CRITICAL",
+            error_code="PROXY_CONSECUTIVE_ERRORS", message="3 lỗi liên tiếp", status="OPEN",
+        )
+        self._audit_with(monkeypatch, age_s=7200)
+        CentralWatchdog()._sweep_proxies()
+        assert _status_of(inc["id"]) == "RESOLVED"

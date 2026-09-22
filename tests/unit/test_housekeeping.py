@@ -346,3 +346,51 @@ class TestParkedResponse:
         with pytest.raises(HTTPException) as exc:
             _respond_flow_result({"status": 500, "error": "kaboom"})
         assert exc.value.status_code == 500
+
+
+class TestModelAccessDeniedResponse:
+    """A denial submitted nothing, so it is a slow retry — not a terminal 502."""
+
+    def test_denied_result_becomes_a_503_with_retry_after(self):
+        res = _respond_flow_result({
+            "status": 503, "error": "PUBLIC_ERROR_MODEL_ACCESS_DENIED: no nick has access",
+            "error_code": "model_access_denied", "retryable": True,
+            "retry_after_s": 300, "denied_nicks": ["nick-a", "Nick-b"],
+        })
+        assert res.status_code == 503
+        assert res.headers["Retry-After"] == "300"
+        body = json.loads(res.body)
+        assert body["error"] == "PUBLIC_ERROR_MODEL_ACCESS_DENIED"
+        assert body["error_code"] == "model_access_denied"
+        assert body["retryable"] is True
+        assert body["denied_nicks"] == ["nick-a", "Nick-b"]
+
+    def test_a_raw_denial_from_one_nick_is_also_retryable(self):
+        """Before the branch existed this fell through to HTTPException(502)."""
+        res = _respond_flow_result({
+            "error": ("RpcError: eb1hJf failed: [7, None, [['type.googleapis.com/google.rpc.ErrorInfo', "
+                      "['PUBLIC_ERROR_MODEL_ACCESS_DENIED']]]]"),
+        })
+        assert res.status_code == 503
+        assert json.loads(res.body)["retryable"] is True
+
+    def test_the_studios_back_off_on_that_body(self):
+        res = _respond_flow_result({
+            "status": 503, "error": "denied", "error_code": "model_access_denied",
+            "retry_after_s": 300,
+        })
+        err = _Err(retry_after=int(res.headers["Retry-After"]))
+        b = ParkedBackoff()
+        with patch("agent.services.parked_retry.time.sleep") as slept:
+            assert b.wait(err, res.body.decode()) is True
+        assert slept.call_args[0][0] == pytest.approx(300, abs=1)
+
+    def test_default_delay_for_a_denial_without_a_header(self):
+        b = ParkedBackoff()
+        with patch("agent.services.parked_retry.time.sleep") as slept:
+            assert b.wait(_Err(), '{"error_code": "model_access_denied"}') is True
+        assert slept.call_args[0][0] == pytest.approx(120, abs=1)
+
+    def test_is_parked_stays_narrow(self):
+        """Back-compat: is_parked() still means the fleet is parked, only."""
+        assert is_parked(_Err(), '{"error_code": "model_access_denied"}') is False

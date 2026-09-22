@@ -1004,9 +1004,9 @@ class TestNickAuthActions:
                 return {"profile_id": profile_id, "cleared_strikes": 3, "unparked": 1}
 
         class Incidents:
-            def resolve_by_sub(self, module, sub_id, error_code=None, action_taken=""):
-                resolved.append((module, sub_id, error_code, action_taken))
-                return 2
+            def resolve_by_nick(self, module, nick_id, error_code=None, action_taken=""):
+                resolved.append((module, nick_id, error_code, action_taken))
+                return 1
 
         monkeypatch.setattr(accounts_api, "get_flow_client", lambda: Flow())
         monkeypatch.setattr("agent.services.incident_manager.get_incident_manager", lambda: Incidents())
@@ -1015,9 +1015,11 @@ class TestNickAuthActions:
         body = res.json()
         assert body["enabled"] is True
         assert body["auth_reset"]["cleared_strikes"] == 3
+        # Auth park and the video-model park are both cleared by one re-enable.
         assert body["auth_reset"]["incidents_resolved"] == 2
         assert cleared == ["n1"]
         assert resolved[0][:3] == ("worker", "n1", "ACCOUNT_AUTH_EXPIRED")
+        assert resolved[1][:3] == ("worker", "n1", "MODEL_ACCESS_DENIED")
 
     def test_disable_does_not_clear_strikes(self, api_client, monkeypatch):
         client, path = api_client
@@ -1104,3 +1106,62 @@ class TestRenameThroughTheApi:
         assert "nothing to rename" in res.json()["detail"]
         ids = [a["id"] for a in json.loads(path.read_text())["accounts"]]
         assert ids == ["a@x.com"]
+
+
+class TestDeleteEvictsTheNick:
+    """Deleting a row left the browser up and its WS session registered.
+
+    The router then kept dispatching to a nick the user had already removed —
+    how a nick without video model access kept failing jobs after deletion.
+    """
+
+    def test_delete_stops_chrome(self, api_client, monkeypatch):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "gone@x.com"})
+        stopped = []
+
+        async def fake_stop(nick_id):
+            stopped.append(nick_id)
+            return True
+
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: True)
+        monkeypatch.setattr(accounts_api, "stop_nick", fake_stop)
+        res = client.delete("/api/accounts/gone@x.com")
+        assert res.status_code == 200
+        assert res.json()["chrome_stopped"] is True
+        assert stopped == ["gone@x.com"]
+        assert json.loads(path.read_text())["accounts"] == []
+
+    def test_delete_when_chrome_is_already_down(self, api_client, monkeypatch):
+        client, _path = api_client
+        client.post("/api/accounts", json={"id": "gone@x.com"})
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: False)
+        res = client.delete("/api/accounts/gone@x.com")
+        assert res.status_code == 200
+        assert res.json()["chrome_stopped"] is False
+
+    def test_a_failing_stop_still_deletes_the_row(self, api_client, monkeypatch):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "gone@x.com"})
+
+        async def boom(nick_id):
+            raise RuntimeError("chrome wedged")
+
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: True)
+        monkeypatch.setattr(accounts_api, "stop_nick", boom)
+        res = client.delete("/api/accounts/gone@x.com")
+        assert res.status_code == 200
+        assert json.loads(path.read_text())["accounts"] == []
+
+    def test_unknown_nick_is_404_and_stops_nothing(self, api_client, monkeypatch):
+        client, _path = api_client
+        stopped = []
+
+        async def fake_stop(nick_id):
+            stopped.append(nick_id)
+            return True
+
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: True)
+        monkeypatch.setattr(accounts_api, "stop_nick", fake_stop)
+        assert client.delete("/api/accounts/ghost").status_code == 404
+        assert stopped == []

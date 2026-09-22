@@ -298,10 +298,28 @@ async def get_one(nick_id: str, reveal: bool = True):
 
 @router.delete("/{nick_id}")
 async def remove(nick_id: str):
+    """Delete a nick and take its Chrome down.
+
+    Deleting only the row left the browser up and its WS session registered, so
+    the router kept dispatching to a nick the user had already removed — which
+    is how a nick without video model access kept failing jobs after deletion.
+    """
+    if get_account(nick_id) is None:
+        raise HTTPException(404, f"unknown account {nick_id}")
+    stopped = False
+    if chrome_running(nick_id):
+        try:
+            stopped = await stop_nick(nick_id)
+        except Exception as exc:
+            logger.warning("could not stop Chrome for deleted nick %s: %s", nick_id, exc)
     if not delete_account(nick_id):
         raise HTTPException(404, f"unknown account {nick_id}")
+    try:
+        get_flow_client().clear_model_denied(nick_id)
+    except Exception:
+        pass
     _reload_router()
-    return {"ok": True, "id": nick_id}
+    return {"ok": True, "id": nick_id, "chrome_stopped": stopped}
 
 
 @router.post("/{nick_id}/check-proxy")
@@ -487,10 +505,18 @@ async def enable_nick(nick_id: str, enabled: bool = True):
         client = get_flow_client()
         if hasattr(client, "clear_auth_strikes"):
             cleared = client.clear_auth_strikes(nick_id)
+        if hasattr(client, "clear_model_denied"):
+            cleared["model_denied_cleared"] = client.clear_model_denied(nick_id)
         try:
             from agent.services.incident_manager import get_incident_manager
-            resolved = get_incident_manager().resolve_by_sub(
+            mgr = get_incident_manager()
+            # Those incidents carry the nick in job_id, so resolve_by_sub() alone
+            # matched nothing and they stayed OPEN after a manual re-enable.
+            resolved = mgr.resolve_by_nick(
                 "worker", nick_id, error_code="ACCOUNT_AUTH_EXPIRED", action_taken="MANUAL_REENABLE"
+            )
+            resolved += mgr.resolve_by_nick(
+                "worker", nick_id, error_code="MODEL_ACCESS_DENIED", action_taken="MANUAL_REENABLE"
             )
         except Exception as exc:
             logger.warning("could not resolve auth incidents for %s: %s", nick_id, exc)

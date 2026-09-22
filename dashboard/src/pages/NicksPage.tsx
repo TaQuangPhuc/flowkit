@@ -50,6 +50,8 @@ interface NickWorker {
   in_flight: number
   chat_session: boolean
   flow_key_present: boolean
+  /** > 0 while this account is out of the video rotation for MODEL_ACCESS_DENIED. */
+  video_denied_for_s?: number
 }
 
 interface NickApi {
@@ -1219,6 +1221,15 @@ function NickCard({
                 className={`px-1.5 py-0.5 rounded text-[10px] border font-medium ${VERDICT_STYLE[auth.verdict]}`}
               >
                 {t(verdictKey(auth.verdict))}
+              </span>
+            )}
+            {!!nick.worker?.video_denied_for_s && (
+              <span
+                title={t('nicks.videoDenied.hint')}
+                className="px-1.5 py-0.5 rounded text-[10px] border font-medium"
+                style={{ color: 'var(--red)', borderColor: 'var(--red)' }}
+              >
+                {t('nicks.videoDenied.badge')}
               </span>
             )}
             <Badge variant="outline">{nick.enabled ? t('nicks.field.enabled') : t('common.dash')}</Badge>

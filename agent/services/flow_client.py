@@ -112,6 +112,10 @@ class FlowClient:
         self._worker_last_video_dispatch: dict[str, float] = {}
         self._replay_in_progress: set[str] = set()
         self._unusual_strikes: dict[str, int] = {}
+        # nick -> epoch until which that account is known to have no access to
+        # the Veo models (PUBLIC_ERROR_MODEL_ACCESS_DENIED). Video-only: such a
+        # nick can still upload, poll and generate images.
+        self._model_denied: dict[str, float] = {}
         self._auth_strikes: dict[str, int] = {}
         self._auth_strike_ts: dict[str, float] = {}
         self._replay_watchdogs: set[str] = set()
@@ -368,6 +372,7 @@ class FlowClient:
         media_ids: list[str] | None = None,
         operation_id: str | None = None,
         require_token: bool | None = None,
+        video_submission: bool = False,
     ) -> tuple[str | None, list[dict]]:
         """Ordered nick routes. Pin is (profile_id or None, routes)."""
         if require_token is None:
@@ -393,15 +398,24 @@ class FlowClient:
             is_quar = False
             if sid:
                 try:
-                    from agent.services.accounts import get_account
+                    from agent.services.accounts import get_account, load_accounts
                     from agent.services.proxy_checker import is_quarantined
                     acc = get_account(sid)
+                    # A deleted nick keeps its Chrome and its WS session, so
+                    # without this it stays routable and keeps failing work.
+                    if acc is None and load_accounts():
+                        continue
                     if acc and not acc.get("enabled", True):
                         continue
                     if acc and acc.get("proxy_url"):
                         is_quar = is_quarantined(acc["proxy_url"])
                 except Exception:
                     pass
+
+            # This account has no access to the video models, so a submit here
+            # is a guaranteed PUBLIC_ERROR_MODEL_ACCESS_DENIED.
+            if video_submission and sid and self._model_denied.get(sid, 0.0) > now:
+                continue
 
             is_avail = (session.get("unavailable_until", 0) <= now) and not is_quar
             cur_dispatched = max(
@@ -510,6 +524,7 @@ class FlowClient:
                 "profile_id": pid,
                 "project_id": self._session_project(session),
                 "available": session.get("unavailable_until", 0) <= now,
+                "video_denied_for_s": max(0, int(self._model_denied.get(pid, 0.0) - now)) if pid else 0,
                 "video_cooldown_remaining_s": round(cooldown_rem, 1),
                 "in_flight": int(session.get("in_flight") or 0),
                 "chat_session": bool(session.get("chat_session_id")),
@@ -545,6 +560,23 @@ class FlowClient:
                 "parked_for_s": round(parked.get(pid, 0.0), 1),
             }
         return out
+
+    def model_denied_nicks(self) -> list[str]:
+        """Connected nicks currently parked for PUBLIC_ERROR_MODEL_ACCESS_DENIED."""
+        now = time.time()
+        return sorted(nick for nick, until in self._model_denied.items() if until > now)
+
+    def model_denied_report(self) -> dict:
+        now = time.time()
+        return {
+            nick: {"parked_for_s": int(until - now), "until": until}
+            for nick, until in sorted(self._model_denied.items())
+            if until > now
+        }
+
+    def clear_model_denied(self, profile_id: str) -> bool:
+        """Put a nick back in the video rotation (after it was granted access)."""
+        return self._model_denied.pop(profile_id, None) is not None
 
     def clear_auth_strikes(self, profile_id: str) -> dict:
         """Forget a nick's soft-auth history and un-park it (manual re-enable)."""
@@ -582,6 +614,7 @@ class FlowClient:
             profile_id=profile_id,
             media_ids=media_ids,
             operation_id=operation_id,
+            video_submission=video_submission,
         )
         owners = {self._media_profiles[mid].casefold() for mid in media_ids or []
                   if self._media_profiles.get(mid)}
@@ -590,6 +623,20 @@ class FlowClient:
                     "error": "MEDIA_PROFILE_MISMATCH: reference images must belong to the selected nick; upload references to one profile"}
         self._last_route = None
         if not candidates:
+            denied = self.model_denied_nicks()
+            if video_submission and denied and not pin:
+                return {
+                    "status": 503,
+                    "retryable": True,
+                    "error_code": "model_access_denied",
+                    "retry_after_s": 300,
+                    "denied_nicks": denied,
+                    "error": (
+                        "PUBLIC_ERROR_MODEL_ACCESS_DENIED: no connected nick has access to "
+                        f"the video models ({', '.join(denied)}) — add a nick whose Google "
+                        "account can render in the Flow UI"
+                    ),
+                }
             if pin:
                 return {"error": f"NO_FLOW_TAB: profile {pin} is not connected"}
             if self._extensions:
@@ -847,6 +894,16 @@ class FlowClient:
                 ):
                     nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms)
                     self._unusual_strikes.pop(prof_id, None)
+                    if self._model_denied.pop(prof_id, None):
+                        logger.info("Model access restored on %s — un-parked for video", prof_id)
+                        try:
+                            from agent.services.incident_manager import get_incident_manager
+                            get_incident_manager().resolve_by_nick(
+                                "worker", prof_id, error_code="MODEL_ACCESS_DENIED",
+                                action_taken="MODEL_ACCESS_RESTORED",
+                            )
+                        except Exception:
+                            pass
                     self._auth_strikes.pop(prof_id, None)
                     self._auth_strike_ts.pop(prof_id, None)
                     from agent.services.accounts import get_account
@@ -1056,6 +1113,48 @@ class FlowClient:
                         nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=str(r13_exc))
                     finally:
                         self._in_retry_13 = False
+                elif "PUBLIC_ERROR_MODEL_ACCESS_DENIED" in raw_err:
+                    # The Google account was never granted the Veo models, so
+                    # nothing was submitted and neither the session nor the IP
+                    # is at fault: no auth strike, no unusual strike, no proxy
+                    # quarantine, no rotation. Park the nick for video only —
+                    # it can still upload, poll and generate images — and let
+                    # _should_failover move this job to a nick that has access.
+                    until = time.time() + _config.MODEL_DENIED_PARK_S
+                    first = prof_id not in self._model_denied
+                    self._model_denied[prof_id] = until
+                    nick_metrics.record_completion(
+                        prof_id, success=False, latency_ms=duration_ms,
+                        error="MODEL_ACCESS_DENIED",
+                    )
+                    logger.warning(
+                        "MODEL_ACCESS_DENIED on %s (%s): account has no access to the video "
+                        "models; parked for video %ds, routing to another nick",
+                        prof_id, raw_err[:80], _config.MODEL_DENIED_PARK_S,
+                    )
+                    if first:
+                        try:
+                            from agent.services.incident_manager import get_incident_manager
+                            get_incident_manager().record_incident(
+                                module="worker",
+                                job_id=prof_id,
+                                sub_id=prof_id,
+                                severity="WARNING",
+                                error_code="MODEL_ACCESS_DENIED",
+                                message=(
+                                    f"{prof_id} bị Flow từ chối model video "
+                                    "(PUBLIC_ERROR_MODEL_ACCESS_DENIED) — account này chưa được "
+                                    "cấp quyền render video"
+                                ),
+                                root_cause=(
+                                    "Google account has no entitlement for the low-priority Veo "
+                                    "models; the session and the proxy are both healthy"
+                                ),
+                                action_taken=f"VIDEO_PARKED_{_config.MODEL_DENIED_PARK_S}S",
+                            )
+                        except Exception:
+                            pass
+
                 elif raw_err:
                     nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=raw_err[:200])
 
@@ -1103,6 +1202,8 @@ class FlowClient:
             "extension_switched",
             "public_error_per_model_daily_quota_reached",
             "public_error_user_quota_reached",
+            # This account cannot render video at all; another nick can.
+            "public_error_model_access_denied",
             "public_error_unusual_activity",
             "failed: [13]",
             "failed: [14]",

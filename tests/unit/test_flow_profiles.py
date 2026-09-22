@@ -503,3 +503,106 @@ async def test_per_worker_video_pacing_and_cooldown(client, monkeypatch):
     # Since worker-1 and worker-2 are distinct, they should run nearly simultaneously
     assert (t_end - t_start) < 0.25
 
+
+
+def _denied(rpcid: str) -> dict:
+    return {"error": (
+        f"RpcError: {rpcid} failed: [7, None, [['type.googleapis.com/google.rpc.ErrorInfo', "
+        "['PUBLIC_ERROR_MODEL_ACCESS_DENIED']]]]"
+    )}
+
+
+class TestModelAccessDenied:
+    """A nick whose Google account was never granted the Veo models.
+
+    Nothing is submitted, so the job belongs on another nick — not on a 502.
+    """
+
+    async def test_denial_reroutes_and_parks_only_that_nick(self, client):
+        attach(client, "nick-a", PA, recency=20)
+        attach(client, "nick-b", PB, recency=10)
+
+        async def deny_a(rpcid, freq, captcha_action=None, match=None, timeout=300, path=None):
+            client.calls.append({"rpcid": rpcid, "freq": freq})
+            if t2v_project(freq) == PA:
+                return _denied(rpcid)
+            return _t2v_ok()
+
+        client.batch_rpc = deny_a
+        result = await client.generate_video(None, "go", "0", "scene-1")
+        assert not result.get("error")
+        assert client._last_route["profile_id"] == "nick-b"
+        assert client.model_denied_nicks() == ["nick-a"]
+        # Video only: nick-a can still upload, poll and generate images.
+        _pin, plain = client._profile_candidates()
+        assert "nick-a" in [c["profile_id"] for c in plain]
+        _pin, video = client._profile_candidates(video_submission=True)
+        assert [c["profile_id"] for c in video] == ["nick-b"]
+
+    async def test_denial_does_not_punish_session_or_proxy(self, client, monkeypatch):
+        attach(client, "nick-a", PA)
+        quarantined, rotated = [], []
+        monkeypatch.setattr(
+            "agent.services.proxy_checker.quarantine_proxy",
+            lambda url, reason="", cooldown_seconds=0: quarantined.append(url),
+        )
+
+        async def fake_rotate(nick_id, preflight=False):
+            rotated.append(nick_id)
+            return {"ok": True}
+
+        monkeypatch.setattr("agent.services.proxy_pool.rotate_nick_proxy", fake_rotate)
+
+        async def deny(rpcid, freq, captcha_action=None, match=None, timeout=300, path=None):
+            return _denied(rpcid)
+
+        client.batch_rpc = deny
+        await client.generate_video(None, "go", "0", "scene-1")
+        assert quarantined == [] and rotated == []
+        assert client._auth_strikes == {} and client._unusual_strikes == {}
+
+    async def test_every_nick_denied_answers_503_retryable(self, client):
+        attach(client, "nick-a", PA)
+        attach(client, "nick-b", PB)
+
+        async def deny(rpcid, freq, captcha_action=None, match=None, timeout=300, path=None):
+            return _denied(rpcid)
+
+        client.batch_rpc = deny
+        first = await client.generate_video(None, "go", "0", "scene-1")
+        assert "PUBLIC_ERROR_MODEL_ACCESS_DENIED" in str(first.get("error"))
+        # Both nicks are parked now, so the next submit never reaches Flow.
+        second = await client.generate_video(None, "go", "0", "scene-2")
+        assert second["status"] == 503
+        assert second["error_code"] == "model_access_denied"
+        assert second["retryable"] is True
+        assert second["denied_nicks"] == ["nick-a", "nick-b"]
+
+    async def test_a_later_success_unparks_the_nick(self, client):
+        attach(client, "nick-a", PA)
+
+        async def deny(rpcid, freq, captcha_action=None, match=None, timeout=300, path=None):
+            return _denied(rpcid)
+
+        client.batch_rpc = deny
+        await client.generate_video(None, "go", "0", "scene-1")
+        assert client.model_denied_nicks() == ["nick-a"]
+
+        # Non-video work still routes to nick-a, and one clean call there means
+        # the account has access again.
+        async def ok(_pid):
+            return {"data": "ok"}
+
+        await client._run_on_profile(ok)
+        assert client.model_denied_nicks() == []
+
+    async def test_deleted_nick_leaves_the_rotation(self, client, tmp_path, monkeypatch):
+        # Deleting a nick stops its Chrome, but a browser that is still up keeps
+        # its WS session, and a routable nick with no account row kept failing.
+        acc_path = tmp_path / "live-accounts.json"
+        acc_path.write_text(json.dumps([{"id": "nick-b", "enabled": True}]), encoding="utf-8")
+        monkeypatch.setattr("agent.services.accounts.ACCOUNTS_FILE", acc_path)
+        attach(client, "nick-a", PA)
+        attach(client, "nick-b", PB)
+        _pin, routes = client._profile_candidates()
+        assert [c["profile_id"] for c in routes] == ["nick-b"]

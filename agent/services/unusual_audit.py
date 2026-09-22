@@ -78,6 +78,7 @@ class ProxyHealthRecord:
         self.consecutive_successes = 0
         self.consecutive_errors = 0
         self.last_error_reason: Optional[str] = None
+        self.last_error_at: Optional[float] = None
         self.last_used_at: Optional[float] = None
 
     def record_success(self) -> None:
@@ -86,6 +87,7 @@ class ProxyHealthRecord:
         self.consecutive_successes += 1
         self.consecutive_errors = 0
         self.last_error_reason = None
+        self.last_error_at = None
         self.last_used_at = time.time()
 
     def record_error(self, reason: str = "PUBLIC_ERROR_UNUSUAL_ACTIVITY") -> None:
@@ -94,7 +96,30 @@ class ProxyHealthRecord:
         self.consecutive_errors += 1
         self.consecutive_successes = 0
         self.last_error_reason = reason
+        self.last_error_at = time.time()
         self.last_used_at = time.time()
+
+    def decay_stale_errors(self, ttl_s: float) -> bool:
+        """Forget an error streak older than ``ttl_s``. True if it was cleared.
+
+        The counters are lifetime and persisted, so without this a proxy that
+        failed three times an hour ago is re-quarantined by every later sweep —
+        including proxies whose pool has since been retired.
+        """
+        if self.consecutive_errors <= 0:
+            return False
+        last = self.last_error_at or self.last_used_at
+        if last is None:
+            # Pre-decay state file: no timestamp to judge by, so do not keep
+            # punishing it. The next real error re-arms the streak with one.
+            self.consecutive_errors = 0
+            self.last_error_reason = None
+            return True
+        if time.time() - last <= ttl_s:
+            return False
+        self.consecutive_errors = 0
+        self.last_error_reason = None
+        return True
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +138,8 @@ class ProxyHealthRecord:
             "consecutive_successes": self.consecutive_successes,
             "consecutive_errors": self.consecutive_errors,
             "last_error_reason": self.last_error_reason,
+            "last_error_at": self.last_error_at,
+            "last_error_vn": _now_vn_str(self.last_error_at) if self.last_error_at else None,
             "last_used_vn": _now_vn_str(self.last_used_at) if self.last_used_at else None,
         }
 
@@ -181,6 +208,7 @@ class UnusualAuditManager:
                 rec.consecutive_successes = item.get("consecutive_successes", 0)
                 rec.consecutive_errors = item.get("consecutive_errors", 0)
                 rec.last_error_reason = item.get("last_error_reason")
+                rec.last_error_at = item.get("last_error_at")
                 rec.last_used_at = item.get("last_used_at")
                 self._proxy_records[key] = rec
         except Exception as exc:

@@ -18,6 +18,7 @@ from agent.config import (
     INCIDENT_STALE_TTL_H,
     LOG_KEEP_MB,
     LOG_MAX_MB,
+    PROXY_ERROR_DECAY_S,
     REPLAY_COMPLETED_TTL_H,
     REPLAY_PENDING_TTL_H,
 )
@@ -480,6 +481,17 @@ class CentralWatchdog:
             from agent.services.proxy_checker import quarantine_proxy, run_revival_cycle
 
             for rec in records:
+                # Error streaks are lifetime counters kept on disk, so a stale
+                # one re-quarantines the same proxy on every sweep forever —
+                # that is how the retired pool took the live surfshark gateway
+                # with it. Forget a streak that has not been touched in
+                # PROXY_ERROR_DECAY_S.
+                decayed = rec.decay_stale_errors(PROXY_ERROR_DECAY_S)
+                if decayed:
+                    logger.info(
+                        "[WATCHDOG] Forgot stale error streak on %s (idle > %ds)",
+                        rec.redacted, PROXY_ERROR_DECAY_S,
+                    )
                 if rec.consecutive_errors >= 3:
                     failed += 1
                     # Quarantine proxy with 15m cooldown (900s)
@@ -511,7 +523,7 @@ class CentralWatchdog:
                         action_taken=action_taken,
                         status="RESOLVED" if "AUTO_ROTATED" in action_taken else "OPEN"
                     )
-                elif rec.consecutive_successes >= 5:
+                elif rec.consecutive_successes >= 5 or decayed:
                     healed += self.incident_mgr.resolve_by_sub(
                         module="proxy",
                         sub_id=rec.ip or rec.redacted,

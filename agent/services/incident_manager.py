@@ -206,6 +206,42 @@ class IncidentManager:
             logger.info("[INCIDENT][AUTO_HEALED] Resolved %d open incidents for job %s (%s)", count, job_id, module)
         return count
 
+    def resolve_by_nick(
+        self,
+        module: str,
+        nick_id: str,
+        error_code: Optional[str] = None,
+        action_taken: str = "AUTO_HEALED",
+    ) -> int:
+        """Resolve open incidents about one nick, keyed on job_id OR sub_id.
+
+        Worker incidents are recorded with the nick in `job_id` and proxy/auth
+        sweeps put their subject in `sub_id`, so a caller that only knows the
+        nick has to match either column — resolve_by_sub() alone silently
+        resolved nothing for the nick incidents raised by flow_client.
+        """
+        now = time.time()
+        query = """
+            UPDATE incident
+            SET status = 'RESOLVED', severity = 'HEALED', action_taken = ?, resolved_at = ?
+            WHERE module = ? AND (job_id = ? OR sub_id = ?) AND status IN ('OPEN', 'AUTO_HEALING')
+        """
+        params: List[Any] = [action_taken, now, module, nick_id, nick_id]
+        if error_code:
+            query += " AND error_code = ?"
+            params.append(error_code)
+        with self._lock:
+            with self._get_connection() as conn:
+                cur = conn.execute(query, params)
+                conn.commit()
+                count = cur.rowcount
+        if count > 0:
+            logger.info(
+                "[INCIDENT][AUTO_HEALED] Resolved %d open incidents for nick %s (%s/%s)",
+                count, nick_id, module, error_code or "*",
+            )
+        return count
+
     def resolve_by_sub(
         self,
         module: str,
