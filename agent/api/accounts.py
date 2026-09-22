@@ -318,8 +318,19 @@ async def remove(nick_id: str):
         get_flow_client().clear_model_denied(nick_id)
     except Exception:
         pass
+    # The worker sweep only walks nicks still in accounts.json, so anything left
+    # OPEN here would sit on the dashboard as a live fault on a nick that no
+    # longer exists until the 24h stale TTL.
+    closed = 0
+    try:
+        from agent.services.incident_manager import get_incident_manager
+        closed = get_incident_manager().resolve_by_nick(
+            module="worker", nick_id=nick_id, action_taken="NICK_DELETED",
+        )
+    except Exception as exc:
+        logger.warning("could not close incidents for deleted nick %s: %s", nick_id, exc)
     _reload_router()
-    return {"ok": True, "id": nick_id, "chrome_stopped": stopped}
+    return {"ok": True, "id": nick_id, "chrome_stopped": stopped, "incidents_closed": closed}
 
 
 @router.post("/{nick_id}/check-proxy")

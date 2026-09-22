@@ -421,7 +421,7 @@ class CentralWatchdog:
     # ─── 4. CHROME WORKERS SWEEP ─────────────────────────────────────
 
     def _sweep_workers(self) -> Dict[str, int]:
-        checked, healed, failed = 0, 0, 0
+        checked, healed, failed, orphans = 0, 0, 0, 0
         try:
             from agent.services.accounts import load_accounts
             from agent.services.chrome_nicks import chrome_running, find_running_chrome_pid
@@ -454,10 +454,27 @@ class CentralWatchdog:
                         error_code="CHROME_WORKER_OFFLINE",
                         action_taken="WORKER_ACTIVE",
                     )
+
+            # The loop above only visits nicks still in accounts.json, so an
+            # incident about a nick that has since been deleted is never revisited
+            # and sits OPEN until the 24h stale TTL — the dashboard reads it as a
+            # live fault on a nick that no longer exists.
+            known = {acc["id"] for acc in accounts}
+            for inc in self.incident_mgr.get_incidents(module="worker", status="OPEN", limit=200):
+                orphan = inc.get("sub_id") or inc.get("job_id")
+                if orphan and orphan not in known:
+                    # Counted apart from `healed`: nothing recovered, the subject
+                    # of the incident simply no longer exists.
+                    orphans += self.incident_mgr.resolve_by_nick(
+                        module="worker",
+                        nick_id=orphan,
+                        action_taken="NICK_DELETED",
+                    )
+                    logger.info("[WATCHDOG] Closed incident for deleted nick %s", orphan)
         except Exception as e:
             logger.warning("[WATCHDOG] Worker sweep error: %s", e)
 
-        return {"checked": checked, "healed": healed, "failed": failed}
+        return {"checked": checked, "healed": healed, "failed": failed, "orphans_closed": orphans}
 
     # ─── 5. RESIDENTIAL PROXIES SWEEP ────────────────────────────────
 

@@ -596,6 +596,65 @@ class TestModelAccessDenied:
         await client._run_on_profile(ok)
         assert client.model_denied_nicks() == []
 
+    async def test_a_success_closes_the_session_flagged_incident(self, client, monkeypatch):
+        """UNUSUAL_ACTIVITY opened ACCOUNT_SESSION_FLAGGED but nothing closed it.
+
+        A nick that recovered on its own kept the CRITICAL row on the dashboard
+        until the 24h stale TTL.
+        """
+        attach(client, "nick-a", PA)
+        resolved = []
+
+        class Incidents:
+            def resolve_by_nick(self, module, nick_id, error_code=None, action_taken=""):
+                resolved.append((module, nick_id, error_code, action_taken))
+                return 1
+
+        monkeypatch.setattr(
+            "agent.services.incident_manager.get_incident_manager", lambda: Incidents()
+        )
+
+        async def ok(_pid):
+            return {"data": "ok"}
+
+        # No strikes on record: a plain success must not touch the ledger.
+        await client._run_on_profile(ok)
+        assert resolved == []
+
+        client._unusual_strikes["nick-a"] = 2
+        await client._run_on_profile(ok)
+        assert resolved == [("worker", "nick-a", "ACCOUNT_SESSION_FLAGGED", "SESSION_RECOVERED")]
+        assert "nick-a" not in client._unusual_strikes
+
+    async def test_a_restart_does_not_orphan_the_flag(self, client, monkeypatch):
+        """Strike counts are in memory only, so after a restart the gate above
+        never fires and the CRITICAL row outlives the problem."""
+        attach(client, "nick-a", PA)
+        resolved = []
+
+        class Incidents:
+            def get_incidents(self, module=None, status=None, limit=50, **kw):
+                return [{"error_code": "ACCOUNT_SESSION_FLAGGED", "job_id": "nick-a"}]
+
+            def resolve_by_nick(self, module, nick_id, error_code=None, action_taken=""):
+                resolved.append(nick_id)
+                return 1
+
+        monkeypatch.setattr(
+            "agent.services.incident_manager.get_incident_manager", lambda: Incidents()
+        )
+
+        async def ok(_pid):
+            return {"data": "ok"}
+
+        # Fresh process: no strikes recorded, the open row is the only evidence.
+        assert client._unusual_strikes == {}
+        await client._run_on_profile(ok)
+        assert resolved == ["nick-a"]
+        # Read once, then dropped — a second success does not re-resolve it.
+        await client._run_on_profile(ok)
+        assert resolved == ["nick-a"]
+
     async def test_deleted_nick_leaves_the_rotation(self, client, tmp_path, monkeypatch):
         # Deleting a nick stops its Chrome, but a browser that is still up keeps
         # its WS session, and a routable nick with no account row kept failing.

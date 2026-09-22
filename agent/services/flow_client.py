@@ -112,6 +112,10 @@ class FlowClient:
         self._worker_last_video_dispatch: dict[str, float] = {}
         self._replay_in_progress: set[str] = set()
         self._unusual_strikes: dict[str, int] = {}
+        # Strike counts live in memory only, so after a restart nothing knows a
+        # nick still carries an open ACCOUNT_SESSION_FLAGGED row. Seeded once
+        # from the ledger, lazily, so a success can still close it.
+        self._flagged_nicks: set[str] | None = None
         # nick -> epoch until which that account is known to have no access to
         # the Veo models (PUBLIC_ERROR_MODEL_ACCESS_DENIED). Video-only: such a
         # nick can still upload, poll and generate images.
@@ -578,6 +582,28 @@ class FlowClient:
         """Put a nick back in the video rotation (after it was granted access)."""
         return self._model_denied.pop(profile_id, None) is not None
 
+    def _flagged_from_ledger(self) -> set[str]:
+        """Nicks carrying an open ACCOUNT_SESSION_FLAGGED row, read once.
+
+        Without this the resolve below is gated on a strike counter that a
+        restart wipes, so an incident opened before the restart would stay OPEN
+        until the 24h stale TTL even though the nick was submitting fine.
+        """
+        if self._flagged_nicks is None:
+            self._flagged_nicks = set()
+            try:
+                from agent.services.incident_manager import get_incident_manager
+                for inc in get_incident_manager().get_incidents(
+                    module="worker", status="OPEN", limit=200
+                ):
+                    if inc.get("error_code") == "ACCOUNT_SESSION_FLAGGED":
+                        nick = inc.get("job_id") or inc.get("sub_id")
+                        if nick:
+                            self._flagged_nicks.add(nick)
+            except Exception:
+                pass
+        return self._flagged_nicks
+
     def clear_auth_strikes(self, profile_id: str) -> dict:
         """Forget a nick's soft-auth history and un-park it (manual re-enable)."""
         had = self._auth_strikes.pop(profile_id, 0)
@@ -893,7 +919,24 @@ class FlowClient:
                     not isinstance(last.get("status"), int) or last["status"] < 400
                 ):
                     nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms)
-                    self._unusual_strikes.pop(prof_id, None)
+                    # Gated on the pop: only a nick that actually carried strikes
+                    # has an ACCOUNT_SESSION_FLAGGED incident to close, so a plain
+                    # success does not write to the ledger.
+                    had_strikes = self._unusual_strikes.pop(prof_id, None)
+                    # Ledger lookup first: `or` would short-circuit past it and
+                    # leave the lazy set unseeded.
+                    flagged = self._flagged_from_ledger()
+                    if had_strikes or prof_id in flagged:
+                        flagged.discard(prof_id)
+                        logger.info("UNUSUAL_ACTIVITY cleared on %s — session healthy again", prof_id)
+                        try:
+                            from agent.services.incident_manager import get_incident_manager
+                            get_incident_manager().resolve_by_nick(
+                                "worker", prof_id, error_code="ACCOUNT_SESSION_FLAGGED",
+                                action_taken="SESSION_RECOVERED",
+                            )
+                        except Exception:
+                            pass
                     if self._model_denied.pop(prof_id, None):
                         logger.info("Model access restored on %s — un-parked for video", prof_id)
                         try:
@@ -1079,6 +1122,7 @@ class FlowClient:
                                 ),
                                 action_taken=f"WORKER_PAUSED_{cooldown_s}S",
                             )
+                            self._flagged_from_ledger().add(prof_id)
                         except Exception:
                             pass
 

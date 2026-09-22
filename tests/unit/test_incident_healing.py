@@ -278,3 +278,39 @@ class TestSweepProxiesDecay:
         self._audit_with(monkeypatch, age_s=7200)
         CentralWatchdog()._sweep_proxies()
         assert _status_of(inc["id"]) == "RESOLVED"
+
+
+class TestSweepWorkersClosesDeletedNicks:
+    """_sweep_workers only walks accounts.json, so a deleted nick's incident
+    was never revisited and sat OPEN until the 24h stale TTL — the dashboard
+    read it as a live fault on a nick that no longer exists."""
+
+    def _sweep_with_accounts(self, monkeypatch, ids, running=True):
+        monkeypatch.setattr(
+            "agent.services.accounts.load_accounts",
+            lambda *a, **k: [{"id": i, "enabled": True} for i in ids],
+        )
+        monkeypatch.setattr("agent.services.chrome_nicks.chrome_running", lambda n: running)
+        monkeypatch.setattr(
+            "agent.services.chrome_nicks.find_running_chrome_pid", lambda n: 1234 if running else None
+        )
+        return CentralWatchdog()._sweep_workers()
+
+    def test_an_incident_for_a_deleted_nick_is_closed(self, monkeypatch):
+        offline = _open_worker_incident("nick-deleted", "CHROME_WORKER_OFFLINE")
+        flagged = get_incident_manager().record_incident(
+            module="worker", job_id="nick-deleted", severity="CRITICAL",
+            error_code="ACCOUNT_SESSION_FLAGGED", message="flagged", status="OPEN",
+        )
+        res = self._sweep_with_accounts(monkeypatch, ["nick-kept"])
+        # Counted apart from healed — nothing recovered, the nick is gone.
+        assert res["orphans_closed"] >= 2
+        assert res["healed"] == 0
+        # Both codes go: the nick itself is gone, so nothing about it is live.
+        assert _status_of(offline["id"]) == "RESOLVED"
+        assert _status_of(flagged["id"]) == "RESOLVED"
+
+    def test_a_kept_nick_incident_survives_while_chrome_is_down(self, monkeypatch):
+        inc = _open_worker_incident("nick-kept-down", "CHROME_WORKER_OFFLINE")
+        self._sweep_with_accounts(monkeypatch, ["nick-kept-down"], running=False)
+        assert _status_of(inc["id"]) == "OPEN"

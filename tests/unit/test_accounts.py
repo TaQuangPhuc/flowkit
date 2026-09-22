@@ -1165,3 +1165,47 @@ class TestDeleteEvictsTheNick:
         monkeypatch.setattr(accounts_api, "stop_nick", fake_stop)
         assert client.delete("/api/accounts/ghost").status_code == 404
         assert stopped == []
+
+    def test_delete_closes_that_nick_incidents(self, api_client, monkeypatch):
+        """Otherwise the sweep never revisits them — it only walks accounts.json.
+
+        Every worker incident about a deleted nick then stayed OPEN on the
+        dashboard until the 24h stale TTL, reading as a live fault on a nick
+        that no longer exists.
+        """
+        client, _path = api_client
+        client.post("/api/accounts", json={"id": "gone@x.com"})
+        resolved = []
+
+        class Incidents:
+            def resolve_by_nick(self, module, nick_id, error_code=None, action_taken=""):
+                resolved.append((module, nick_id, error_code, action_taken))
+                return 3
+
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: False)
+        monkeypatch.setattr(
+            "agent.services.incident_manager.get_incident_manager", lambda: Incidents()
+        )
+        res = client.delete("/api/accounts/gone@x.com")
+        assert res.status_code == 200
+        assert res.json()["incidents_closed"] == 3
+        # No error_code filter: CHROME_WORKER_OFFLINE, ACCOUNT_SESSION_FLAGGED
+        # and ACCOUNT_AUTH_EXPIRED all go at once.
+        assert resolved == [("worker", "gone@x.com", None, "NICK_DELETED")]
+
+    def test_a_throwing_incident_ledger_still_deletes(self, api_client, monkeypatch):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "gone@x.com"})
+
+        class Incidents:
+            def resolve_by_nick(self, **kwargs):
+                raise RuntimeError("db locked")
+
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: False)
+        monkeypatch.setattr(
+            "agent.services.incident_manager.get_incident_manager", lambda: Incidents()
+        )
+        res = client.delete("/api/accounts/gone@x.com")
+        assert res.status_code == 200
+        assert res.json()["incidents_closed"] == 0
+        assert json.loads(path.read_text())["accounts"] == []
