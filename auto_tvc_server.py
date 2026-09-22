@@ -14,8 +14,11 @@ from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import batch_image_studio as bis
 import fashion_lookbook_studio as fls
+from agent.config import VIDEO_POLL_TIMEOUT
 
 FLOWKIT_API = "http://127.0.0.1:8100"
+# Leave time for FlowKit's bounded final lookup and the HTTP round trip.
+FLOWKIT_VIDEO_WAIT_SECONDS = VIDEO_POLL_TIMEOUT + 60
 WORK_DIR = Path("/home/pc/flowkit/auto_runs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 BGM_DIR = Path("/home/pc/flowkit/assets/bgm")
@@ -172,30 +175,80 @@ def run_claude_cli_json(prompt: str) -> any:
             raise ValueError(f"All CLI fallbacks (agy & claude) failed ({e}): {stdout[:300]}")
 
 NOVA_BASE_URL = os.environ.get("NOVA_BASE_URL", "https://api.vilao.ai/v1")
-NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "sk-ed315f54662e9ebe508d95bca3d93a65f4d697030d90cea81fde7f39d64e0055")
-NOVA_MODEL = os.environ.get("NOVA_MODEL", "deepseek-v4-flash")
+NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "sk-72afd079199f58a7b302e65b6690744ce8cf7b44c0dcd163070052e7fa774535")
+NOVA_MODEL = os.environ.get("NOVA_MODEL", "chib/deepseek-v4.1-flash")
+
+_DEFAULT_FALLBACKS = ["spd/grok-4.6", "grok-4.6", "cnt/grok-4.6", "fa/grok-4.6-fast"]
+_env_fallbacks = os.environ.get("NOVA_FALLBACK_MODELS", "")
+if _env_fallbacks:
+    NOVA_FALLBACK_MODELS = [m.strip() for m in _env_fallbacks.split(",") if m.strip()]
+else:
+    NOVA_FALLBACK_MODELS = _DEFAULT_FALLBACKS
+
+def get_candidate_models() -> list[str]:
+    primary = os.environ.get("NOVA_MODEL", NOVA_MODEL)
+    candidates = [primary]
+    for fb in NOVA_FALLBACK_MODELS:
+        if fb not in candidates:
+            candidates.append(fb)
+    return candidates
 
 def grok_chat_completion(messages: list[dict], max_tokens: int = 8192, thinking_budget: int = 0, timeout: int = 150) -> str:
-    """Send chat completion to LLM API (chib/deepseek-v4.1-flash)."""
-    payload = {
-        "model": NOVA_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }
-    if thinking_budget and "gemini" in NOVA_MODEL.lower():
-        payload["thinking_config"] = {"thinking_budget": thinking_budget}
-    req = urllib.request.Request(
-        f"{NOVA_BASE_URL}/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {NOVA_API_KEY}",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    """Send chat completion to LLM API with automatic multi-tier fallback (DeepSeek -> Grok)."""
+    candidate_models = get_candidate_models()
+    errors = []
+    api_key = os.environ.get("NOVA_API_KEY", NOVA_API_KEY)
+    base_url = os.environ.get("NOVA_BASE_URL", NOVA_BASE_URL).rstrip("/")
+
+    for idx, model_name in enumerate(candidate_models):
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
         }
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        res = json.loads(resp.read().decode("utf-8"))
-        return res["choices"][0]["message"]["content"]
+        if thinking_budget and "gemini" in model_name.lower():
+            payload["thinking_config"] = {"thinking_budget": thinking_budget}
+        req = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                if "choices" in res and res["choices"] and "message" in res["choices"][0]:
+                    content = res["choices"][0]["message"].get("content", "")
+                    if content:
+                        if idx > 0:
+                            print(f"[LLM FALLBACK SUCCESS] Model '{model_name}' succeeded after fallback!")
+                        return content
+                    raise ValueError(f"Empty content from model '{model_name}'")
+                elif "error" in res:
+                    raise ValueError(f"API error: {res['error'].get('message', res['error'])}")
+                else:
+                    raise ValueError(f"Unexpected response format: {res}")
+        except Exception as e:
+            err_str = str(e)
+            if hasattr(e, "read"):
+                try:
+                    err_body = e.read().decode("utf-8", errors="ignore")
+                    err_str += f" | {err_body}"
+                except Exception:
+                    pass
+            log_msg = f"[LLM FAIL] Model '{model_name}' failed: {err_str}"
+            if idx < len(candidate_models) - 1:
+                next_model = candidate_models[idx + 1]
+                print(f"{log_msg} -> Auto-falling back to '{next_model}'...")
+            else:
+                print(f"{log_msg} -> All candidate models exhausted.")
+            errors.append(f"{model_name}: {err_str}")
+            continue
+
+    raise RuntimeError(f"All LLM candidate models failed: {'; '.join(errors)}")
 
 def grok_vision_analyze(prompt: str, image_paths: list[Path]) -> any:
     """Call Google Gemini 3.8 Flash Vision on Nova Gateway with auto AGY Vision fallback."""
@@ -747,25 +800,43 @@ def rotate_profile_proxy(nick_id: str = "nick-a") -> dict:
         print(f"Error rotating proxy for {nick_id}: {e}")
         return {"ok": False, "error": str(e)}
 
+from agent.services.flow_trace import traced_sync, trace_id, emit as trace_emit, summary as trace_summary
+from agent.services.parked_retry import ParkedBackoff
+
+
+@traced_sync("tvc.api")
 def call_flowkit_api(endpoint: str, payload: dict, timeout: int = 120, max_retries: int = 5, job_id: str = None) -> dict:
+    if endpoint in ("/api/flow/generate-video", "/api/flow/generate-video-refs"):
+        max_retries = 1  # Lost response does not mean Google rejected the render.
     url = f"{FLOWKIT_API}{endpoint}"
-    for attempt in range(1, max_retries + 1):
+    parked = ParkedBackoff()
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"}
         )
+        req.add_header("X-Request-ID", trace_id.get())
+        trace_emit("tvc.api.attempt", attempt=attempt, endpoint=endpoint, timeout_s=timeout)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 return data
         except urllib.error.HTTPError as err:
+            trace_emit("tvc.api.http_error", status=err.code, attempt=attempt)
             err_body = ""
             try:
                 err_body = err.read().decode("utf-8")
             except Exception:
                 pass
 
+            # A fully parked fleet submitted nothing: wait it out instead of
+            # failing the item after ~10s of 503s. Does not consume an attempt.
+            if parked.wait(err, err_body):
+                attempt -= 1
+                continue
             is_unusual = "UNUSUAL_ACTIVITY" in err_body or "ogiZ0b failed: [13]" in err_body or err.code == 429
             if is_unusual and attempt < max_retries:
                 retry_s = 3.5
@@ -1083,7 +1154,7 @@ def batch_poll_videos_flowkit(
     job_dir: Path,
     on_clip_done: callable = None,
     on_clip_failed: callable = None,
-    max_duration_s: int = 420
+    max_duration_s: int = FLOWKIT_VIDEO_WAIT_SECONDS
 ) -> dict[int, Path]:
     """Centralized Batch Poller Daemon: Polls all pending operations in a single consolidated request.
     
@@ -1095,7 +1166,6 @@ def batch_poll_videos_flowkit(
     completed_clips: dict[int, Path] = {}
     active_ops = dict(pending_ops)
     start_time = time.time()
-    scene_start_times = {s_idx: time.time() for s_idx in active_ops}
     poll_round = 0
     
     if active_ops:
@@ -1118,18 +1188,6 @@ def batch_poll_videos_flowkit(
                     
             for scene_idx, op_name in list(active_ops.items()):
                 curr = results_by_name.get(op_name)
-                # Per-scene timeout check: 300s max per scene
-                elapsed_sc = time.time() - scene_start_times.get(scene_idx, start_time)
-                if elapsed_sc > 300:
-                    print(f"[BATCH POLLER] ⚠️ Scene {scene_idx} timed out after {int(elapsed_sc)}s.")
-                    del active_ops[scene_idx]
-                    if on_clip_failed:
-                        try:
-                            on_clip_failed(scene_idx, f"Quá thời gian render Veo ({int(elapsed_sc)}s). Bấm 'Render lại Video' để thử lại.")
-                        except Exception as fb_err:
-                            print(f"[BATCH POLLER] Failed callback error for scene {scene_idx}: {fb_err}")
-                    continue
-
                 if not curr:
                     continue
                 status = curr.get("status")
@@ -1196,17 +1254,20 @@ def batch_poll_videos_flowkit(
 def generate_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int, job_id: str = None, duration_s: int = 8) -> str:
     """Fallback single-scene video generator (used for single scene regeneration)."""
     op_name = submit_video_flowkit(keyframe_mid, motion_prompt, scene_idx, job_id=job_id, duration_s=duration_s)
-    for poll_idx in range(75): # up to 300s (~5 mins)
+    started = time.monotonic()
+    poll_idx = 0
+    while time.monotonic() - started < FLOWKIT_VIDEO_WAIT_SECONDS:
+        poll_idx += 1
         time.sleep(4)
         poll_body = {"operations": [{"operation": {"name": op_name}}]}
         try:
             p_data = call_flowkit_api("/api/flow/check-status", poll_body, timeout=30, job_id=job_id)
-            curr = (p_data.get("operations") or [{}])[0]
+            curr = (p_data.get("operations") or (p_data.get("data") or {}).get("operations") or [{}])[0]
             status = curr.get("status")
             metadata = (curr.get("operation") or {}).get("metadata", {})
             fife = metadata.get("video", {}).get("fifeUrl")
             if poll_idx % 15 == 0:
-                print(f"[VEO POLL] Scene {scene_idx} ({op_name[:12]}...): loop {poll_idx}/75, status={status}")
+                print(f"[VEO POLL] Scene {scene_idx} ({op_name[:12]}...): loop {poll_idx}, status={status}")
             if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL" or fife:
                 print(f"[VEO DONE] Scene {scene_idx} completed after {poll_idx * 4}s!")
                 return fife
@@ -1216,7 +1277,7 @@ def generate_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int
             if "Veo render failed" in str(e):
                 raise
             continue
-    raise TimeoutError(f"Veo video scene {scene_idx} timed out after 300s")
+    raise TimeoutError(f"Veo video scene {scene_idx} timed out after {FLOWKIT_VIDEO_WAIT_SECONDS}s")
 
 GROK_VOICE_CONFIGS = {
     "female_north": {
@@ -1416,8 +1477,8 @@ def generate_video_grok(
     voice_key: str = ""
 ) -> Path:
     """Generate a single video clip from Keyframe using xAI Grok Imagine Video via NOVA Gateway."""
-    base_url = os.environ.get("NOVA_BASE_URL", "https://novagateway.net").rstrip("/")
-    api_key = os.environ.get("NOVA_API_KEY", "")
+    base_url = os.environ.get("NOVA_BASE_URL", NOVA_BASE_URL).rstrip("/")
+    api_key = os.environ.get("NOVA_API_KEY", NOVA_API_KEY)
     
     if not keyframe_path or not keyframe_path.exists():
         raise FileNotFoundError(f"Keyframe file not found for scene {scene_idx}: {keyframe_path}")
@@ -3139,15 +3200,7 @@ def run_scene_regeneration_worker(
                     "message": f"Veo 3.1 đang render lại Video Cảnh {scene_id} ({scene_duration}s)..."
                 }
             )
-            try:
-                video_fife = generate_video_flowkit(kf_mid, sc["video_motion_prompt"], scene_id, job_id=job_id, duration_s=scene_duration)
-            except Exception as e_veo:
-                if kf_path.exists():
-                    print(f"Veo error: {e_veo}. Uploading fresh keyframe image to FlowKit...")
-                    fresh_mid = upload_to_flowkit(kf_path, job_id=job_id)
-                    video_fife = generate_video_flowkit(fresh_mid, sc["video_motion_prompt"], scene_id, job_id=job_id, duration_s=scene_duration)
-                else:
-                    raise e_veo
+            video_fife = generate_video_flowkit(kf_mid, sc["video_motion_prompt"], scene_id, job_id=job_id, duration_s=scene_duration)
 
             urllib.request.urlretrieve(video_fife, str(clip_path))
 
@@ -3448,11 +3501,11 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             data = {
                 "ok": True,
                 "active_workers": max(1, workers_count),
-                "max_concurrency": max(15, workers_count * 15),
-                "default_threads": 15,
+                "max_concurrency": max(20, workers_count * 20),
+                "default_threads": 20,
                 "min_threads": 1,
-                "max_threads": 45,
-                "recommended_threads": 20,
+                "max_threads": 60,
+                "recommended_threads": 25,
                 "description": "Số luồng xử lý song song tối ưu cho cụm Google AI."
             }
             self.send_response(200)
@@ -4330,8 +4383,43 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             bid = data.get("batch_id")
+            if data.get("all_failed") is True:
+                with bis._batch_lock(bid):
+                    batch = bis.BATCH_JOBS.get(bid, {})
+                    items = batch.get("items", [])
+                    busy = any(v.get("status") not in {"FAILED", "COMPLETED"}
+                               or v.get("video_status") in {"SUBMITTING", "RENDERING", "GENERATING"}
+                               for v in items)
+                    retry_items = [v for v in items if v.get("status") == "FAILED" and v.get("retry_safe") is not False]
+                    if busy or not retry_items:
+                        self.send_response(409)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"ok": False, "error": "Batch đang chạy hoặc không có ảnh đủ điều kiện thử lại."}).encode("utf-8"))
+                        return
+                    for item in retry_items:
+                        item["status"] = "PENDING"
+                    batch["queue_version"] = 1
+                    bis.save_batch_job(bid)
+                    threading.Thread(target=bis.start_batch_pipeline, args=(bid,), daemon=True).start()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "item_ids": [v["item_id"] for v in retry_items]}).encode("utf-8"))
+                return
             item_id = int(data.get("item_id", 1))
-            threading.Thread(target=bis.execute_single_item, args=(bid, item_id), daemon=True).start()
+            item = next((v for v in bis.BATCH_JOBS.get(bid, {}).get("items", []) if v.get("item_id") == item_id), None)
+            if not item or item.get("status") != "FAILED" or item.get("retry_safe") is False:
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": "Cần kiểm tra kết quả hiện có trước khi tạo lại ảnh."}).encode("utf-8"))
+                return
+            with bis._batch_lock(bid):
+                item["status"] = "PENDING"
+                bis.BATCH_JOBS[bid]["queue_version"] = 1
+                bis.save_batch_job(bid)
+            threading.Thread(target=bis.start_batch_pipeline, args=(bid,), daemon=True).start()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -4348,7 +4436,11 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             bid = data.get("batch_id")
             item_id = int(data.get("item_id", 1))
             prompt = data.get("motion_prompt", "")
-            threading.Thread(target=bis.transfer_item_to_video, args=(bid, item_id, prompt), daemon=True).start()
+            if not bis.queue_batch_video(bid, item_id, prompt):
+                self.send_response(409)
+                self.end_headers()
+                self.wfile.write(b'Video already active or requires reconciliation.')
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -5216,8 +5308,7 @@ HTML_UI = r"""<!DOCTYPE html>
                     <div>
                         <label style="font-size: 12px; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">⚡ Tốc Độ Xử Lý:</label>
                         <select id="selBatchConcurrency">
-                            <option value="5" selected>5 ảnh / lượt (Ổn định)</option>
-                            <option value="10">10 ảnh / lượt (Tốc độ cao)</option>
+                            <option value="5" selected>Tự động — xếp lượt công bằng</option>
                         </select>
                     </div>
                 </div>
@@ -5328,8 +5419,7 @@ HTML_UI = r"""<!DOCTYPE html>
                     <div>
                         <label style="font-size: 12px; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">⚡ Tốc Độ Xử Lý:</label>
                         <select id="selOutfitConcurrency">
-                            <option value="5" selected>5 ảnh / lượt (Ổn định)</option>
-                            <option value="10">10 ảnh / lượt (Tốc độ cao)</option>
+                            <option value="5" selected>Tự động — xếp lượt công bằng</option>
                         </select>
                     </div>
                 </div>
@@ -5388,6 +5478,10 @@ HTML_UI = r"""<!DOCTYPE html>
                 <div style="background: #78350f; border: 1px solid #d97706; padding: 10px; border-radius: 8px; text-align: center;">
                     <div style="font-size: 11px; color: #fde68a;">Đang Xử Lý</div>
                     <div id="batchStatRunning" style="font-size: 18px; font-weight: 800; color: #fbbf24;">0</div>
+                </div>
+                <div style="background: #0f172a; border: 1px solid #334155; padding: 10px; border-radius: 8px; text-align: center;">
+                    <div style="font-size: 11px; color: #94a3b8;">Chờ Lượt</div>
+                    <div id="batchStatWaiting" style="font-size: 18px; font-weight: 800; color: #fff;">0</div>
                 </div>
                 <div style="background: #450a0a; border: 1px solid #b91c1c; padding: 10px; border-radius: 8px; text-align: center;">
                     <div style="font-size: 11px; color: #fca5a5;">Thất Bại</div>
@@ -5846,6 +5940,7 @@ HTML_UI = r"""<!DOCTYPE html>
                 document.getElementById('batchStatDone').innerText = s.completed || 0;
                 document.getElementById('batchStatRunning').innerText = s.processing || 0;
                 document.getElementById('batchStatFailed').innerText = s.failed || 0;
+                document.getElementById('batchStatWaiting').innerText = (s.pending || 0) + (s.video_pending || 0);
 
                 renderBatchGallery(b);
 
@@ -5907,8 +6002,8 @@ HTML_UI = r"""<!DOCTYPE html>
                             </div>
                         ` : (hasImg ? `
                             <div style="margin-top:4px;">
-                                ${item.video_status === 'RENDERING' || item.video_status === 'SUBMITTING' ? `
-                                    <div style="font-size:11px;color:#fbbf24;text-align:center;padding:6px;background:#1e1b4b;border-radius:6px;">⏳ Veo 3.1 đang render video 8s...</div>
+                                ${['QUEUED', 'RENDERING', 'SUBMITTING'].includes(item.video_status) ? `
+                                    <div style="font-size:11px;color:#fbbf24;text-align:center;padding:6px;background:#1e1b4b;border-radius:6px;">⏳ ${item.video_status === 'QUEUED' ? 'Video đang chờ lượt' : 'Veo 3.1 đang xử lý video 8s...'}</div>
                                 ` : `
                                     <button type="button" onclick="transferItemToVideo('${b.batch_id}', ${item.item_id})" style="width:100%;background:#1e293b;border:1px solid #4338ca;color:#c7d2fe;padding:6px 10px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;transition:0.2s;" onmouseover="this.style.background='#312e81'" onmouseout="this.style.background='#1e293b'">
                                         🎬 Tạo Video Veo 3.1 (8s)
@@ -5918,7 +6013,7 @@ HTML_UI = r"""<!DOCTYPE html>
                         ` : '')}
 
                         <!-- Retry button if failed -->
-                        ${item.status === 'FAILED' ? `
+                        ${item.status === 'FAILED' && item.retry_safe !== false ? `
                             <button type="button" onclick="retryBatchItem('${b.batch_id}', ${item.item_id})" style="background:#7f1d1d;border:1px solid #ef4444;color:#fecaca;padding:6px 10px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;margin-top:4px;">
                                 🔄 Thử Lại Lần Nữa
                             </button>
@@ -5931,11 +6026,15 @@ HTML_UI = r"""<!DOCTYPE html>
 
         async function retryBatchItem(batchId, itemId) {
             try {
-                await fetch('/api/batch/retry', {
+                const response = await fetch('/api/batch/retry', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ batch_id: batchId, item_id: itemId })
                 });
+                if (!response.ok) {
+                    const detail = await response.json();
+                    throw new Error(detail.error || 'Không thể thử lại tác vụ này.');
+                }
                 pollBatchStatus(batchId);
             } catch (e) {
                 alert('Lỗi khi thử lại: ' + e.message);
@@ -7024,6 +7123,7 @@ if __name__ == "__main__":
                     pass
     print(f"Loaded {len(JOBS)} past jobs from {WORK_DIR}")
     bis.load_all_batch_jobs()
+    bis.batch_scheduler().recover()
     fls.load_all_lookbook_jobs()
 
     # Proxy Health Daemon is already managed by FlowKit API Service (port 8100).

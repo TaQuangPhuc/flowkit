@@ -112,7 +112,7 @@ python3 -c "from agent.config import USE_BATCH_RPC, FLOW_PROJECT_ID; \
 | **429** | Flow API | Rate-limit or quota — backoff; if message mentions QUOTA_REACHED, terminal |
 | **500** | Flow backend **or** extension fetch exception (`background.js:504`) | Transient — retry with backoff |
 | **502** | FastAPI (`agent/api/flow.py:80,92`) | Extension returned error without explicit status — treat as transient |
-| **503** | FastAPI | "Extension not connected" or `NO_FLOW_KEY` — worker re-queues PENDING, waits |
+| **503** | FastAPI | "Extension not connected" or `NO_FLOW_KEY` — worker re-queues PENDING, waits. Also `ALL_WORKERS_PARKED` when every nick is parked — read `Retry-After`, see §C3 |
 | **504** | Agent | 60s WS timeout waiting for extension — transient, re-queue |
 
 Detection lives in `agent/worker/_parsing.py:_is_error`. A result is treated as an error if ANY of these hold:
@@ -165,6 +165,40 @@ Three behaviours on this path routinely look like bugs and are not:
   a retried video request re-polls the render already running instead of paying
   for a second one.
 
+### C3. Fleet-level errors (multi-nick router)
+
+These come from the router in `agent/services/flow_client.py`, not from Flow.
+They are about *which nick* can take the work, so no single request is at fault.
+
+| Error / code | Cause | Auto-handling | Fix |
+|--------------|-------|---------------|-----|
+| `ALL_WORKERS_PARKED` / `all_workers_parked` (503) | Every unpinned nick is parked (`unavailable_until` in the future) after an UNUSUAL_ACTIVITY or auth strike. **Nothing was submitted upstream** | Response carries `retryable: true`, `retry_after_s` and a `Retry-After` header; the studios' `ParkedBackoff` waits it out within a 15-minute budget (`PARKED_RETRY_BUDGET_S`) | Nothing, if one nick is due back — the park is minutes, not seconds. If *all* nicks are parked for 30m repeatedly: check `/health` `workers[]`, then §A `PUBLIC_ERROR_UNUSUAL_ACTIVITY` |
+| `ACCOUNT_AUTH_EXPIRED` incident + `enabled: false` in `agent/accounts.json` | A nick took `AUTH_STRIKES_BEFORE_DISABLE` (3) soft auth failures inside `AUTH_STRIKE_TTL_S` (1h), or one hard 401 | Nick is removed from rotation and an incident is opened. Strikes decay after the TTL, so an isolated failure a day apart no longer accumulates | **Verify before re-login** — see below. If genuinely signed out, sign in on that nick's Flow tab and flip `enabled` back to `true` |
+
+**`ACCOUNT_AUTH_EXPIRED` has a false-positive history — verify from raw evidence.**
+On 22 Sep 2026 four signed-in nicks were auto-disabled because the classifier
+matched the bare substring `401` in a *successful* payload (media uuids like
+`b19701b7-4010-4c0f-9401-…` contain it). The user's "I refreshed the Flow page
+and it looks fine" was correct and the code was wrong. Classification now reads
+`last["error"]` text plus the integer `status`, but the lesson stands: never
+trust the incident's own label. Check, in this order:
+
+1. `.scratch/ext-netlog.jsonl` — per-rpc status for that nick. A real signout is
+   401 on **every** rpcid; an account-level block is 401 on the generation rpcs
+   (`maseQ`, `YhhmEf`) while `StreamChat`/`nzlxg` still answer 200 on the same `f.sid`.
+2. The Flow tab itself. If it loads signed-in, it is not a session problem.
+3. Only then act. An account-level block is not fixed by re-login — take the
+   nick out of rotation and check it by hand in the Flow UI.
+
+**Incidents are a ledger, not a diagnosis.** `GET /api/system/incidents` lists
+them; `POST /api/system/incidents/sweep` runs `CentralWatchdog.run_sweep()`,
+which heals what it can, auto-closes anything unresolved past
+`INCIDENT_STALE_TTL_H` (24h, severity `INFO`, never `ACCOUNT_AUTH_EXPIRED`),
+prunes `flow_operation_replay` / `flow_operation_failover`, and trims
+`server.log` + `.scratch/*.jsonl` past `LOG_MAX_MB`. An OPEN incident with
+`age≈0h` is a live problem being re-recorded each sweep; an old one with no
+matching symptom is ledger residue, so confirm against `/health` before acting.
+
 ### D. YouTube upload errors (`youtube/upload.py`)
 
 | Error | Cause | Fix |
@@ -198,6 +232,8 @@ When the user describes a symptom in plain language, map it here first.
 | Scene images inconsistent across scenes | Check all refs have UUID `media_id` — run `/fk-fix-uuids` |
 | `media_id` starts with `CAMS...` | Run `/fk-fix-uuids` to extract UUID from URL |
 | Upscale fails on every scene | On the batch path upscale is unported (`UNSUPPORTED_ON_BATCH_API`) — no upsampler rpc has been captured. On the legacy path it needs `PAYGATE_TIER_TWO` |
+| 503 `ALL_WORKERS_PARKED` on every call | Whole fleet is parked. Nothing was submitted, so it is safe to wait — honour `Retry-After`. Check `/health` `workers[]` for how many nicks are `enabled` |
+| A nick was auto-disabled / `ACCOUNT_AUTH_EXPIRED` | **Do not re-login on the incident alone** — check `.scratch/ext-netlog.jsonl` per-rpc status and the Flow tab first (§C3). 401 on `maseQ` only, with `StreamChat` at 200, is an account block, not an expired session |
 | Request stuck in PROCESSING > 10 min | Check `error_message` history; if extension dropped, reload it at `chrome://extensions` |
 | "Requested entity was not found" spam | Image URLs expired — re-upload via `POST /api/upload-image` or wait for `_recover_entity_not_found` |
 | Expired signed URLs | Run `/fk-refresh-urls` — on the batch path this re-signs every stored media id through the media rpc |

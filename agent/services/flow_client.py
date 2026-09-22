@@ -15,11 +15,15 @@ Both shape their answers the same way, so everything downstream — the worker's
 parsers, the operation poller, the scene/character updaters — is transport-blind.
 """
 import asyncio
+import base64
 import contextvars
+import copy
 import json
 import logging
 import os
+import random
 import time
+import urllib.request
 import uuid
 from typing import Awaitable, Callable, Optional
 
@@ -29,10 +33,16 @@ from agent.config import (
     VIDEO_MODELS, UPSCALE_MODELS, IMAGE_MODELS, VIDEO_POLL_TIMEOUT,
     USE_BATCH_RPC, FLOW_PROJECT_ID, FLOW_ALLOW_DEGRADED,
     DEFAULT_PAYGATE_TIER, PROFILE_MAX_CONCURRENT,
+    SMART_REPLAY_ENABLED, SMART_REPLAY_TIMEOUT,
+    AUTH_STRIKES_BEFORE_DISABLE,
+    AUTH_STRIKE_TTL_S,
 )
 from agent import config as _config
 from agent.services import flow_batch as fb
 from agent.services.headers import random_headers
+
+from agent.services.video_evidence import transition as video_evidence
+from agent.services.flow_trace import emit as trace_emit, traced, summary as trace_summary, identifier as trace_identifier, fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +64,7 @@ class FlowClient:
     """Sends commands to Chrome extension via WebSocket."""
 
     def __init__(self):
+        self._event_loop = None
         self._extension_ws = None  # Active authenticated extension connection
         self._extensions: dict[object, dict] = {}
         self._pending: dict[str, asyncio.Future] = {}
@@ -66,6 +77,9 @@ class FlowClient:
         self._operation_projects: dict[str, str] = {}
         self._operation_media: dict[str, str] = {}
         self._operation_polls: dict[str, int] = {}
+        self._operation_start_time: dict[str, float] = {}
+        self._operation_results: dict[str, dict] = {}
+        self._operation_poll_tasks: dict[str, asyncio.Task] = {}
         # Which nick created an operation / media id. Poll, get_media, and
         # i2v-after-upload must stay on that Chrome — Flow projects do not
         # exist on another Google account.
@@ -91,8 +105,23 @@ class FlowClient:
         self._profile_semaphores: dict[str, asyncio.Semaphore] = {}
         self._retrying_profiles: set[str] = set()
         self._last_route: Optional[dict] = None
+        self._operation_complaints: dict[str, str] = {}
+        self._profile_dispatched_counts: dict[str, int] = {}
+        self._profile_in_flight: dict[str, int] = {}
+        self._worker_dispatch_locks: dict[str, asyncio.Lock] = {}
+        self._worker_last_video_dispatch: dict[str, float] = {}
+        self._replay_in_progress: set[str] = set()
+        self._unusual_strikes: dict[str, int] = {}
+        self._auth_strikes: dict[str, int] = {}
+        self._auth_strike_ts: dict[str, float] = {}
+        self._replay_watchdogs: set[str] = set()
         self._load_r2v_ops()
         self._load_media_profiles()
+
+    def _worker_dispatch_lock(self, prof_id: str) -> asyncio.Lock:
+        if prof_id not in self._worker_dispatch_locks:
+            self._worker_dispatch_locks[prof_id] = asyncio.Lock()
+        return self._worker_dispatch_locks[prof_id]
 
     def reload_configured_profiles(self) -> None:
         from agent.services.accounts import load_nick_pins
@@ -120,6 +149,10 @@ class FlowClient:
 
     def set_extension(self, ws):
         """Called when extension connects via WS."""
+        try:
+            self._event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         self._extensions[ws] = {
             "connected_at": time.time(),
             "flow_key": None,
@@ -129,6 +162,7 @@ class FlowClient:
             "project_id": None,
             "chat_session_id": None,
             "in_flight": 0,
+            "dispatched_count": 0,
         }
         # A new unauthenticated profile must not displace an already
         # authenticated extension. It becomes active after token_captured.
@@ -300,6 +334,18 @@ class FlowClient:
             pinned = self._operation_profiles.get(operation_id)
             if pinned:
                 return pinned
+            try:
+                from agent.services.flow_failover import get_operation_failover, get_operation_replay
+                fo = get_operation_failover(operation_id)
+                if fo and fo.get("failover_worker_id"):
+                    self._operation_profiles[operation_id] = fo["failover_worker_id"]
+                    return fo["failover_worker_id"]
+                rep = get_operation_replay(operation_id)
+                if rep and rep.get("worker_id"):
+                    self._operation_profiles[operation_id] = rep["worker_id"]
+                    return rep["worker_id"]
+            except Exception:
+                pass
         for mid in media_ids or []:
             pinned = self._media_profiles.get(mid)
             if pinned:
@@ -342,13 +388,44 @@ class FlowClient:
                 if not sid or str(sid).strip().lower() != str(pin).strip().lower():
                     continue
             recency = session.get("token_captured_at") or session.get("connected_at") or 0
+
+            # Check if this worker profile's proxy is currently quarantined or account is disabled
+            is_quar = False
+            if sid:
+                try:
+                    from agent.services.accounts import get_account
+                    from agent.services.proxy_checker import is_quarantined
+                    acc = get_account(sid)
+                    if acc and not acc.get("enabled", True):
+                        continue
+                    if acc and acc.get("proxy_url"):
+                        is_quar = is_quarantined(acc["proxy_url"])
+                except Exception:
+                    pass
+
+            is_avail = (session.get("unavailable_until", 0) <= now) and not is_quar
+            cur_dispatched = max(
+                int(session.get("dispatched_count") or 0),
+                self._profile_dispatched_counts.get(sid, 0) if sid else 0,
+            )
+            cur_in_flight = max(
+                int(session.get("in_flight") or 0),
+                self._profile_in_flight.get(sid, 0) if sid else 0,
+            )
+
+            now_mono = time.monotonic()
+            last_v = self._worker_last_video_dispatch.get(sid, 0.0) if sid else 0.0
+            cooldown_rem = max(0.0, _config.PER_WORKER_VIDEO_COOLDOWN_MIN - (now_mono - last_v)) if sid else 0.0
+
             routes.append({
                 "ws": ws,
                 "profile_id": sid,
                 "project_id": self._session_project(session),
                 "pinned": bool(pin),
-                "available": session.get("unavailable_until", 0) <= now,
-                "in_flight": int(session.get("in_flight") or 0),
+                "available": is_avail,
+                "in_flight": cur_in_flight,
+                "dispatched_count": cur_dispatched,
+                "cooldown_remaining": cooldown_rem,
                 "recency": recency,
             })
         routes.sort(
@@ -357,6 +434,8 @@ class FlowClient:
                 not bool(item["profile_id"]),
                 not bool(item["project_id"]),
                 item["in_flight"],
+                round(item.get("cooldown_remaining", 0.0), 1),
+                item["dispatched_count"],
                 -item["recency"],
             ),
         )
@@ -421,18 +500,25 @@ class FlowClient:
 
     def workers(self) -> list[dict]:
         now = time.time()
+        now_mono = time.monotonic()
         out = []
         for session in self._extensions.values():
+            pid = session.get("profile_id")
+            last_v = self._worker_last_video_dispatch.get(pid, 0.0) if pid else 0.0
+            cooldown_rem = max(0.0, _config.PER_WORKER_VIDEO_COOLDOWN_MIN - (now_mono - last_v)) if pid else 0.0
             out.append({
-                "profile_id": session.get("profile_id"),
+                "profile_id": pid,
                 "project_id": self._session_project(session),
                 "available": session.get("unavailable_until", 0) <= now,
+                "video_cooldown_remaining_s": round(cooldown_rem, 1),
                 "in_flight": int(session.get("in_flight") or 0),
                 "chat_session": bool(session.get("chat_session_id")),
                 "flow_key_present": bool(session.get("flow_key")),
+                "flow_guard_version": session.get("flow_guard_version"),
             })
         return out
 
+    @traced("worker.route")
     async def _run_on_profile(
         self,
         builder: Callable[[str], Awaitable[dict]],
@@ -442,6 +528,7 @@ class FlowClient:
         media_ids: list[str] | None = None,
         operation_id: str | None = None,
         allow_failover: bool = True,
+        video_submission: bool = False,
     ) -> dict:
         """Run ``builder(flow_project_id)`` on one nick.
 
@@ -457,6 +544,11 @@ class FlowClient:
             media_ids=media_ids,
             operation_id=operation_id,
         )
+        owners = {self._media_profiles[mid].casefold() for mid in media_ids or []
+                  if self._media_profiles.get(mid)}
+        if len(owners) > 1 or (owners and pin and str(pin).casefold() not in owners):
+            return {"status": 400, "error_code": "media_profile_mismatch", "retryable": False,
+                    "error": "MEDIA_PROFILE_MISMATCH: reference images must belong to the selected nick; upload references to one profile"}
         self._last_route = None
         if not candidates:
             if pin:
@@ -470,6 +562,31 @@ class FlowClient:
             else:
                 pid = ""
             return await builder(pid)
+
+        # Every unpinned candidate parked means each nick just failed auth or
+        # sits on a quarantined proxy. Dispatching anyway burns the job on a
+        # known-dead session (and hides the real cause behind a Flow error), so
+        # answer 503 and let the worker re-queue until a nick comes back.
+        if not pin and not any(route.get("available") for route in candidates):
+            parked = ", ".join(str(route.get("profile_id") or "?") for route in candidates)
+            # Tell the client how long the park actually lasts. Without it the
+            # studios retried for ~10s against a 30m park and failed the item.
+            waits = [
+                float((self._extensions.get(route.get("ws")) or {}).get("unavailable_until") or 0)
+                for route in candidates
+            ]
+            soonest = min((w for w in waits if w > 0), default=0.0)
+            retry_after = int(max(30, min(soonest - time.time(), 900))) if soonest else 60
+            return {
+                "status": 503,
+                "retryable": True,
+                "error_code": "all_workers_parked",
+                "retry_after_s": retry_after,
+                "error": (
+                    "Extension not connected: every nick is parked "
+                    f"({parked}) — auth expired or proxy quarantined, re-login needed"
+                ),
+            }
 
         last: dict = {"error": "Extension not connected"}
         for index, route in enumerate(candidates):
@@ -487,34 +604,212 @@ class FlowClient:
             # Telemetry & burst tracker
             from agent.services.unusual_audit import get_unusual_audit
             audit_mgr = get_unusual_audit()
-            burst_metrics = audit_mgr.record_request_dispatched(prof_id)
+            burst_metrics = {}
+            from agent.services.accounts import get_account
+            audit_account = get_account(prof_id)
+            audit_proxy_url = audit_account.get("proxy_url", "") if audit_account else ""
+
+            from agent.services.nick_metrics import get_nick_metrics_tracker
+            nick_metrics = get_nick_metrics_tracker()
             t_start = time.time()
 
+            # Reserve worker immediately to prevent load imbalance across concurrent requests
+            if session is not None:
+                session["dispatched_count"] = int(session.get("dispatched_count") or 0) + 1
+            if prof_id:
+                self._profile_dispatched_counts[prof_id] = self._profile_dispatched_counts.get(prof_id, 0) + 1
+                self._profile_in_flight[prof_id] = self._profile_in_flight.get(prof_id, 0) + 1
+
             try:
+                trace_emit("worker.wait", profile_hash=fingerprint(prof_id), attempt=index+1,
+                           candidates=len(candidates), pinned=bool(pin), operation_id=trace_identifier(operation_id))
                 async with self._profile_sema(sema_key):
+                    trace_emit("worker.acquired", profile_hash=fingerprint(prof_id),
+                               queue_ms=round((time.time()-t_start)*1000))
                     if session is not None:
                         session["in_flight"] = int(session.get("in_flight") or 0) + 1
+                        nick_metrics.record_in_flight(prof_id, session["in_flight"])
                     try:
-                        last = await builder(pid)
-                    except Exception as e:
-                        last = _batch_error(e)
+                        if video_submission:
+                            async with self._worker_dispatch_lock(prof_id):
+                                now_m = time.monotonic()
+                                last_disp = self._worker_last_video_dispatch.get(prof_id, 0.0)
+                                # Emulate human pacing: randomized jitter between min and max
+                                cooldown_target = random.uniform(
+                                    _config.PER_WORKER_VIDEO_COOLDOWN_MIN,
+                                    _config.PER_WORKER_VIDEO_COOLDOWN_MAX,
+                                )
+                                wait_s = cooldown_target - (now_m - last_disp)
+                                if wait_s > 0:
+                                    logger.info(
+                                        "Worker %s human jitter video pacing: waiting %.2fs (target: %.2fs in [%.1fs, %.1fs])",
+                                        prof_id, wait_s, cooldown_target,
+                                        _config.PER_WORKER_VIDEO_COOLDOWN_MIN, _config.PER_WORKER_VIDEO_COOLDOWN_MAX,
+                                    )
+                                    await asyncio.sleep(wait_s)
+                                self._worker_last_video_dispatch[prof_id] = time.monotonic()
+                                burst_metrics = audit_mgr.record_request_dispatched(prof_id)
+                                burst_metrics["rpc_in_flight"] = session.get("in_flight", 0) if session else 0
+                                nick_metrics.record_dispatch(prof_id)
+                                try:
+                                    last = await builder(pid)
+                                except Exception as e:
+                                    last = _batch_error(e)
+                        else:
+                            burst_metrics = audit_mgr.record_request_dispatched(prof_id)
+                            burst_metrics["rpc_in_flight"] = session.get("in_flight", 0) if session else 0
+                            nick_metrics.record_dispatch(prof_id)
+                            try:
+                                last = await builder(pid)
+                            except Exception as e:
+                                last = _batch_error(e)
                     finally:
                         if session is not None:
                             session["in_flight"] = max(
                                 0, int(session.get("in_flight") or 1) - 1,
                             )
+                            nick_metrics.record_in_flight(prof_id, session["in_flight"])
             finally:
+                if prof_id:
+                    self._profile_in_flight[prof_id] = max(0, self._profile_in_flight.get(prof_id, 1) - 1)
                 _current_route.reset(token)
 
             duration_ms = int((time.time() - t_start) * 1000)
 
             if isinstance(last, dict):
                 raw_err = str(last.get("error") or last.get("data") or "")
+                # Only the extension emits SUBMISSION_OUTCOME_UNKNOWN, and always
+                # in the error channel. raw_err falls back to the whole data
+                # payload, so matching it there would fail healthy responses —
+                # the bug class that disabled four signed-in nicks on 22 Sep.
+                if last.get("error") and "SUBMISSION_OUTCOME_UNKNOWN" in str(last["error"]):
+                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=raw_err[:200])
+                    return {**last, "retryable": False, "error_code": "upstream_submission_unknown"}
+                if video_submission and last.get("error"):
+                    # A dropped response may hide an accepted render. Only
+                    # explicit pre-submit rejection can safely move/retry it.
+                    safe_rejection = any(marker in raw_err.lower() for marker in (
+                        "no_at_token", "no_flow_tab", "no_flow_key", "no_flow_project",
+                        "extension not connected", "public_error_", "low_priority_only",
+                        "ask_for_permission", "unsupported_on_batch_api",
+                        "_not_submitted", "status=401", "status 401", "status: 401",
+                        "http 401", "401 unauthorized", "unauthorized",
+                        "envelope in response", "flow_page_not_ready",
+                    ))
+                    if not safe_rejection:
+                        nick_metrics.record_completion(prof_id, success=False,
+                                                       latency_ms=duration_ms, error=raw_err[:200])
+                        return {**last, "retryable": False, "error_code": "upstream_submission_unknown"}
+
+                # Classify auth off the error channel and the real status code.
+                # raw_err falls back to the whole data payload, so a bare "401"
+                # substring test matched healthy responses whose media and
+                # operation uuids happen to contain those digits — that is what
+                # disabled four signed-in nicks on 22 Sep.
+                err_text = str(last.get("error") or "")
+                status_code = last.get("status") if isinstance(last.get("status"), int) else None
+                low_err = err_text.lower()
+                hard_401 = status_code == 401 or any(m in low_err for m in (
+                    "status=401", "status 401", "status: 401", "http 401",
+                    "401 unauthorized", "unauthorized",
+                ))
+                is_auth_error = bool(err_text) and (hard_401 or any(m in low_err for m in (
+                    "no_at_token", "envelope in response",
+                )))
+                if is_auth_error and session is not None:
+                    # A real 401 means the Google session is dead — parking in
+                    # 30m loops just spams retries. Disable the account until
+                    # the user re-logs in and re-enables it. Tab-side issues
+                    # (no_at_token, destroyed context) stay a 30m park.
+                    if hard_401:
+                        try:
+                            from agent.services.accounts import upsert_account
+                            acc = get_account(prof_id)
+                            if acc and acc.get("enabled", True):
+                                acc["enabled"] = False
+                                upsert_account(acc)
+                                logger.warning(
+                                    "Account %s disabled after 401 — needs Google re-login",
+                                    prof_id,
+                                )
+                                try:
+                                    from agent.services.incident_manager import get_incident_manager
+                                    get_incident_manager().record_incident(
+                                        module="worker",
+                                        job_id=prof_id,
+                                        severity="CRITICAL",
+                                        error_code="ACCOUNT_AUTH_EXPIRED",
+                                        message=(
+                                            f"{prof_id} returned 401 — Google session expired; "
+                                            "account disabled until re-login"
+                                        ),
+                                        root_cause="Google auth session rejected by upstream (401)",
+                                        action_taken="ACCOUNT_DISABLED",
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception as dis_exc:
+                            logger.warning("Could not disable %s after 401: %s", prof_id, dis_exc)
+                    else:
+                        session["unavailable_until"] = max(session.get("unavailable_until", 0), time.time() + 1800)
+                        # A soft auth failure hides its status code: the batch
+                        # envelope is simply absent because the page answered a
+                        # sign-in redirect. One is transient; a run of them on
+                        # the same nick is the same dead session a hard 401
+                        # reports, so escalate instead of re-parking forever.
+                        now_s = time.time()
+                        if now_s - self._auth_strike_ts.get(prof_id, 0.0) > AUTH_STRIKE_TTL_S:
+                            strikes = 1  # previous run aged out
+                        else:
+                            strikes = self._auth_strikes.get(prof_id, 0) + 1
+                        self._auth_strikes[prof_id] = strikes
+                        self._auth_strike_ts[prof_id] = now_s
+                        logger.warning(
+                            "Auth / 401 failure on %s: %s; marked unavailable for 30m (strike %d)",
+                            prof_id, raw_err[:120], strikes,
+                        )
+                        if strikes >= AUTH_STRIKES_BEFORE_DISABLE:
+                            try:
+                                from agent.services.accounts import upsert_account
+                                acc = get_account(prof_id)
+                                if acc and acc.get("enabled", True):
+                                    acc["enabled"] = False
+                                    upsert_account(acc)
+                                    logger.warning(
+                                        "Account %s disabled after %d auth failures — needs Google re-login",
+                                        prof_id, strikes,
+                                    )
+                                    try:
+                                        from agent.services.incident_manager import get_incident_manager
+                                        get_incident_manager().record_incident(
+                                            module="worker",
+                                            job_id=prof_id,
+                                            severity="CRITICAL",
+                                            error_code="ACCOUNT_AUTH_EXPIRED",
+                                            message=(
+                                                f"{prof_id} failed auth {strikes}x in a row "
+                                                "(no rpc envelope — signed-out page); "
+                                                "account disabled until re-login"
+                                            ),
+                                            root_cause=(
+                                                "Flow tab answers a sign-in redirect instead of the "
+                                                "batch envelope; the Google session is gone"
+                                            ),
+                                            action_taken="ACCOUNT_DISABLED",
+                                        )
+                                    except Exception:
+                                        pass
+                            except Exception as dis_exc:
+                                logger.warning("Could not disable %s after auth failures: %s", prof_id, dis_exc)
                 
                 # Check for successful RPC
                 if not last.get("error") and (
                     not isinstance(last.get("status"), int) or last["status"] < 400
                 ):
+                    nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms)
+                    self._unusual_strikes.pop(prof_id, None)
+                    self._auth_strikes.pop(prof_id, None)
+                    self._auth_strike_ts.pop(prof_id, None)
                     from agent.services.accounts import get_account
                     acc = get_account(prof_id)
                     p_url = acc.get("proxy_url", "") if acc else ""
@@ -552,10 +847,14 @@ class FlowClient:
                         from agent.services.proxy_pool import rotate_nick_proxy
                         rot_res = await rotate_nick_proxy(prof_id, preflight=True)
                         rotation_info["rotation_triggered"] = True
+                        if not rot_res.get("ok"):
+                            last["proxy_rotated"] = False
+                            last["retryable"] = True
+                            last["message"] = "UNUSUAL_ACTIVITY: chưa đổi được proxy; giữ đường hiện tại."
+                            raise RuntimeError(rot_res.get("error") or "PROXY_ROTATION_FAILED")
                         rotation_info["new_proxy"] = rot_res.get("proxy")
-                        if rot_res.get("proxy"):
-                            p_clean = rot_res["proxy"].split("@")[-1]
-                            rotation_info["new_proxy_ip"] = p_clean.split(":")[0] if ":" in p_clean else p_clean
+                        rotation_info["new_proxy_ip"] = rot_res.get("egress_ip")
+                        rotation_info["flow_tab_reloaded"] = bool(rot_res.get("flow_tab_reloaded"))
 
                         last["proxy_rotated"] = True
                         last["new_proxy"] = rot_res.get("proxy")
@@ -571,50 +870,16 @@ class FlowClient:
                             self._retrying_profiles = set()
                             retrying = self._retrying_profiles
 
-                        if prof_id not in retrying:
+                        if prof_id not in retrying and not video_submission:
                             retrying.add(prof_id)
                             try:
                                 logger.info(
                                     "Auto-retrying request for %s on new proxy %s...",
                                     prof_id, rot_res.get("proxy"),
                                 )
-                                # Reload Flow tab in Chrome so reCAPTCHA Enterprise and session tokens
-                                # are re-evaluated cleanly on the new proxy IP.
-                                token_route = _current_route.set(route)
-                                try:
-                                    logger.info("Requesting Chrome extension to reload Flow tab for %s...", prof_id)
-                                    reload_res = await self._send("reload_flow_tab", {}, timeout=20)
-                                    logger.info("Reload Flow tab response for %s: %s", prof_id, reload_res)
-                                    rotation_info["flow_tab_reloaded"] = bool(
-                                        reload_res and reload_res.get("result", {}).get("ok")
-                                    )
-                                except Exception as rel_err:
-                                    logger.warning("Could not reload Flow tab on %s: %s", prof_id, rel_err)
-                                    rotation_info["flow_tab_reloaded"] = False
-                                    rotation_info["flow_tab_reload_error"] = str(rel_err)
-                                finally:
-                                    _current_route.reset(token_route)
-
-                                # Settle delay after page reload (extension already waited 3.5s)
-                                await asyncio.sleep(0.5)
-
-                                # Pre-flight test: verify 1 live reCAPTCHA Enterprise token can be minted on the new proxy
-                                token_probe = _current_route.set(route)
-                                try:
-                                    logger.info("Pre-flight testing reCAPTCHA Enterprise token on new proxy for %s...", prof_id)
-                                    probe_res = await self._send("solve_captcha", {"captchaAction": "FLOW_PROBE"}, timeout=15)
-                                    probe_data = probe_res.get("result") or probe_res or {}
-                                    if probe_data.get("token"):
-                                        logger.info("✅ reCAPTCHA Enterprise test probe PASSED on %s (len: %d)!", prof_id, len(probe_data["token"]))
-                                        rotation_info["recaptcha_token_verified"] = True
-                                    else:
-                                        logger.warning("⚠️ reCAPTCHA Enterprise test probe failed on %s: %s", prof_id, probe_data.get("error"))
-                                        rotation_info["recaptcha_token_verified"] = False
-                                except Exception as probe_err:
-                                    logger.warning("reCAPTCHA test probe error on %s: %s", prof_id, probe_err)
-                                    rotation_info["recaptcha_token_verified"] = False
-                                finally:
-                                    _current_route.reset(token_probe)
+                                # Proxy rotation owns the drain/reload/resume transaction.
+                                # An additional reload here could disrupt newly resumed work.
+                                rotation_info["flow_tab_reloaded"] = bool(rot_res.get("flow_tab_reloaded"))
 
                                 token_retry = _current_route.set(route)
                                 try:
@@ -638,7 +903,9 @@ class FlowClient:
                                         or retry_last["status"] < 400
                                     ):
                                         logger.info("Auto-retry on new proxy SUCCEEDED for %s!", prof_id)
+                                        nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms)
                                         rotation_info["retry_success"] = True
+                                        self._unusual_strikes.pop(prof_id, None)
                                         audit_mgr.record_unusual_event(
                                             worker_id=prof_id,
                                             rpc_id=rpc_id,
@@ -647,12 +914,14 @@ class FlowClient:
                                             call_duration_ms=duration_ms,
                                             payload_summary={"project_id": pid},
                                             rotation_info=rotation_info,
+                                            proxy_url=audit_proxy_url,
                                         )
                                         audit_mgr.record_request_success(prof_id, rot_res.get("proxy_url", ""))
                                         return retry_last
 
                                     rotation_info["retry_success"] = False
                                     rotation_info["retry_error"] = str(retry_last.get("error") or "")[:200]
+                                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error="UNUSUAL_ACTIVITY_RETRY_FAILED")
                                     last = retry_last
                                     last["proxy_rotated"] = True
                                     last["new_proxy"] = rot_res.get("proxy")
@@ -668,6 +937,7 @@ class FlowClient:
                     except Exception as rot_exc:
                         logger.error("Auto-rotation failed for %s: %s", prof_id, rot_exc)
                         rotation_info["rotation_error"] = str(rot_exc)
+                        nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=str(rot_exc))
 
                     # Persist full audit record
                     audit_mgr.record_unusual_event(
@@ -678,7 +948,43 @@ class FlowClient:
                         call_duration_ms=duration_ms,
                         payload_summary={"project_id": pid},
                         rotation_info=rotation_info,
+                        proxy_url=audit_proxy_url,
                     )
+
+                    # Worker-level circuit breaker: every flag already rotates
+                    # the proxy, so a repeat flag means the fresh IP failed too
+                    # — that is an account/session trust problem, not an IP
+                    # problem. Park the worker so unpinned work routes to other
+                    # nicks while the session recovers; escalate to a re-login
+                    # incident instead of burning more proxy sessions.
+                    strikes = self._unusual_strikes.get(prof_id, 0) + 1
+                    self._unusual_strikes[prof_id] = strikes
+                    cooldown_s = 300 if strikes < 2 else 1800
+                    if session is not None:
+                        session["unavailable_until"] = max(
+                            session.get("unavailable_until", 0),
+                            time.time() + cooldown_s,
+                        )
+                    if strikes >= 2:
+                        try:
+                            from agent.services.incident_manager import get_incident_manager
+                            get_incident_manager().record_incident(
+                                module="worker",
+                                job_id=prof_id,
+                                severity="CRITICAL",
+                                error_code="ACCOUNT_SESSION_FLAGGED",
+                                message=(
+                                    f"{prof_id} flagged UNUSUAL_ACTIVITY {strikes}x in a row "
+                                    "across rotated proxies — Google account session needs re-login"
+                                ),
+                                root_cause=(
+                                    "reCAPTCHA trust failure persists on fresh verified IPs; "
+                                    "the flag follows the Google session, not the proxy"
+                                ),
+                                action_taken=f"WORKER_PAUSED_{cooldown_s}S",
+                            )
+                        except Exception:
+                            pass
 
                 elif ("failed: [13]" in raw_err or "ogiz0b failed: [13]" in raw_err.lower()) and not getattr(self, "_in_retry_13", False):
                     prof_id = route.get("profile_id") or "worker"
@@ -700,14 +1006,19 @@ class FlowClient:
                                 or retry_last["status"] < 400
                             ):
                                 logger.info("Auto-retry on RPC [13] SUCCEEDED for %s!", prof_id)
+                                nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms)
                                 return retry_last
                             last = retry_last
+                            nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error="RPC_13_RETRY_FAILED")
                         finally:
                             _current_route.reset(token_retry)
                     except Exception as r13_exc:
                         logger.error("Auto-retry on RPC [13] failed for %s: %s", prof_id, r13_exc)
+                        nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=str(r13_exc))
                     finally:
                         self._in_retry_13 = False
+                elif raw_err:
+                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=raw_err[:200])
 
 
             has_alternative = index + 1 < len(candidates)
@@ -744,12 +1055,25 @@ class FlowClient:
             "no_at_token",
             "flow_tab_discarded",
             "no current window",
+            "frame with id 0",
+            "execution context was destroyed",
+            "target closed",
+            "session closed",
             "extension not connected",
             "extension disconnected",
             "extension_switched",
             "public_error_per_model_daily_quota_reached",
             "public_error_user_quota_reached",
+            "public_error_unusual_activity",
             "failed: [13]",
+            "failed: [14]",
+            "status=401",
+            "status 401",
+            "status: 401",
+            "401",
+            "unauthorized",
+            "envelope in response",
+            "flow_page_not_ready",
         ))
 
     def set_flow_key(self, key: str):
@@ -807,6 +1131,7 @@ class FlowClient:
                 "yes" if data.get("flowKeyPresent") or session.get("flow_key") else "no",
             )
             if data.get("type") == "extension_ready":
+                session["flow_guard_version"] = data.get("flowGuardVersion")
                 asyncio.create_task(self._sync_tier())
             if not session.get("chat_session_id"):
                 pid = self._session_project(session)
@@ -1086,6 +1411,22 @@ class FlowClient:
                     refreshed, len(targets), project_id[:12])
         return {"refreshed": refreshed, "found": len(targets)}
 
+    async def profile_control(self, profile_id: str, method: str, params: dict, timeout: float = 75) -> dict:
+        """Control exactly one extension, never fail over to another nick."""
+        for ws, session in list(self._extensions.items()):
+            if session.get("profile_id") != profile_id:
+                continue
+            if method in {"prepare_proxy_rotation", "finish_proxy_rotation"} and not session.get("flow_guard_version"):
+                return {"ok": False, "error": "EXTENSION_UPDATE_REQUIRED"}
+            token = _current_route.set({"ws": ws, "profile_id": profile_id})
+            try:
+                response = await self._send(method, params, timeout=timeout)
+                return response.get("result") or {"ok": False, "error": response.get("error", "EXTENSION_CONTROL_FAILED")}
+            finally:
+                _current_route.reset(token)
+        return {"ok": False, "error": "EXTENSION_NOT_CONNECTED"}
+
+    @traced("extension.request")
     async def _send(self, method: str, params: dict, timeout: float = 300) -> dict:
         """Send request to extension and wait for response.
 
@@ -1093,6 +1434,11 @@ class FlowClient:
         must check result.get("error") or use _is_ws_error() before reading data.
         Never raises; exceptions are caught and returned as error dicts.
         """
+        if method == "api_request" and isinstance(params.get("body"), dict):
+            for request in params["body"].get("requests", []):
+                model = request.get("videoModelKey")
+                if model and model not in {fb.VIDEO_MODEL, fb.VIDEO_T2V_MODEL, fb.VIDEO_R2V_MODEL}:
+                    return {"status": 400, "error": "LOW_PRIORITY_ONLY: paid video models are disabled"}
         if not self.connected:
             return {"error": "Extension not connected"}
 
@@ -1119,6 +1465,11 @@ class FlowClient:
             self._extension_ws = extension_ws
             self._flow_key = self._extensions[extension_ws].get("flow_key")
             req_id = str(uuid.uuid4())
+            trace_started = time.monotonic()
+            trace_emit("extension.dispatch", extension_request_id=req_id, method=trace_identifier(method),
+                       rpc_id=trace_identifier(params.get("rpcid")), timeout_s=timeout, attempt=index+1,
+                       profile_hash=fingerprint(self._extensions[extension_ws].get("profile_id")),
+                       pending_count=len(self._pending))
             future = asyncio.get_running_loop().create_future()
             self._pending[req_id] = future
             self._pending_ws[req_id] = extension_ws
@@ -1128,6 +1479,7 @@ class FlowClient:
                     "id": req_id,
                     "method": method,
                     "params": params,
+                    "expiresAt": int((time.time() + timeout - 1) * 1000),
                 }))
                 last_result = await asyncio.wait_for(future, timeout=timeout)
             except asyncio.TimeoutError:
@@ -1135,6 +1487,8 @@ class FlowClient:
             except Exception as e:
                 last_result = {"error": str(e)}
             finally:
+                trace_emit("extension.result", extension_request_id=req_id,
+                           elapsed_ms=round((time.monotonic()-trace_started)*1000), result=trace_summary(last_result))
                 self._pending.pop(req_id, None)
                 self._pending_ws.pop(req_id, None)
 
@@ -1205,6 +1559,7 @@ class FlowClient:
             params["path"] = path
         return await self._send("batch_rpc", params, timeout=timeout)
 
+    @traced("rpc.parse")
     async def _batch_payload(self, rpcid: str | None, freq: str,
                              captcha_action: str | None = None,
                              timeout: float = 300,
@@ -1256,18 +1611,56 @@ class FlowClient:
         """
         if not operation_id:
             return
-        if len(self._operation_projects) > 512:
-            self._operation_projects.clear()
-            self._operation_media.clear()
-            self._operation_polls.clear()
-            self._operation_profiles.clear()
-            self._operation_chat_sessions.clear()
-            self._operation_ref_ids.clear()
+        clean_id = operation_id.removeprefix("operations/") if isinstance(operation_id, str) else operation_id
+        if len(self._operation_projects) > 2048:
+            # Evict old finished operations, never erase pins for active renders.
+            for old_id in list(self._operation_results)[:128]:
+                for key in (old_id, f"operations/{old_id}"):
+                    for cache in (self._operation_projects, self._operation_media,
+                                  self._operation_polls, self._operation_start_time,
+                                  self._operation_profiles, self._operation_chat_sessions,
+                                  self._operation_ref_ids, self._operation_results):
+                        cache.pop(key, None)
+        self._operation_start_time.setdefault(clean_id, time.time())
+        op_prefixed = f"operations/{clean_id}"
+        self._operation_projects[clean_id] = project_id
+        self._operation_projects[op_prefixed] = project_id
         self._operation_projects[operation_id] = project_id
         route = _current_route.get()
         if route and route.get("profile_id"):
+            self._operation_profiles[clean_id] = route["profile_id"]
+            self._operation_profiles[op_prefixed] = route["profile_id"]
             self._operation_profiles[operation_id] = route["profile_id"]
+        trace_emit("operation.bound", operation_id=trace_identifier(clean_id),
+                   project_id=trace_identifier(project_id), profile_hash=fingerprint(self._operation_profiles.get(clean_id)))
         self._save_r2v_ops()
+        self._schedule_replay_watchdog(clean_id)
+
+    def _schedule_replay_watchdog(self, clean_id: str) -> None:
+        """Fire smart replay on a timer — poll-driven triggers starve when the
+        client polls sparsely, which is exactly the stalled-render case."""
+        if not SMART_REPLAY_ENABLED or not clean_id or clean_id in self._replay_watchdogs:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._replay_watchdogs.add(clean_id)
+        asyncio.create_task(self._replay_watchdog(clean_id))
+
+    async def _replay_watchdog(self, clean_id: str) -> None:
+        try:
+            await asyncio.sleep(SMART_REPLAY_TIMEOUT)
+            from agent.services.flow_failover import get_failover_target
+            if get_failover_target(clean_id) or clean_id in self._replay_in_progress:
+                return
+            done = self._operation_results.get(clean_id) or {}
+            if str(done.get("status", "")).endswith(("SUCCESSFUL", "FAILED")):
+                return
+            self._replay_in_progress.add(clean_id)
+            await self._maybe_trigger_smart_replay(clean_id)
+        finally:
+            self._replay_watchdogs.discard(clean_id)
 
     def _remember_media(self, media_id: str, profile_id: str | None = None) -> None:
         """Which nick uploaded or generated this media id."""
@@ -1337,6 +1730,10 @@ class FlowClient:
             media = row.get("media")
             if media:
                 self._operation_media[op_id] = media
+            if row.get("started_at"):
+                self._operation_start_time[op_id] = float(row["started_at"])
+            if isinstance(row.get("result"), dict):
+                self._operation_results[op_id] = row["result"]
 
     def _ops_snapshot(self) -> dict:
         """operation_id → project/session/media so a restart can still poll."""
@@ -1348,6 +1745,8 @@ class FlowClient:
                 "refs": list(self._operation_ref_ids.get(op_id) or ()),
                 "profile": self._operation_profiles.get(op_id) or "",
                 "media": self._operation_media.get(op_id) or "",
+                "started_at": self._operation_start_time.get(op_id),
+                "result": self._operation_results.get(op_id),
             }
         return rows
 
@@ -1452,7 +1851,9 @@ class FlowClient:
                               project_id: str = "", scene_id: str = "",
                               aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
                               end_image_media_id: str = None,
-                              user_paygate_tier: str = "PAYGATE_TIER_TWO") -> dict:
+                              user_paygate_tier: str = "PAYGATE_TIER_TWO",
+                              *,
+                              profile_id: str | None = None) -> dict:
         """Submit i2v (start frame) or t2v (no start frame). Returns operations."""
         start = start_image_media_id or None
         if not USE_BATCH_RPC:
@@ -1471,19 +1872,28 @@ class FlowClient:
 
             async def run_t2v(pid: str):
                 freq = fb.t2v_request(
-                    prompt, pid, aspect=aspect_ratio, model=fb.VIDEO_T2V_MODEL)
+                    prompt, pid, aspect=aspect_ratio, model=fb.VIDEO_T2V_MODEL, count=1)
                 payload = await self._batch_payload(
                     fb.RPC_GEN_T2V, freq, fb.CAPTCHA_VIDEO, timeout=120)
                 operations = fb.read_operations(payload)
                 for operation in operations:
                     self._remember_operation(operation.operation_id, pid)
+                    submitted_media = fb.submitted_video_media(payload, operation.operation_id, pid)
+                    if submitted_media:
+                        self._operation_media[operation.operation_id] = submitted_media
+                        self._remember_media(submitted_media)
+                        self._save_r2v_ops()
+                    video_evidence('submit', operation.operation_id, 'handle_received', payload=payload,
+                                   project_id=pid, reference_media_ids=[],
+                                   profile_hash=fingerprint((_current_route.get() or {}).get('profile_id')))
                 return {"status": 200, "data": {
                     "operations": [_as_pending_operation(op.operation_id) for op in operations]
                 }}
 
             try:
                 return await self._run_on_profile(
-                    run_t2v, project_id, allow_failover=True)
+                    run_t2v, project_id, profile_id=profile_id, allow_failover=True,
+                    video_submission=True)
             except Exception as e:
                 return _batch_error(e)
 
@@ -1509,20 +1919,31 @@ class FlowClient:
                 fb.RPC_GEN_VIDEO, freq, fb.CAPTCHA_VIDEO, timeout=120)
             operation = fb.read_operation(payload)
             self._remember_operation(operation.operation_id, pid)
+            submitted_media = fb.submitted_video_media(payload, operation.operation_id, pid)
+            if submitted_media:
+                self._operation_media[operation.operation_id] = submitted_media
+                self._remember_media(submitted_media)
+                self._save_r2v_ops()
+            video_evidence('submit', operation.operation_id, 'handle_received', payload=payload,
+                           project_id=pid, reference_media_id=start,
+                           profile_hash=fingerprint((_current_route.get() or {}).get('profile_id')))
             return {"status": 200, "data": {
                 "operations": [_as_pending_operation(operation.operation_id)]
             }}
 
         try:
             return await self._run_on_profile(
-                run_i2v, project_id, media_ids=[start], allow_failover=True)
+                run_i2v, project_id, profile_id=profile_id, media_ids=[start], allow_failover=True,
+                video_submission=True)
         except Exception as e:
             return _batch_error(e)
 
     async def generate_video_from_references(self, reference_media_ids: list[str],
                                               prompt: str, project_id: str, scene_id: str,
                                               aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
-                                              user_paygate_tier: str = "PAYGATE_TIER_TWO") -> dict:
+                                              user_paygate_tier: str = "PAYGATE_TIER_TWO",
+                                              *,
+                                              profile_id: str | None = None) -> dict:
         """Generate video from multiple reference images (r2v)."""
         if not USE_BATCH_RPC:
             return await self._legacy_generate_video_from_references(
@@ -1538,14 +1959,11 @@ class FlowClient:
             # StreamChat has no model slot. Without this setting the
             # Ingredients agent picks Omni Flash (~15 credits) and stalls on
             # ask_for_permission. Captured Kcr7Ub pins lite_low_priority (free).
-            settings = await self.batch_rpc(
+            await self._batch_payload(
                 fb.RPC_PROJECT_SETTINGS,
                 fb.set_video_defaults_request(pid, aspect=aspect_ratio),
                 timeout=45,
             )
-            if settings.get("error"):
-                raise fb.FlowBatchError(
-                    f"{fb.RPC_PROJECT_SETTINGS}: {settings['error']}")
             # Fresh conversation — a session that already ignored permission
             # keeps picking Omni Flash even after the model pin.
             session = await self._mint_chat_session(pid)
@@ -1560,6 +1978,9 @@ class FlowClient:
             if result.get("error"):
                 raise fb.FlowBatchError(f"StreamChat: {result['error']}")
             raw = result.get("data") or ""
+            if "ask_for_permission" in raw:
+                return {"status": 400, "error": "LOW_PRIORITY_ONLY: ask_for_permission; paid generation was not approved"}
+            chunks = []
             try:
                 chunks = fb.payloads(raw)
                 operation = fb.read_stream_chat_operation(
@@ -1580,6 +2001,9 @@ class FlowClient:
                 logger.warning("r2v StreamChat had no uuid; polling via session %s", session)
                 op_id = session
             self._remember_operation(op_id, pid)
+            video_evidence('submit', op_id, 'handle_received', payload=chunks,
+                           project_id=pid, reference_media_ids=refs, session_id=trace_identifier(session),
+                           profile_hash=fingerprint((_current_route.get() or {}).get('profile_id')))
             if session and session != fb.CHAT_SESSION_SLOT:
                 self._operation_chat_sessions[op_id] = session
             self._operation_ref_ids[op_id] = tuple(refs)
@@ -1592,7 +2016,8 @@ class FlowClient:
 
         try:
             return await self._run_on_profile(
-                run, project_id, media_ids=refs, allow_failover=True)
+                run, project_id, profile_id=profile_id, media_ids=refs, allow_failover=True,
+                video_submission=True)
         except Exception as e:
             logger.error("[DEBUG] r2v StreamChat failed: %s", e)
             return _batch_error(e)
@@ -1644,92 +2069,339 @@ class FlowClient:
         return {"status": 200, "data": {"operations": out}}
 
     async def _poll_batch_operation(self, operation_id: str) -> dict:
-        async def run(_pid: str):
-            return await self._poll_batch_operation_inner(operation_id)
-
-        result = await self._run_on_profile(
-            run,
-            self._operation_projects.get(operation_id) or "",
-            operation_id=operation_id,
-            allow_failover=False,
-        )
-        if isinstance(result, dict) and result.get("error") and "operation" not in result:
-            return _as_pending_operation(operation_id, error=result["error"])
+        """Coalesce concurrent polls; a browser disconnect must not cancel the poll."""
+        clean_id = operation_id.removeprefix("operations/")
+        task = self._operation_poll_tasks.get(clean_id)
+        if task is None:
+            task = asyncio.create_task(self._poll_batch_operation_once(clean_id))
+            self._operation_poll_tasks[clean_id] = task
+            def finished(done):
+                if self._operation_poll_tasks.get(clean_id) is done:
+                    self._operation_poll_tasks.pop(clean_id, None)
+            task.add_done_callback(finished)
+        result = copy.deepcopy(await asyncio.shield(task))
+        result.setdefault("operation", {})["name"] = operation_id
         return result
 
-    async def _poll_batch_operation_inner(self, operation_id: str) -> dict:
-        media_id = self._operation_media.get(operation_id)
-        complaint = None
+    @traced("video.poll")
+    async def _poll_batch_operation_once(self, clean_id: str) -> dict:
+        from agent.services.flow_failover import (
+            get_failover_target, get_operation_replay,
+            update_operation_failover, update_operation_replay,
+        )
+        if clean_id in self._operation_results:
+            return self._operation_results[clean_id]
+        # Keep following failovers created before the low-priority fix.
+        target = get_failover_target(clean_id)
+        active_id = target or clean_id
+        if clean_id not in self._operation_start_time:
+            replay = get_operation_replay(clean_id) or {}
+            self._operation_start_time[clean_id] = float(replay.get("created_at") or time.time())
+            if clean_id not in self._operation_projects:
+                p_payload = replay.get("payload") or {}
+                if isinstance(p_payload, str):
+                    try:
+                        p_payload = json.loads(p_payload)
+                    except Exception:
+                        p_payload = {}
+                proj = p_payload.get("project_id")
+                if proj:
+                    self._remember_operation(clean_id, proj)
+            if clean_id not in self._operation_profiles and replay.get("worker_id"):
+                self._operation_profiles[clean_id] = replay["worker_id"]
+        started = self._operation_start_time[clean_id]
+        timeout_budget = min(VIDEO_POLL_TIMEOUT + 180, 480) if target else VIDEO_POLL_TIMEOUT
+        remaining = timeout_budget - (time.time() - started)
+        trace_emit("video.poll.state", operation_id=trace_identifier(clean_id),
+                   media_id=trace_identifier(self._operation_media.get(active_id)),
+                   profile_hash=fingerprint(self._operation_profiles.get(active_id)),
+                   elapsed_s=round(time.time()-started, 3), remaining_s=round(remaining, 3),
+                   round=self._operation_polls.get(active_id, 0))
+        # Even at the deadline allow one final bounded lookup: the clip may
+        # already exist. Transient RPC/worker errors cannot extend the budget.
+        async def run(_pid: str):
+            return await self._poll_batch_operation_inner(active_id)
+        try:
+            result = await asyncio.wait_for(self._run_on_profile(
+                run, self._operation_projects.get(active_id) or self._operation_projects.get(clean_id) or "",
+                operation_id=active_id, allow_failover=False,
+            ), timeout=max(15, min(45, remaining)))
+        except Exception as exc:
+            result = _as_pending_operation(active_id, error=str(exc))
+        if "operation" not in result:
+            result = _as_pending_operation(active_id, error=result.get("error"))
+        result["operation"]["name"] = clean_id
+        status = result.get("status", "")
 
-        if not media_id:
-            media_id, complaint = await self._find_operation_media(operation_id)
-            if not media_id:
-                return _as_pending_operation(operation_id, error=complaint)
-            self._operation_media[operation_id] = media_id
-            self._remember_media(media_id)
+        # If a failover replay is active but still pending, check if the original finished in parallel
+        if target and status != "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+            try:
+                orig_res = await self._poll_batch_operation_inner(clean_id)
+                if orig_res.get("status") == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+                    result = orig_res
+                    result["operation"]["name"] = clean_id
+                    status = "MEDIA_GENERATION_STATUS_SUCCESSFUL"
+            except Exception:
+                pass
+
+        if status not in ("MEDIA_GENERATION_STATUS_SUCCESSFUL", "MEDIA_GENERATION_STATUS_FAILED"):
+            elapsed = time.time() - started
+            # Smart late-replay: if an operation has been rendering for >= SMART_REPLAY_TIMEOUT
+            # and has not yet been replayed, trigger a secondary dispatch to rescue the stalled job
+            if (
+                SMART_REPLAY_ENABLED
+                and elapsed >= SMART_REPLAY_TIMEOUT
+                and not target
+                and clean_id not in self._replay_in_progress
+            ):
+                self._replay_in_progress.add(clean_id)
+                asyncio.create_task(self._maybe_trigger_smart_replay(clean_id))
+
+            if elapsed >= timeout_budget:
+                result = self._video_failure(clean_id, "upstream_timeout",
+                    f"upstream_timeout: low-priority video has no result after {int(elapsed)}s; "
+                    "no paid model or duplicate generation was submitted")
+                logger.warning("Operation %s low-priority render timeout after %.1fs", clean_id[:20], elapsed)
+        status = result.get("status", "")
+        if status in ("MEDIA_GENERATION_STATUS_SUCCESSFUL", "MEDIA_GENERATION_STATUS_FAILED"):
+            self._operation_results[clean_id] = result
+            terminal = "COMPLETED" if status.endswith("SUCCESSFUL") else "FAILED"
+            update_operation_replay(clean_id, status=terminal)
+            if target:
+                update_operation_failover(clean_id, status=terminal)
             self._save_r2v_ops()
+        return result
+
+    def _pick_failover_worker(self, exclude: str = "") -> str | None:
+        """Best available connected worker that is not ``exclude``."""
+        try:
+            _pin, routes = self._profile_candidates()
+        except Exception:
+            return None
+        ex = (exclude or "").casefold()
+        for route in routes:
+            pid = route.get("profile_id") or ""
+            if pid and pid.casefold() != ex and route.get("available") and route.get("project_id"):
+                return pid
+        return None
+
+    async def _reupload_media_to_worker(self, media_ids: list[str], target_worker: str) -> list[str] | None:
+        """Move still-valid source images onto another account.
+
+        Flow media handles are account-scoped, so a cross-account replay must
+        move the pixels, not the id. Returns new media ids, or None when any
+        source is no longer fetchable.
+        """
+        moved: list[str] = []
+        for mid in media_ids:
+            try:
+                res = await self.get_media(mid)
+                fife = ((res.get("data") or {}).get("image") or {}).get("fifeUrl")
+                if not fife:
+                    return None
+                raw, mime = await asyncio.to_thread(_fetch_url_bytes, fife)
+                up = await self.upload_image(
+                    base64.b64encode(raw).decode("ascii"), mime,
+                    profile_id=target_worker,
+                )
+                new_id = ((up.get("data") or {}).get("media") or {}).get("name") or up.get("_mediaId")
+                if not new_id:
+                    return None
+                moved.append(new_id)
+            except Exception as exc:
+                logger.warning("Failover re-upload of %s to %s failed: %s", mid[:12], target_worker, exc)
+                return None
+        return moved
+
+    async def _maybe_trigger_smart_replay(self, clean_id: str) -> None:
+        """Re-dispatch a stalled operation, preferring a different worker/account.
+
+        The original op stays pinned to its worker; the rescue attempt is a
+        parallel submit. Media handles are account-scoped, so cross-account
+        i2v/r2v re-uploads still-valid source images to the target nick first.
+        Falls back to same-worker dispatch when no other worker is usable or
+        the source media can no longer be fetched.
+        """
+        from agent.services.flow_failover import (
+            get_operation_replay, record_operation_failover, get_failover_target
+        )
+        if get_failover_target(clean_id):
+            return
+        replay = get_operation_replay(clean_id)
+        if not replay or replay.get("status") not in ("PENDING", None):
+            return
+        payload = replay.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return
+        req_type = replay.get("request_type") or "generate_video"
+        orig_worker = replay.get("worker_id") or ""
+        prompt = payload.get("prompt")
+        if not prompt:
+            return
+
+        target_worker = self._pick_failover_worker(exclude=orig_worker)
+        aspect = payload.get("aspect_ratio") or "VIDEO_ASPECT_RATIO_LANDSCAPE"
+        tier = payload.get("user_paygate_tier") or "PAYGATE_TIER_TWO"
+        scene = payload.get("scene_id") or ""
+        logger.info(
+            "Triggering smart late-replay for stalled operation %s (worker: %s -> %s) after %ds",
+            clean_id[:12], orig_worker, target_worker or "same", SMART_REPLAY_TIMEOUT
+        )
 
         try:
-            urls = await self._batch_media_urls(media_id)
-        except Exception as e:
-            # as29s [5] on a queued r2v id is "not written yet", not a
-            # dead job. Keep the id so the next round does not forget it.
-            complaint = str(e)
-            urls = None
+            if req_type == "generate_video_refs":
+                refs = payload.get("reference_media_ids") or []
+                if not refs:
+                    return
+                new_refs = (
+                    await self._reupload_media_to_worker(refs[:3], target_worker)
+                    if target_worker else None
+                )
+                if new_refs:
+                    res = await self.generate_video_from_references(
+                        new_refs, prompt, "", scene,
+                        aspect_ratio=aspect, user_paygate_tier=tier,
+                        profile_id=target_worker,
+                    )
+                else:
+                    res = await self.generate_video_from_references(
+                        refs, prompt, payload.get("project_id") or "", scene,
+                        aspect_ratio=aspect, user_paygate_tier=tier,
+                    )
+            else:
+                start = payload.get("start_image_media_id")
+                end = payload.get("end_image_media_id")
+                new_start = None
+                if target_worker and start:
+                    moved = await self._reupload_media_to_worker([start], target_worker)
+                    new_start = moved[0] if moved else None
+                if target_worker and (new_start or not start):
+                    # Cross-account: t2v submits directly; i2v uses the
+                    # re-uploaded start frame on the target worker's project.
+                    # End-frame chaining cannot cross accounts (media-scoped).
+                    res = await self.generate_video(
+                        new_start, prompt, "", scene,
+                        aspect_ratio=aspect, user_paygate_tier=tier,
+                        profile_id=target_worker,
+                    )
+                else:
+                    res = await self.generate_video(
+                        start, prompt, payload.get("project_id") or "", scene,
+                        aspect_ratio=aspect, end_image_media_id=end,
+                        user_paygate_tier=tier,
+                    )
+        except Exception as exc:
+            logger.warning("Smart replay failed to dispatch for %s: %s", clean_id[:12], exc)
+            return
 
-        if (urls is None or not urls.video) and operation_id in self._operation_chat_sessions:
-            # Transcript can stay at "queued" for minutes, then grow a
-            # /video/ url or a new media_id. Re-read it when as29s misses.
-            refreshed = await self._media_id_from_chat_session(
-                operation_id, self._operation_projects.get(operation_id),
-            )
+        # Extract new operation id from res
+        new_ops = (res.get("data") or {}).get("operations") if isinstance(res.get("data"), dict) else res.get("operations")
+        if isinstance(new_ops, list) and new_ops:
+            first = new_ops[0]
+            new_op_id = ""
+            if isinstance(first, dict):
+                new_op_id = (first.get("operation") or {}).get("name") or first.get("name") or ""
+            elif isinstance(first, str):
+                new_op_id = first
+            if new_op_id:
+                clean_new = new_op_id.removeprefix("operations/")
+                profiles = getattr(self, "_operation_profiles", {})
+                new_worker = profiles.get(clean_new) or profiles.get(new_op_id) or ""
+                record_operation_failover(
+                    original_op_id=clean_id,
+                    new_op_id=clean_new,
+                    original_worker_id=orig_worker,
+                    failover_worker_id=new_worker,
+                    status="IN_PROGRESS",
+                )
+                logger.info(
+                    "Smart late-replay mapped successfully: %s -> %s (worker: %s -> %s)",
+                    clean_id[:12], clean_new[:12], orig_worker, new_worker
+                )
+
+    @staticmethod
+    def _video_failure(operation_id: str, code: str, message: str) -> dict:
+        return {"operation": {"name": operation_id},
+                "status": "MEDIA_GENERATION_STATUS_FAILED",
+                "error_code": code, "error": message}
+
+    def _video_complaint_failure(self, operation_id: str, complaint: str | None):
+        if not complaint:
+            return None
+        if "ask_for_permission" in complaint or "LOW_PRIORITY_ONLY" in complaint:
+            return self._video_failure(operation_id, "low_priority_only", complaint)
+        if "UNSAFE_GENERATION" in complaint:
+            return self._video_failure(operation_id, "content_policy_violation", complaint)
+        # A missing media row is normal while low-priority renders are queued.
+        # Explicit upstream rejection is terminal; network hiccups are not.
+        if "PUBLIC_ERROR" in complaint:
+            return self._video_failure(operation_id, "upstream_rejected", complaint)
+        return None
+
+    async def _poll_batch_operation_inner(
+        self, operation_id: str, original_op_id: str | None = None,
+        has_explicit_start: bool | None = None,
+    ) -> dict:
+        operation_id = operation_id.removeprefix("operations/")
+        rounds = self._operation_polls.get(operation_id, 0) + 1
+        self._operation_polls[operation_id] = rounds
+        media_id = self._operation_media.get(operation_id)
+        complaint = self._operation_complaints.get(operation_id)
+        direct = None
+        cached_media_id = media_id
+        # A confirmed media handle can finish even when the large listing fails.
+        # Check it before the slower discovery path can consume the poll budget.
+        if media_id:
+            try:
+                direct = await self._batch_media_urls(media_id)
+                if direct.video:
+                    return {"operation": {"name": operation_id,
+                            "metadata": {"video": {"mediaId": media_id, "fifeUrl": direct.video}}},
+                            "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL"}
+            except Exception:
+                pass
+        if not media_id or rounds % 3 == 0:
+            refreshed, complaint = await self._find_operation_media(operation_id)
+            failure = self._video_complaint_failure(operation_id, complaint)
+            if failure:
+                return failure
             if refreshed:
                 media_id = refreshed
                 self._operation_media[operation_id] = media_id
                 self._remember_media(media_id)
                 self._save_r2v_ops()
+        if not media_id:
+            return _as_pending_operation(operation_id, error=complaint)
+        urls = direct if cached_media_id == media_id else None
+        if urls is None:
             try:
                 urls = await self._batch_media_urls(media_id)
-            except Exception as e:
-                return _as_pending_operation(
-                    operation_id, error=str(e), media_id=media_id)
-
+            except Exception as exc:
+                complaint = str(exc)
+        if (not urls or not urls.video) and operation_id in self._operation_chat_sessions:
+            refreshed = await self._media_id_from_chat_session(
+                operation_id, self._operation_projects.get(operation_id))
+            failure = self._video_complaint_failure(
+                operation_id, self._operation_complaints.get(operation_id))
+            if failure:
+                return failure
+            if refreshed and refreshed != media_id:
+                media_id = refreshed
+                self._operation_media[operation_id] = media_id
+                self._remember_media(media_id)
+                self._save_r2v_ops()
+                try:
+                    urls = await self._batch_media_urls(media_id)
+                except Exception as exc:
+                    complaint = str(exc)
         if not urls or not urls.video:
-            rounds = self._operation_polls.get(operation_id, 0)
-            if rounds > 0 and rounds % 3 == 0:
-                refreshed_id, op_complaint = await self._find_operation_media(operation_id)
-                if op_complaint:
-                    complaint = op_complaint
-                if refreshed_id and refreshed_id != media_id:
-                    media_id = refreshed_id
-                    self._operation_media[operation_id] = media_id
-                    self._remember_media(media_id)
-                    self._save_r2v_ops()
-
-            if rounds >= 25:
-                logger.warning(
-                    "Operation %s timed out waiting for video media (rounds=%d, complaint=%s)",
-                    operation_id[:20], rounds, complaint,
-                )
-                return {
-                    "operation": {"name": operation_id},
-                    "status": "MEDIA_GENERATION_STATUS_FAILED",
-                    "error": complaint or "Google Flow: video generation failed upstream (timeout)",
-                }
-
-            # The id landed but the clip is still being written; downloading
-            # now would save the poster still instead of the video.
             return _as_pending_operation(operation_id, error=complaint, media_id=media_id)
-
-        # The media id stays cached rather than being cleared here: a batch
-        # with several operations re-polls the finished ones alongside the
-        # pending ones, and a cleared entry would report them PENDING again.
-        # Growth is bounded by _remember_operation.
         return {
-            "operation": {
-                "name": operation_id,
-                "metadata": {"video": {"mediaId": media_id, "fifeUrl": urls.video}},
-            },
+            "operation": {"name": operation_id,
+                          "metadata": {"video": {"mediaId": media_id, "fifeUrl": urls.video}}},
             "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
         }
 
@@ -1741,17 +2413,26 @@ class FlowClient:
         expensive call, so it is only consulted when the poll says something
         happened, when the poll is unreadable, or every third round regardless.
         """
-        rounds = self._operation_polls.get(operation_id, 0) + 1
-        self._operation_polls[operation_id] = rounds
-
-        project_id = self._operation_projects.get(operation_id) or FLOW_PROJECT_ID
+        clean_op_id = operation_id.removeprefix("operations/") if isinstance(operation_id, str) else operation_id
+        rounds = self._operation_polls.get(clean_op_id, 0)
+        project_id = (
+            self._operation_projects.get(clean_op_id)
+            or self._operation_projects.get(operation_id)
+            or FLOW_PROJECT_ID
+        )
         complaint = None
         worth_looking = rounds % 3 == 0
         try:
-            operation = fb.read_operation(
-                await self._batch_payload(
-                    fb.RPC_OPERATION, fb.operation_request(operation_id), timeout=60)
-            )
+            operation_payload = await self._batch_payload(
+                fb.RPC_OPERATION, fb.operation_request(operation_id), timeout=60)
+            operation = fb.read_operation(operation_payload)
+            video_evidence('operation', operation_id,
+                           f'{operation.status}:{fingerprint(operation.error or "")}',
+                           payload=operation_payload, project_id=trace_identifier(project_id),
+                           reported_project_id=trace_identifier(operation.project_id),
+                           project_matches=not operation.project_id or operation.project_id == project_id,
+                           profile_hash=fingerprint((_current_route.get() or {}).get('profile_id')),
+                           diagnostic=trace_summary(operation.error))
             complaint = operation.error
             project_id = operation.project_id or project_id
             if project_id:
@@ -1779,6 +2460,8 @@ class FlowClient:
             media_id = await self._media_id_from_chat_session(operation_id, project_id)
             if media_id:
                 return media_id, complaint
+            if getattr(self, "_operation_complaints", {}).get(operation_id):
+                return None, self._operation_complaints[operation_id]
             media_id = await self._media_id_from_r2v_listing(operation_id, project_id)
             if media_id:
                 return media_id, complaint
@@ -1834,6 +2517,14 @@ class FlowClient:
                 blobs = []
         except Exception as exc:
             logger.warning("GetSession %s failed: %s", session[:12], exc)
+            return None
+
+        if "ask_for_permission" in raw:
+            logger.warning("GetSession %s blocked paid-model confirmation for op %s",
+                           session[:12], operation_id[:12])
+            self._operation_complaints[operation_id] = (
+                "LOW_PRIORITY_ONLY: ask_for_permission; paid generation was not approved"
+            )
             return None
 
         exclude = {
@@ -1967,14 +2658,25 @@ class FlowClient:
                     fb.first_payload(raw, fb.RPC_PROJECT_MEDIA), operation_id)
             except (fb.FlowBatchError, fb.RpcError, json.JSONDecodeError):
                 media_id = None
+        video_evidence('listing_binding', operation_id, media_id or 'missing',
+                       project_id=trace_identifier(project_id), media_id=trace_identifier(media_id),
+                       operation_present=operation_id in raw,
+                       profile_hash=fingerprint((_current_route.get() or {}).get('profile_id')))
         return media_id
 
     async def _batch_media_urls(self, media_id: str) -> "fb.MediaUrls":
         try:
             payload = await self._batch_payload(
                 fb.RPC_MEDIA, fb.media_request(media_id), timeout=60)
-            return fb.read_media_urls(payload, media_id)
+            urls = fb.read_media_urls(payload, media_id)
+            video_evidence('media', media_id, 'video' if urls.video else 'image_only' if urls.image else 'no_urls',
+                           payload=payload, profile_hash=fingerprint((_current_route.get() or {}).get('profile_id')))
+            return urls
         except fb.RpcError as e:
+            codes = [n for n in e.detail if type(n) is int and 0 <= n <= 16] if isinstance(e.detail, list) else []
+            video_evidence('media', media_id, 'rpc_error:' + ','.join(map(str,codes)),
+                           payload=e.detail, rpc_id=e.rpcid, rpc_codes=codes,
+                           profile_hash=fingerprint((_current_route.get() or {}).get('profile_id')))
             if "[5]" in str(e):
                 return fb.MediaUrls(media_id=media_id, video=None, image=None)
             raise
@@ -2022,8 +2724,18 @@ class FlowClient:
             return _batch_error(e)
 
     async def upload_image(self, image_base64: str, mime_type: str = "image/jpeg",
-                            project_id: str = "", file_name: str = "image.jpg") -> dict:
+                            project_id: str = "", file_name: str = "image.jpg",
+                            *, profile_id: str | None = None,
+                            reference_media_id: str | None = None) -> dict:
         """Upload an image into the project so it can be used as a reference."""
+        if reference_media_id:
+            owner = self._media_profiles.get(reference_media_id)
+            if not owner or not self._UUID_RE.fullmatch(reference_media_id):
+                return {"status": 400, "error": "REFERENCE_BINDING_UNKNOWN: upload the first reference again",
+                        "retryable": False}
+            if profile_id and profile_id.casefold() != owner.casefold():
+                return {"status": 400, "error": "MEDIA_PROFILE_MISMATCH", "retryable": False}
+            profile_id = owner
         if not USE_BATCH_RPC:
             return await self._legacy_upload_image(image_base64, mime_type, project_id, file_name)
         async def run(pid: str):
@@ -2033,12 +2745,12 @@ class FlowClient:
                 fb.CAPTCHA_IMAGE, timeout=120,
             )
             media_id = fb.read_uploaded_media_id(payload)
-            self._remember_media(media_id)
+            self._remember_media(media_id, profile_id=profile_id)
             return {"status": 200, "data": {"media": {"name": media_id}}, "_mediaId": media_id}
 
         try:
             return await self._run_on_profile(
-                run, project_id, allow_failover=True)
+                run, project_id, profile_id=profile_id, allow_failover=not bool(reference_media_id))
         except Exception as e:
             return _batch_error(e)
 
@@ -2483,6 +3195,12 @@ def _as_pending_operation(operation_id: str, error: str | None = None,
 
 def _is_ws_error(result: dict) -> bool:
     return bool(result.get("error")) or (isinstance(result.get("status"), int) and result["status"] >= 400)
+
+
+def _fetch_url_bytes(url: str, timeout: int = 30) -> tuple[bytes, str]:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(), (resp.headers.get_content_type() or "image/jpeg")
 
 
 # Singleton

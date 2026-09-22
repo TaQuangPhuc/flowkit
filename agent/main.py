@@ -10,7 +10,11 @@ import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent.config import API_HOST, API_PORT, BASE_DIR, WS_HOST, WS_PORT
+from agent.config import (
+    API_HOST, API_PORT, BASE_DIR, WS_HOST, WS_PORT,
+    PER_WORKER_VIDEO_COOLDOWN, PER_WORKER_VIDEO_COOLDOWN_MIN, PER_WORKER_VIDEO_COOLDOWN_MAX,
+    VIDEO_POLL_TIMEOUT, SMART_REPLAY_ENABLED, SMART_REPLAY_TIMEOUT,
+)
 from agent.db.schema import init_db, close_db
 from agent.api.characters import router as characters_router
 from agent.api.projects import router as projects_router
@@ -27,6 +31,10 @@ from agent.api.providers import router as providers_router
 from agent.api.active_project import router as active_project_router
 from agent.api.accounts import router as accounts_router
 from agent.api.system import router as system_router
+from agent.api.fashion_lookbook import router as fashion_lookbook_router
+from agent.api.incidents import router as incidents_router
+from agent.services.central_watchdog import start_central_watchdog, stop_central_watchdog
+from agent.services.flow_trace import FlowTraceMiddleware, emit as trace_emit, identifier as trace_identifier, summary as trace_summary
 from agent.services.request_shield import RequestShieldMiddleware, get_request_shield
 from agent.worker.processor import get_worker_controller
 from agent.services.flow_client import get_flow_client
@@ -98,6 +106,11 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     ws_task = asyncio.create_task(run_ws_server())
     worker_task = asyncio.create_task(controller.start())
+    from agent.services.video_reconciliation import VideoReconciler
+    from agent.config import VIDEO_POLL_TIMEOUT
+    reconciler = VideoReconciler(get_flow_client(), BASE_DIR / '.scratch' / 'video-reconciliation.json',
+                                render_timeout=VIDEO_POLL_TIMEOUT)
+    reconcile_task = asyncio.create_task(reconciler.run())
     logger.info("WS server + worker started")
 
     # Auto-restore bridges and launch enabled nicks
@@ -124,7 +137,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Failed to start proxy health daemon: %s", e)
 
+    # Start Central Watchdog & Self-Healing Daemon
+    try:
+        start_central_watchdog()
+        logger.info("Central Watchdog Daemon started")
+    except Exception as e:
+        logger.warning("Failed to start central watchdog: %s", e)
+
     yield
+
+    reconcile_task.cancel()
+    await asyncio.gather(reconcile_task, return_exceptions=True)
 
     # Graceful shutdown: Never drop in-flight client requests
     shield = get_request_shield()
@@ -135,6 +158,11 @@ async def lifespan(app: FastAPI):
     logger.info("Graceful shutdown: Draining background worker tasks...")
     controller.request_shutdown()
     await controller.drain(timeout=120.0)
+
+    try:
+        stop_central_watchdog()
+    except Exception:
+        pass
 
     try:
         from agent.services.proxy_checker import stop_proxy_health_daemon
@@ -151,6 +179,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Flow Kit", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(RequestShieldMiddleware)
+app.add_middleware(FlowTraceMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -173,6 +202,8 @@ app.include_router(providers_router)
 app.include_router(active_project_router)
 app.include_router(accounts_router, prefix="/api")
 app.include_router(system_router, prefix="/api")
+app.include_router(fashion_lookbook_router, prefix="/api")
+app.include_router(incidents_router)
 
 
 import secrets as _secrets
@@ -194,6 +225,8 @@ async def ext_callback(request: Request):
                 str(req_id)[:8] if req_id else "none",
                 len(client._pending),
                 "yes" if req_id and req_id in client._pending else "no")
+    trace_emit("extension.callback", extension_request_id=trace_identifier(req_id),
+               matched=bool(req_id and req_id in client._pending), result=trace_summary(data))
     if req_id and req_id in client._pending:
         future = client._pending[req_id]
         try:
@@ -205,6 +238,17 @@ async def ext_callback(request: Request):
 
 
 _NETLOG_PATH = BASE_DIR / ".scratch" / "ext-netlog.jsonl"
+
+
+def _append_netlog(rec: dict) -> None:
+    """Append one capture and trim the file when it outgrows LOG_MAX_MB."""
+    from agent.config import LOG_KEEP_MB, LOG_MAX_MB
+    from agent.services.log_maintenance import trim_log
+
+    _NETLOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _NETLOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    trim_log(_NETLOG_PATH, LOG_MAX_MB * 1024 * 1024, LOG_KEEP_MB * 1024 * 1024)
 _NETLOG_UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
 )
@@ -254,6 +298,16 @@ def _session_from_netlog(url: str, freq: str | None) -> str | None:
 async def ext_netlog(request: Request):
     """Append a Flow RPC capture from the extension. Also pins GN0Bre session."""
     data = await request.json()
+    if data.get("event") == "network_error":
+        from agent.services.network_diagnostics import sanitize_failure, append_failure
+        record = sanitize_failure(data)
+        if record is None:
+            return {"ok": False, "error": "INVALID_NETWORK_DIAGNOSTIC"}
+        append_failure(_NETLOG_PATH.with_name("ext-network-errors.jsonl"), record)
+        logger.warning("ext/network_error rpcid=%s profile=%s request=%s error=%s elapsed_ms=%s",
+                       record["rpcid"], record["profileId"], record["requestId"],
+                       record["networkError"], record["elapsedMs"])
+        return {"ok": True}
     url = str(data.get("url") or "")[:800]
     freq = data.get("freq")
     if isinstance(freq, str) and len(freq) > 24000:
@@ -266,12 +320,12 @@ async def ext_netlog(request: Request):
         "rpcid": data.get("rpcid"),
         "session": session,
         "freq": freq,
+        "profileId": data.get("profileId") or None,
     }
-    _NETLOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _NETLOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # One disk write per Flow RPC. Doing it inline blocked the event loop, and
+    # nothing ever trimmed the file (it reached 129MB).
+    await asyncio.to_thread(_append_netlog, rec)
     profile_id = data.get("profileId") or None
-    rec["profileId"] = profile_id
     if session:
         get_flow_client().remember_chat_session(session, profile_id=profile_id)
     logger.info(
@@ -284,13 +338,22 @@ async def ext_netlog(request: Request):
     return {"ok": True, "session": session}
 
 
+@app.get("/api/ext/network-errors")
+async def ext_network_errors(limit: int = 40):
+    from agent.services.network_diagnostics import tail_failures
+    entries = tail_failures(_NETLOG_PATH.with_name("ext-network-errors.jsonl"), limit)
+    return {"entries": entries, "count": len(entries)}
+
+
 @app.get("/api/ext/netlog")
 async def ext_netlog_tail(limit: int = 40):
     """Tail the extension RPC capture log."""
     if not _NETLOG_PATH.exists():
         return {"count": 0, "path": str(_NETLOG_PATH), "entries": []}
-    lines = _NETLOG_PATH.read_text(encoding="utf-8").splitlines()
     cap = max(1, min(int(limit or 40), 200))
+    # Never read the whole file: it is append-only and unbounded between trims.
+    from agent.services.log_maintenance import read_tail
+    lines = read_tail(_NETLOG_PATH, 2 * 1024 * 1024).decode("utf-8", "ignore").splitlines()
     entries = []
     for line in lines[-cap:]:
         try:
@@ -307,6 +370,11 @@ async def health():
         "status": "ok",
         "version": "0.2.0",
         "extension_connected": client.connected,
+        "video_cooldown_range_s": [PER_WORKER_VIDEO_COOLDOWN_MIN, PER_WORKER_VIDEO_COOLDOWN_MAX],
+        "video_cooldown_s": PER_WORKER_VIDEO_COOLDOWN,
+        "video_poll_timeout_s": VIDEO_POLL_TIMEOUT,
+        "smart_replay_enabled": SMART_REPLAY_ENABLED,
+        "smart_replay_timeout_s": SMART_REPLAY_TIMEOUT,
         "ws": client.ws_stats,
         "workers": client.workers(),
     }

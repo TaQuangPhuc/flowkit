@@ -48,17 +48,49 @@ DEFAULT_PAYGATE_TIER = os.environ.get("DEFAULT_PAYGATE_TIER", "PAYGATE_TIER_TWO"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 VIDEO_POLL_INTERVAL = int(os.environ.get("VIDEO_POLL_INTERVAL", "10"))  # polling interval for video/upscale status
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
-VIDEO_POLL_TIMEOUT = int(os.environ.get("VIDEO_POLL_TIMEOUT", "420"))
+VIDEO_POLL_TIMEOUT = int(os.environ.get("VIDEO_POLL_TIMEOUT", "300"))
 API_COOLDOWN = int(os.environ.get("API_COOLDOWN", "1"))  # seconds between API calls (anti-spam)
-MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "50"))  # Google Flow max parallel requests
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "65"))  # Google Flow max parallel requests
 STALE_PROCESSING_TIMEOUT = int(os.environ.get("STALE_PROCESSING_TIMEOUT", "600"))  # 10 min
 
 # ─── Multi-nick gate ─────────────────────────────────────────
 # Nova (and everything else) still talks to one URL on :8100. Behind it, each
 # Chrome profile is one Flow nick + one sticky proxy + one Flow project.
 # Concurrent slots are per nick; credits are not multiplied.
-PROFILE_MAX_CONCURRENT = int(os.environ.get("PROFILE_MAX_CONCURRENT", "15"))
+PROFILE_MAX_CONCURRENT = int(os.environ.get("PROFILE_MAX_CONCURRENT", "20"))
+# Randomized human-like jitter cooldown (seconds) between video generation dispatches on the same worker
+PER_WORKER_VIDEO_COOLDOWN_MIN = float(os.environ.get("PER_WORKER_VIDEO_COOLDOWN_MIN", "2.0"))
+PER_WORKER_VIDEO_COOLDOWN_MAX = float(os.environ.get("PER_WORKER_VIDEO_COOLDOWN_MAX", "3.0"))
+PER_WORKER_VIDEO_COOLDOWN = PER_WORKER_VIDEO_COOLDOWN_MAX
 PROFILES_FILE = Path(os.environ.get("FLOW_PROFILES_FILE", Path(__file__).parent / "profiles.json"))
+
+# ─── Smart Late-Replay (Rescuing stalled Google Veo 3 queue jobs) ───
+SMART_REPLAY_ENABLED = os.environ.get("SMART_REPLAY_ENABLED", "1") == "1"
+SMART_REPLAY_TIMEOUT = int(os.environ.get("SMART_REPLAY_TIMEOUT", "180"))
+# Consecutive soft auth failures (no rpc envelope = signed-out page) before a
+# nick is taken out of rotation and flagged for re-login.
+AUTH_STRIKES_BEFORE_DISABLE = int(os.environ.get("AUTH_STRIKES_BEFORE_DISABLE", "3"))
+# Strikes must age out, otherwise one soft failure a day for three days
+# disables a nick that was healthy the whole time.
+AUTH_STRIKE_TTL_S = int(os.environ.get("AUTH_STRIKE_TTL_S", "3600"))
+
+# Age at which an unresolved incident is auto-closed. Safe because every sweep
+# re-records a problem that is still live, with a fresh timestamp; without it
+# the ledger keeps rows whose producing code no longer exists.
+INCIDENT_STALE_TTL_H = int(os.environ.get("INCIDENT_STALE_TTL_H", "24"))
+
+# ─── Housekeeping (nothing pruned these tables/logs before) ─────────
+# Replay rows are only useful while an operation can still be replayed.
+REPLAY_COMPLETED_TTL_H = int(os.environ.get("REPLAY_COMPLETED_TTL_H", "24"))
+REPLAY_PENDING_TTL_H = int(os.environ.get("REPLAY_PENDING_TTL_H", "6"))
+# A failover left IN_PROGRESS past this is not in progress, it is abandoned.
+FAILOVER_STUCK_TTL_H = int(os.environ.get("FAILOVER_STUCK_TTL_H", "6"))
+# Mappings are kept longer: get_failover_target() still resolves late polls.
+FAILOVER_PURGE_TTL_D = int(os.environ.get("FAILOVER_PURGE_TTL_D", "7"))
+# Append-only logs are trimmed to the last LOG_KEEP_MB once they pass LOG_MAX_MB.
+LOG_MAX_MB = int(os.environ.get("LOG_MAX_MB", "256"))
+LOG_KEEP_MB = int(os.environ.get("LOG_KEEP_MB", "32"))
+
 # Live nick + proxy store. Secrets stay here, not in the committed profiles.json.
 ACCOUNTS_FILE = Path(os.environ.get("FLOW_ACCOUNTS_FILE", Path(__file__).parent / "accounts.json"))
 

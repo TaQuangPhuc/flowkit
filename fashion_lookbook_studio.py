@@ -23,14 +23,42 @@ from pathlib import Path
 from typing import Optional, Any
 from concurrent.futures import ThreadPoolExecutor
 
+from agent.services.parked_retry import ParkedBackoff, retry_after_seconds
+
 WORK_DIR = Path("/home/pc/flowkit/auto_runs")
 FLOWKIT_API = "http://127.0.0.1:8100"
 BGM_DIR = Path("/home/pc/flowkit/assets/bgm")
 NOVA_BASE_URL = os.environ.get("NOVA_BASE_URL", "https://api.vilao.ai/v1")
-NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "sk-ed315f54662e9ebe508d95bca3d93a65f4d697030d90cea81fde7f39d64e0055")
-NOVA_MODEL = os.environ.get("NOVA_MODEL", "deepseek-v4-flash")
+NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "sk-72afd079199f58a7b302e65b6690744ce8cf7b44c0dcd163070052e7fa774535")
+NOVA_MODEL = os.environ.get("NOVA_MODEL", "chib/deepseek-v4.1-flash")
 
 LOOKBOOK_JOBS: dict[str, dict] = {}
+
+LOOKBOOK_CONFIG = {
+    "num_threads": int(os.environ.get("LOOKBOOK_THREADS", "4")),
+    "max_allowed_threads": 10,
+    "default_threads": 4
+}
+
+
+def get_lookbook_threads() -> dict:
+    return {
+        "ok": True,
+        "num_threads": LOOKBOOK_CONFIG["num_threads"],
+        "default_threads": LOOKBOOK_CONFIG["default_threads"],
+        "max_allowed": LOOKBOOK_CONFIG["max_allowed_threads"]
+    }
+
+
+def set_lookbook_threads(threads: int) -> dict:
+    val = max(1, min(LOOKBOOK_CONFIG["max_allowed_threads"], int(threads)))
+    LOOKBOOK_CONFIG["num_threads"] = val
+    return {
+        "ok": True,
+        "num_threads": val,
+        "message": f"Đã cập nhật số luồng xử lý Lookbook thành {val} luồng song song"
+    }
+
 
 # ─── TEMPLATES DEFINITION ────────────────────────────────────────────────────
 
@@ -439,9 +467,14 @@ def get_all_lookbook_presets() -> dict:
 # ─── HELPER FUNCTIONS ────────────────────────────────────────────────────────
 
 def call_flowkit_api(endpoint: str, payload: dict, timeout: int = 180, max_retries: int = 4) -> dict:
+    if endpoint in ("/api/flow/generate-video", "/api/flow/generate-video-refs"):
+        max_retries = 1
     url = f"{FLOWKIT_API}{endpoint}"
     data = json.dumps(payload).encode("utf-8")
-    for attempt in range(1, max_retries + 1):
+    parked = ParkedBackoff()
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
         req = urllib.request.Request(
             url,
             data=data,
@@ -459,11 +492,16 @@ def call_flowkit_api(endpoint: str, payload: dict, timeout: int = 180, max_retri
                 err_body = err.read().decode("utf-8", errors="ignore")
             except Exception:
                 pass
-            if err.code == 429 or "UNUSUAL" in err_body.upper():
-                time.sleep(4.0)
+            # A fully parked fleet submitted nothing: wait it out instead of
+            # failing the item after ~10s of 503s. Does not consume an attempt.
+            if parked.wait(err, err_body):
+                attempt -= 1
+                continue
+            if attempt < max_retries and (err.code == 429 or "UNUSUAL" in err_body.upper()):
+                time.sleep(retry_after_seconds(err, 4.0))
                 continue
             elif attempt < max_retries and err.code in [500, 502, 503, 504]:
-                time.sleep(2.5)
+                time.sleep(retry_after_seconds(err, 2.5))
                 continue
             raise RuntimeError(f"FlowKit error {err.code} on {endpoint}: {err_body or err.reason}")
         except Exception:
@@ -502,14 +540,16 @@ def grok_vision_analyze(prompt: str, image_paths: list[Path]) -> dict:
             })
 
     content = [{"type": "text", "text": prompt}] + images_payload
-    payload = {
-        "model": NOVA_MODEL,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 4096,
-        "response_format": {"type": "json_object"}
-    }
+    candidate_models = [
+        os.environ.get("NOVA_MODEL", NOVA_MODEL),
+        "spd/grok-4.6",
+        "grok-4.6",
+        "cnt/grok-4.6",
+        "fa/grok-4.6-fast"
+    ]
+    api_key = os.environ.get("NOVA_API_KEY", NOVA_API_KEY)
     headers = {
-        "Authorization": f"Bearer {NOVA_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     }
@@ -518,23 +558,30 @@ def grok_vision_analyze(prompt: str, image_paths: list[Path]) -> dict:
         "http://127.0.0.1:8080/v1/chat/completions"
     ]
     last_err = None
-    for ep in endpoints:
-        try:
-            req = urllib.request.Request(
-                ep,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-            raw_text = res["choices"][0]["message"]["content"].strip()
-            if "```" in raw_text:
-                raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
-                raw_text = re.sub(r"\s*```$", "", raw_text.strip())
-            return json.loads(raw_text)
-        except Exception as e:
-            last_err = e
-            continue
+    for model_name in candidate_models:
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 4096,
+            "response_format": {"type": "json_object"}
+        }
+        for ep in endpoints:
+            try:
+                req = urllib.request.Request(
+                    ep,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                raw_text = res["choices"][0]["message"]["content"].strip()
+                if "```" in raw_text:
+                    raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
+                    raw_text = re.sub(r"\s*```$", "", raw_text.strip())
+                return json.loads(raw_text)
+            except Exception as e:
+                last_err = e
+                continue
     raise last_err or RuntimeError("Failed to analyze outfit vision")
 
 
@@ -654,6 +701,83 @@ def recover_lookbook_job(job_id: str) -> dict:
         final_mp4 = jdir / "final_lookbook.mp4"
         if not final_mp4.exists():
             stitch_lookbook_final(job_id)
+        return LOOKBOOK_JOBS.get(job_id, job)
+
+    # ── STAGE 2 RECOVERY ──
+    video_clips = job.get("video_clips", [])
+    if video_clips or job.get("stage") == 2:
+        valid_clips = []
+        has_pending = False
+        changed = False
+        for vc in video_clips:
+            cid = vc.get("clip_id") or vc.get("source_image_id")
+            cp = jdir / f"clip_{cid}.mp4"
+            if cp.exists() and cp.stat().st_size > 50000:
+                if vc.get("status") != "COMPLETED":
+                    vc["status"] = "COMPLETED"
+                    vc["status_text"] = "Đã hoàn thành video"
+                    vc["video_url"] = f"/api/fashion-lookbook/stage2/clips/{job_id}/{cid}"
+                    changed = True
+                valid_clips.append(cp)
+                continue
+
+            op_name = vc.get("operation_name")
+            if op_name:
+                try:
+                    p_body = {"operations": [{"operation": {"name": op_name}}]}
+                    p_res = call_flowkit_api("/api/flow/check-status", p_body, timeout=20, max_retries=1)
+                    ret_ops = p_res.get("operations") or (p_res.get("data") or {}).get("operations") or []
+                    for op_item in ret_ops:
+                        st = str(op_item.get("status") or "")
+                        meta = (op_item.get("operation") or {}).get("metadata", {})
+                        fife = meta.get("video", {}).get("fifeUrl")
+                        if st == "MEDIA_GENERATION_STATUS_SUCCESSFUL" or fife:
+                            urllib.request.urlretrieve(fife, str(cp))
+                            vc["status"] = "COMPLETED"
+                            vc["status_text"] = "Đã hoàn thành video"
+                            vc["video_url"] = f"/api/fashion-lookbook/stage2/clips/{job_id}/{cid}"
+                            valid_clips.append(cp)
+                            changed = True
+                            break
+                        elif "PENDING" in st.upper() or not st:
+                            has_pending = True
+                            vc["status"] = "RENDERING_VIDEO"
+                            changed = True
+                            break
+                except Exception as ex:
+                    print(f"[STAGE2 WATCHDOG] Error checking status for {op_name}: {ex}")
+
+            if vc.get("status") in ["PENDING", "RENDERING_VIDEO"]:
+                has_pending = True
+
+        if len(valid_clips) == len(video_clips) and len(video_clips) > 0:
+            save_lookbook_job(
+                job_id,
+                stage=2,
+                status="STAGE2_COMPLETED",
+                progress_percent=100,
+                message=f"Đã hoàn thành toàn bộ {len(video_clips)} video thời trang!",
+                video_clips=video_clips
+            )
+            stitch_lookbook_final(job_id)
+            return LOOKBOOK_JOBS.get(job_id, job)
+        elif has_pending:
+            if job_id not in ACTIVE_LOOKBOOK_WORKERS:
+                threading.Thread(target=run_stage2_lookbook_worker, args=(job_id,), daemon=True).start()
+            save_lookbook_job(
+                job_id,
+                stage=2,
+                status="STAGE2_RUNNING",
+                progress_percent=max(10, int(len(valid_clips) / max(1, len(video_clips)) * 90)),
+                message=f"Đang tiếp tục kết xuất {len(valid_clips)}/{len(video_clips)} video...",
+                video_clips=video_clips
+            )
+            return LOOKBOOK_JOBS.get(job_id, job)
+        elif changed:
+            save_lookbook_job(job_id, video_clips=video_clips)
+        return LOOKBOOK_JOBS.get(job_id, job)
+
+    if not scenes:
         return LOOKBOOK_JOBS.get(job_id, job)
 
     # Check if all scene clips exist on disk
@@ -1422,7 +1546,8 @@ def create_stage1_lookbook_job(
     style_preset: str = "Luxury boutique fashion",
     lighting_preset: str = "soft studio lighting",
     model_ai: str = "google/nano-banana-pro",
-    selected_poses: Optional[list[str]] = None
+    selected_poses: Optional[list[str]] = None,
+    num_threads: Optional[int] = None
 ) -> str:
     """Create a new Stage 1 Master Flow Lookbook job (1-9 products, 15 poses gallery)."""
     job_id = uuid.uuid4().hex[:12]
@@ -1507,6 +1632,7 @@ def create_stage1_lookbook_job(
             "created_at": time.time()
         })
 
+    effective_threads = int(num_threads) if num_threads else LOOKBOOK_CONFIG["num_threads"]
     job = {
         "job_id": job_id,
         "stage": 1,
@@ -1518,6 +1644,7 @@ def create_stage1_lookbook_job(
         "aspect_ratio": aspect_ratio,
         "quality": quality,
         "quantity": len(valid_poses),
+        "num_threads": effective_threads,
         "style_preset": style_preset,
         "lighting_preset": lighting_preset,
         "background_preset": background_preset,
@@ -1540,7 +1667,7 @@ def create_stage1_lookbook_job(
 
 
 def run_stage1_lookbook_worker(job_id: str):
-    """Execute Stage 1: Upload references (1-9 products + model + bg) and render Lookbook Gallery."""
+    """Execute Stage 1: Upload references (1-9 products + model + bg) and render Lookbook Gallery with concurrency."""
     ACTIVE_LOOKBOOK_WORKERS.add(job_id)
     try:
         jdir = WORK_DIR / f"lookbook_{job_id}"
@@ -1556,6 +1683,7 @@ def run_stage1_lookbook_worker(job_id: str):
         has_bg_ref = bool(job.get("has_background_ref"))
         model_preset_id = job.get("model_preset_id", "asian_minimalist_25")
         images_data = job.get("images", [])
+        job_threads = int(job.get("num_threads") or LOOKBOOK_CONFIG["num_threads"])
 
         # Step 1: Upload references
         save_lookbook_job(job_id, status="PREPARING_REFS", progress_percent=15, message="Đang nạp ảnh sản phẩm và người mẫu vào GPU...")
@@ -1614,18 +1742,20 @@ def run_stage1_lookbook_worker(job_id: str):
         # Step 2: Generate Lookbook Images
         save_lookbook_job(job_id, status="GENERATING_IMAGES", progress_percent=30, message="Đang sinh bộ sưu tập ảnh Lookbook chuẩn thời trang...")
 
-        golden_mid = None
+        flow_ar = "IMAGE_ASPECT_RATIO_PORTRAIT" if aspect_ratio in ["3:4", "9:16"] else "IMAGE_ASPECT_RATIO_LANDSCAPE"
 
-        for idx, img_item in enumerate(images_data):
+        def _render_image_item(img_item, current_refs, golden_anchor=None):
             img_id = img_item["image_id"]
             pose = img_item["pose"]
             img_path = jdir / f"image_{img_id}.jpg"
+
+            if img_path.exists() and img_path.stat().st_size > 10000 and img_item.get("status") == "COMPLETED":
+                return img_item.get("media_id")
 
             img_item["status"] = "GENERATING"
             img_item["status_text"] = f"Đang vẽ dáng {pose}..."
             save_lookbook_job(job_id, images=images_data)
 
-            # Build Master Flow Director Prompt
             prompt = build_image_prompt(
                 pose=pose,
                 aspect_ratio=aspect_ratio,
@@ -1636,31 +1766,26 @@ def run_stage1_lookbook_worker(job_id: str):
                 has_background_ref=bool(bg_mid)
             )
 
-            # If golden anchor exists from Image 1, link for identity consistency
-            current_refs = all_refs
-            if golden_mid and img_id > 1:
+            refs_for_image = list(current_refs)
+            if golden_anchor and img_id > 1:
                 prompt = (
                     f"EXACT SAME MODEL AND OUTFIT AS PRIMARY REFERENCE IMAGE. "
                     f"Keep face shape, hairstyle, skin tone and exact garment construction consistent. "
                     f"{prompt}"
                 )
-                current_refs = [golden_mid] + [m for m in all_refs if m != golden_mid]
+                refs_for_image = [golden_anchor] + [m for m in current_refs if m != golden_anchor]
 
             img_item["prompt"] = prompt
 
-            # Map aspect ratio for FlowKit
-            flow_ar = "IMAGE_ASPECT_RATIO_PORTRAIT" if aspect_ratio in ["3:4", "9:16"] else "IMAGE_ASPECT_RATIO_LANDSCAPE"
-
             payload = {
                 "prompt": prompt,
-                "character_media_ids": current_refs,
-                "reference_image_media_ids": current_refs,
-                "imageInputs": [{"media_id": m} for m in current_refs],
+                "character_media_ids": refs_for_image,
+                "reference_image_media_ids": refs_for_image,
+                "imageInputs": [{"media_id": m} for m in refs_for_image],
                 "aspect_ratio": flow_ar,
                 "model_family": "banana_pro"
             }
 
-            img_generated = False
             for attempt in range(1, 4):
                 try:
                     res = call_flowkit_api("/api/flow/generate-image", payload, timeout=180)
@@ -1678,20 +1803,26 @@ def run_stage1_lookbook_worker(job_id: str):
                         img_item["image_url"] = f"/api/fashion-lookbook/stage1/images/{job_id}/{img_id}"
                         img_item["status"] = "COMPLETED"
                         img_item["status_text"] = "Đã hoàn thành ảnh"
-                        if not golden_mid:
-                            golden_mid = mid
-                        img_generated = True
-                        break
+                        save_lookbook_job(job_id, images=images_data)
+                        return mid
                 except Exception as e:
                     print(f"[LOOKBOOK STAGE1] Attempt {attempt} failed for image {img_id}: {e}")
                     time.sleep(3)
 
-            if not img_generated:
-                img_item["status"] = "FAILED"
-                img_item["status_text"] = "Lỗi khi sinh ảnh"
+            img_item["status"] = "FAILED"
+            img_item["status_text"] = "Lỗi khi sinh ảnh"
+            save_lookbook_job(job_id, images=images_data)
+            return None
 
-            pct = 30 + int((idx + 1) / len(images_data) * 60)
-            save_lookbook_job(job_id, images=images_data, progress_percent=pct)
+        golden_mid = None
+        if images_data:
+            # First image generated as Golden Anchor
+            golden_mid = _render_image_item(images_data[0], all_refs)
+
+        if len(images_data) > 1:
+            max_workers = max(1, min(10, job_threads, len(images_data) - 1))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                list(executor.map(lambda item: _render_image_item(item, all_refs, golden_mid), images_data[1:]))
 
         # Step 3: Bundle ZIP
         create_stage1_zip(job_id)
@@ -1720,9 +1851,10 @@ def create_stage2_lookbook_job(
     camera_movement: str = "Cinematic Push-in",
     duration: int = 8,
     video_model: str = "Omni Flash",
-    is_lite_mode: bool = False
+    is_lite_mode: bool = False,
+    num_threads: Optional[int] = None
 ) -> dict:
-    """Create a Stage 2 Video Generation request for selected lookbook images."""
+    """Create a Stage 2 Video Generation request for selected lookbook images with concurrency."""
     job = LOOKBOOK_JOBS.get(job_id)
     if not job:
         jdir = WORK_DIR / f"lookbook_{job_id}"
@@ -1760,12 +1892,14 @@ def create_stage2_lookbook_job(
             "created_at": time.time()
         })
 
+    effective_threads = int(num_threads) if num_threads else LOOKBOOK_CONFIG["num_threads"]
     save_lookbook_job(
         job_id,
         stage=2,
         status="STAGE2_RUNNING",
         progress_percent=10,
-        message=f"Bắt đầu dựng {len(video_clips)} video thời trang chuyển động...",
+        num_threads=effective_threads,
+        message=f"Bắt đầu dựng {len(video_clips)} video thời trang chuyển động ({effective_threads} luồng)...",
         video_clips=video_clips
     )
 
@@ -1774,7 +1908,7 @@ def create_stage2_lookbook_job(
 
 
 def run_stage2_lookbook_worker(job_id: str):
-    """Execute Stage 2: Render video motion clips for all selected lookbook images."""
+    """Execute Stage 2: Render video motion clips concurrently using ThreadPoolExecutor."""
     ACTIVE_LOOKBOOK_WORKERS.add(job_id)
     try:
         jdir = WORK_DIR / f"lookbook_{job_id}"
@@ -1785,23 +1919,62 @@ def run_stage2_lookbook_worker(job_id: str):
         video_clips = job.get("video_clips", [])
         aspect_ratio = job.get("aspect_ratio", "3:4")
         video_ar = "VIDEO_ASPECT_RATIO_PORTRAIT" if aspect_ratio in ["3:4", "9:16"] else "VIDEO_ASPECT_RATIO_LANDSCAPE"
+        job_threads = int(job.get("num_threads") or LOOKBOOK_CONFIG["num_threads"])
 
-        for idx, clip in enumerate(video_clips):
+        # 1. Immediate check: Mark existing valid clips as COMPLETED
+        for clip in video_clips:
+            cid = clip["clip_id"]
+            clip_path = jdir / f"clip_{cid}.mp4"
+            if clip_path.exists() and clip_path.stat().st_size > 50000:
+                clip["status"] = "COMPLETED"
+                clip["status_text"] = "Đã hoàn thành video"
+                clip["video_url"] = f"/api/fashion-lookbook/stage2/clips/{job_id}/{cid}"
+
+        save_lookbook_job(job_id, video_clips=video_clips)
+
+        # 2. Filter clips that still need rendering
+        pending_clips = [c for c in video_clips if c.get("status") != "COMPLETED"]
+        if not pending_clips:
+            save_lookbook_job(
+                job_id,
+                status="STAGE2_COMPLETED",
+                stage=2,
+                progress_percent=100,
+                message=f"Đã hoàn thành toàn bộ {len(video_clips)} video thời trang!",
+                video_clips=video_clips
+            )
+            stitch_lookbook_final(job_id)
+            return
+
+        max_workers = max(1, min(10, job_threads, len(pending_clips)))
+
+        def _render_single_clip(item_and_stagger):
+            idx, clip = item_and_stagger
+            stagger_s = idx * 2.0
+            if stagger_s > 0:
+                time.sleep(stagger_s)
+
             cid = clip["clip_id"]
             img_path = jdir / f"image_{cid}.jpg"
             clip_path = jdir / f"clip_{cid}.mp4"
+
+            if clip_path.exists() and clip_path.stat().st_size > 50000:
+                clip["status"] = "COMPLETED"
+                clip["status_text"] = "Đã hoàn thành video"
+                clip["video_url"] = f"/api/fashion-lookbook/stage2/clips/{job_id}/{cid}"
+                save_lookbook_job(job_id, video_clips=video_clips)
+                return
 
             if not img_path.exists():
                 clip["status"] = "FAILED"
                 clip["status_text"] = f"Không tìm thấy file ảnh gốc image_{cid}.jpg"
                 save_lookbook_job(job_id, video_clips=video_clips)
-                continue
+                return
 
             clip["status"] = "RENDERING_VIDEO"
             clip["status_text"] = "Đang kết xuất chuyển động video (Veo 3.1 / Omni Flash)..."
             save_lookbook_job(job_id, video_clips=video_clips)
 
-            # Fresh upload of source frame
             start_mid = None
             try:
                 start_mid = upload_image_flowkit(img_path)
@@ -1812,7 +1985,7 @@ def run_stage2_lookbook_worker(job_id: str):
                 clip["status"] = "FAILED"
                 clip["status_text"] = "Lỗi nạp ảnh khung hình gốc vào GPU"
                 save_lookbook_job(job_id, video_clips=video_clips)
-                continue
+                return
 
             video_prompt = build_video_prompt(
                 motion_preset=clip.get("motion_preset", "Elegant Turnaround"),
@@ -1841,7 +2014,7 @@ def run_stage2_lookbook_worker(job_id: str):
 
                 # Poll until video is ready
                 start_t = time.time()
-                time.sleep(20)
+                time.sleep(15)
                 video_saved = False
                 while time.time() - start_t < 720:
                     time.sleep(6)
@@ -1875,18 +2048,29 @@ def run_stage2_lookbook_worker(job_id: str):
                 clip["status_text"] = str(e)[:100]
                 save_lookbook_job(job_id, video_clips=video_clips)
 
-            pct = 10 + int((idx + 1) / len(video_clips) * 85)
-            save_lookbook_job(job_id, video_clips=video_clips, progress_percent=pct)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(_render_single_clip, enumerate(pending_clips)))
 
         completed_clips = sum(1 for c in video_clips if c.get("status") == "COMPLETED")
-        save_lookbook_job(
-            job_id,
-            status="STAGE2_COMPLETED",
-            stage=2,
-            progress_percent=100,
-            message=f"Đã hoàn thành {completed_clips}/{len(video_clips)} video thời trang!",
-            video_clips=video_clips
-        )
+        if completed_clips == len(video_clips):
+            save_lookbook_job(
+                job_id,
+                status="STAGE2_COMPLETED",
+                stage=2,
+                progress_percent=100,
+                message=f"Đã hoàn thành toàn bộ {len(video_clips)} video thời trang!",
+                video_clips=video_clips
+            )
+            stitch_lookbook_final(job_id)
+        else:
+            save_lookbook_job(
+                job_id,
+                status="STAGE2_PARTIAL",
+                stage=2,
+                progress_percent=int(completed_clips / len(video_clips) * 100),
+                message=f"Đã hoàn thành {completed_clips}/{len(video_clips)} video thời trang.",
+                video_clips=video_clips
+            )
 
     finally:
         ACTIVE_LOOKBOOK_WORKERS.discard(job_id)
@@ -1903,4 +2087,3 @@ def stitch_lookbook_master(job_id: str, bgm_id: str = "vogue_runway") -> dict:
         "job_id": job_id,
         "master_url": f"/api/fashion-lookbook/{job_id}/master" if success else None
     }
-

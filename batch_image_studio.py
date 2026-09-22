@@ -18,13 +18,12 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Optional, Any
-from concurrent.futures import ThreadPoolExecutor
 
 WORK_DIR = Path("/home/pc/flowkit/auto_runs")
-FLOWKIT_API = "http://127.0.0.1:8100"
-NOVA_BASE_URL = "https://novagateway.net/v1"
-NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "NOVA_e9eWanAexhxLDKfEeVbLUMb16bxR7_AU")
-NOVA_MODEL = os.environ.get("NOVA_MODEL", "google/gemini-3.8-flash")
+FLOWKIT_API = os.environ.get("FLOWKIT_API", "http://127.0.0.1:8100").rstrip("/")
+NOVA_BASE_URL = os.environ.get("NOVA_BASE_URL", "https://api.vilao.ai/v1")
+NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "sk-72afd079199f58a7b302e65b6690744ce8cf7b44c0dcd163070052e7fa774535")
+NOVA_MODEL = os.environ.get("NOVA_MODEL", "chib/deepseek-v4.1-flash")
 
 IMAGE_DIRECTOR = """PRODUCT REFERENCE LOCK — HIGHEST PRIORITY.
 Copy the reference product EXACTLY.
@@ -50,13 +49,59 @@ VARIANT_ANGLES = [
 ]
 
 BATCH_JOBS: dict[str, dict] = {}
+_BATCH_LOCKS = {}
+_SCHEDULER = None
+_SCHEDULER_LOCK = threading.Lock()
 
 
+def batch_scheduler():
+    global _SCHEDULER
+    with _SCHEDULER_LOCK:
+        if _SCHEDULER is None:
+            import sys
+            from batch_scheduler import BatchScheduler
+            _SCHEDULER = BatchScheduler(sys.modules[__name__])
+        return _SCHEDULER
+
+
+def defer_not_submitted(batch_id, item, phase, error):
+    count = item.get(f"{phase}_busy_count", 0) + 1
+    delay = max(error.retry_after_s, min(60, 3 * 2 ** min(count - 1, 5)))
+    item[f"{phase}_busy_count"] = count
+    item[f"{phase}_next_attempt_at"] = time.time() + delay
+    item["status" if phase == "image" else "video_status"] = "QUEUED"
+    item["retry_safe" if phase == "image" else "video_retry_safe"] = True
+    item.pop("error" if phase == "image" else "video_error", None)
+    item["message"] = "Đang chờ lượt; hệ thống bận, yêu cầu chưa được gửi."
+    save_batch_job(batch_id)
+
+
+def _batch_lock(batch_id):
+    return _BATCH_LOCKS.setdefault(batch_id, threading.RLock())
+
+
+class FlowRequestError(RuntimeError):
+    def __init__(self, message, *, retry_safe=False, retry_after_s=3):
+        super().__init__(message)
+        self.retry_safe = retry_safe
+        self.retry_after_s = retry_after_s
+
+
+from agent.services.flow_trace import traced_sync, trace_id, emit as trace_emit, summary as trace_summary
+from agent.services.parked_retry import ParkedBackoff, retry_after_seconds
+
+
+@traced_sync("batch.api")
 def call_flowkit_api(endpoint: str, payload: dict, timeout: int = 180, max_retries: int = 4) -> dict:
     """Send request to FlowKit server with auto-retry and failover support."""
+    if endpoint in ("/api/flow/generate-image", "/api/flow/generate-video", "/api/flow/generate-video-refs"):
+        max_retries = 1
     url = f"{FLOWKIT_API}{endpoint}"
     data = json.dumps(payload).encode("utf-8")
-    for attempt in range(1, max_retries + 1):
+    parked = ParkedBackoff()
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
         req = urllib.request.Request(
             url,
             data=data,
@@ -65,24 +110,42 @@ def call_flowkit_api(endpoint: str, payload: dict, timeout: int = 180, max_retri
                 "User-Agent": "FlowKit-BatchStudio/1.0"
             }
         )
+        req.add_header("X-Request-ID", trace_id.get())
+        trace_emit("batch.api.attempt", attempt=attempt, endpoint=endpoint, timeout_s=timeout)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as err:
+            trace_emit("batch.api.http_error", status=err.code, attempt=attempt)
             err_body = ""
             try:
                 err_body = err.read().decode("utf-8", errors="ignore")
             except Exception:
                 pass
-            if err.code == 429 or "UNUSUAL" in err_body.upper():
+            # A fully parked fleet submitted nothing: wait it out instead of
+            # failing the item after ~10s of 503s. Does not consume an attempt.
+            if parked.wait(err, err_body):
+                attempt -= 1
+                continue
+            if attempt < max_retries and (err.code == 429 or "UNUSUAL" in err_body.upper()):
                 print(f"[FLOWKIT BATCH] 429/Unusual activity on {endpoint} (Attempt {attempt}/{max_retries}). Delaying 4s...")
-                time.sleep(4.0)
+                time.sleep(retry_after_seconds(err, 4.0))
                 continue
             elif attempt < max_retries and err.code in [500, 502, 503, 504]:
                 print(f"[FLOWKIT BATCH] HTTP {err.code} on {endpoint} (Attempt {attempt}/{max_retries}). Retrying in 2.5s...")
                 time.sleep(2.5)
                 continue
-            raise RuntimeError(f"FlowKit error {err.code} on {endpoint}: {err_body or err.reason}")
+            try:
+                detail = json.loads(err_body)
+            except (ValueError, TypeError):
+                detail = {}
+            safe = isinstance(detail, dict) and detail.get("error") == "FLOW_REQUEST_NOT_SUBMITTED" and detail.get("retryable") is True
+            retry_after = detail.get("retry_after_s", 3) if isinstance(detail, dict) else 3
+            try:
+                retry_after = max(3, float(retry_after))
+            except (ValueError, TypeError):
+                retry_after = 3
+            raise FlowRequestError(f"FlowKit error {err.code} on {endpoint}: {err_body or err.reason}", retry_safe=safe, retry_after_s=retry_after)
         except Exception as e:
             if attempt < max_retries:
                 print(f"[FLOWKIT BATCH] Network error on {endpoint}: {e}. Retrying in 2.5s...")
@@ -91,7 +154,7 @@ def call_flowkit_api(endpoint: str, payload: dict, timeout: int = 180, max_retri
             raise
 
 
-def upload_image_flowkit(image_path: Path) -> str:
+def upload_image_flowkit(image_path: Path, reference_media_id: str = "") -> str:
     """Upload image to FlowKit Gateway and return media UUID."""
     b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
     payload = {
@@ -99,11 +162,40 @@ def upload_image_flowkit(image_path: Path) -> str:
         "mime_type": "image/jpeg",
         "file_name": image_path.name
     }
+    if reference_media_id:
+        payload["reference_media_id"] = reference_media_id
     res = call_flowkit_api("/api/flow/upload-image", payload, timeout=120)
     mid = res.get("media_id") or (res.get("raw", {}).get("media") or {}).get("name") or (res.get("media") or {}).get("name") or res.get("_mediaId")
     if not mid:
         raise RuntimeError(f"Failed to upload image {image_path.name}: {res}")
     return mid
+
+
+def prepare_batch_references(batch_id: str):
+    """Bind references before generation; reupload legacy mixed-nick inputs."""
+    with _batch_lock(batch_id):
+        batch = BATCH_JOBS[batch_id]
+        entities = batch.get("face_models", []) + batch.get("outfits", [])
+        anchor = batch.get("reference_anchor_media_id", "")
+        bdir = WORK_DIR / f"batch_{batch_id}"
+        for entity in entities:
+            if (not anchor or not entity.get("media_id")
+                    or entity.get("binding_anchor_media_id") != anchor):
+                mid = upload_image_flowkit(bdir / entity["filename"], anchor)
+                anchor = anchor or mid
+                entity.update(media_id=mid, binding_anchor_media_id=anchor)
+                batch["reference_anchor_media_id"] = anchor
+                save_batch_job(batch_id)
+        faces = {v["index"]: v["media_id"] for v in batch.get("face_models", [])}
+        outfits = {v["index"]: v["media_id"] for v in batch.get("outfits", [])}
+        for item in batch.get("items", []):
+            if item.get("status") == "COMPLETED":
+                continue
+            face, outfit = faces.get(item.get("face_index")), outfits.get(item.get("outfit_index"))
+            if not face or not outfit:
+                raise FlowRequestError("REFERENCE_UPLOAD_FAILED: both references are required")
+            item.update(face_media_id=face, outfit_media_id=outfit)
+        save_batch_job(batch_id)
 
 
 def refine_fashion_prompt(user_prompt: str) -> str:
@@ -130,33 +222,42 @@ def refine_fashion_prompt(user_prompt: str) -> str:
     except Exception as e_cli:
         print(f"[PROMPT REFINE] Claude CLI error: {e_cli}")
 
-    # 2. Secondary: Nova Gateway (Gemini 3.8 Flash)
-    try:
-        payload = {
-            "model": NOVA_MODEL,
-            "messages": [
-                {"role": "system", "content": "Bạn là chuyên gia prompt cho Fashion AI."},
-                {"role": "user", "content": prompt_text}
-            ],
-            "max_tokens": 1024,
-            "thinking_config": {"thinking_budget": 0}
-        }
-        req = urllib.request.Request(
-            f"{NOVA_BASE_URL}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {NOVA_API_KEY}",
-                "Content-Type": "application/json"
+    # 2. Secondary: Nova Gateway (DeepSeek -> Grok fallback)
+    candidate_models = [
+        os.environ.get("NOVA_MODEL", NOVA_MODEL),
+        "spd/grok-4.6",
+        "grok-4.6",
+        "cnt/grok-4.6",
+        "fa/grok-4.6-fast"
+    ]
+    for model_name in candidate_models:
+        try:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": "Bạn là chuyên gia prompt cho Fashion AI."},
+                    {"role": "user", "content": prompt_text}
+                ],
+                "max_tokens": 1024
             }
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"].strip()
-            if content.startswith('"') and content.endswith('"'):
-                content = content[1:-1].strip()
-            return content
-    except Exception as e_nova:
-        pass
+            req = urllib.request.Request(
+                f"{NOVA_BASE_URL}/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {NOVA_API_KEY}",
+                    "Content-Type": "application/json"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0]["message"].get("content", "").strip()
+                    if content.startswith('"') and content.endswith('"'):
+                        content = content[1:-1].strip()
+                    if content:
+                        return content
+        except Exception:
+            continue
 
     # 3. Fallback to FlowKit internal agJzFb
     try:
@@ -193,6 +294,11 @@ def load_all_batch_jobs():
 
 def save_batch_job(batch_id: str, **kwargs):
     """Update and persist batch job state."""
+    with _batch_lock(batch_id):
+        _save_batch_job(batch_id, **kwargs)
+
+
+def _save_batch_job(batch_id: str, **kwargs):
     b = BATCH_JOBS.setdefault(batch_id, {"batch_id": batch_id})
     b.update(kwargs)
     b["updated_at"] = time.time()
@@ -203,30 +309,43 @@ def save_batch_job(batch_id: str, **kwargs):
     completed = sum(1 for it in items if it.get("status") == "COMPLETED")
     failed = sum(1 for it in items if it.get("status") == "FAILED")
     processing = sum(1 for it in items if it.get("status") in ["GENERATING", "VIDEO_RENDERING", "SUBMITTING"])
-    pending = sum(1 for it in items if it.get("status") == "PENDING")
+    pending = sum(1 for it in items if it.get("status") in {"PENDING", "QUEUED"})
+    video_pending = sum(1 for it in items if it.get("video_status") == "QUEUED")
+    video_processing = sum(1 for it in items if it.get("video_status") in {"SUBMITTING", "RENDERING", "GENERATING"})
 
     pct = round((completed / total * 100), 1) if total > 0 else 0
-    is_video_running = any(it.get("video_status") in ["SUBMITTING", "RENDERING", "GENERATING"] for it in items)
+    is_video_running = any(it.get("video_status") in ["QUEUED", "SUBMITTING", "RENDERING", "GENERATING"] for it in items)
     b["stats"] = {
         "total": total,
         "completed": completed,
         "failed": failed,
-        "processing": processing + (1 if is_video_running else 0),
+        "processing": processing + video_processing,
         "pending": pending,
+        "video_pending": video_pending,
         "progress_percent": pct,
         "is_done": (completed + failed) == total and total > 0 and not is_video_running
     }
 
+    if pending or is_video_running:
+        b["message"] = "Đang xử lý; các yêu cầu còn lại đang chờ lượt."
+    elif (completed + failed) == total:
+        b["message"] = f"Đã hoàn thành {completed}/{total} ảnh" + (f" ({failed} ảnh cần kiểm tra)." if failed else ".")
+
     bdir = WORK_DIR / f"batch_{batch_id}"
     bdir.mkdir(parents=True, exist_ok=True)
     try:
-        (bdir / "batch.json").write_text(json.dumps(b, ensure_ascii=False, indent=2), encoding="utf-8")
+        pending = bdir / "batch.json.pending"
+        pending.write_text(json.dumps(b, ensure_ascii=False, indent=2), encoding="utf-8")
+        with pending.open("rb") as saved:
+            os.fsync(saved.fileno())
+        pending.replace(bdir / "batch.json")
     except Exception as e:
         print(f"[BATCH] Error saving batch {batch_id}: {e}")
+        raise
 
 
 def execute_single_item(batch_id: str, item_id: int):
-    """Execute single image generation task with Dual-Reference Binding and 3-attempt auto-retry."""
+    """Generate once; retry only a proven not-submitted request."""
     b = BATCH_JOBS.get(batch_id)
     if not b:
         return
@@ -234,6 +353,18 @@ def execute_single_item(batch_id: str, item_id: int):
     item = next((it for it in b.get("items", []) if it.get("item_id") == item_id), None)
     if not item:
         return
+
+    with _batch_lock(batch_id):
+        if item.get("status") not in {"PENDING", "QUEUED", "FAILED"} or item.get("retry_safe") is False:
+            return
+        item["status"] = "GENERATING"
+        item.pop("error", None)
+        try:
+            prepare_batch_references(batch_id)
+        except Exception as exc:
+            item.update(status="FAILED", error=str(exc), message="Không nạp đủ ảnh tham chiếu; chưa gửi tạo ảnh.")
+            save_batch_job(batch_id)
+            return
 
     bdir = WORK_DIR / f"batch_{batch_id}"
     cfg = b.get("config", {})
@@ -244,7 +375,7 @@ def execute_single_item(batch_id: str, item_id: int):
     ref_media_ids = [mid for mid in [item.get("face_media_id"), item.get("outfit_media_id")] if mid]
     prompt = item.get("prompt", IMAGE_DIRECTOR)
 
-    max_attempts = 3
+    max_attempts = 1
     success = False
     last_error = ""
 
@@ -270,15 +401,23 @@ def execute_single_item(batch_id: str, item_id: int):
             mid = media.get("name") or media.get("image", {}).get("generatedImage", {}).get("mediaId")
             fife_url = media.get("image", {}).get("generatedImage", {}).get("fifeUrl") or f"{FLOWKIT_API}/api/flow/image/{mid}"
 
+            item["output_media_id"] = mid
+            save_batch_job(batch_id)
+
             # Save generated image
             img_out_path = bdir / f"item_{item_id}.jpg"
             urllib.request.urlretrieve(fife_url, str(img_out_path))
 
             item["status"] = "COMPLETED"
+            item.pop("error", None)
+            item.pop("retry_safe", None)
+            item.pop("image_next_attempt_at", None)
             item["output_media_id"] = mid
             item["image_url"] = f"/batch/{batch_id}/item/{item_id}"
             item["message"] = "Hoàn tất thành công!"
             item["completed_at"] = time.time()
+            if auto_transfer_video:
+                item["video_status"] = "QUEUED"
             success = True
             save_batch_job(batch_id)
             print(f"[BATCH {batch_id}] Item {item_id} completed successfully (Media: {mid[:12]}...)!")
@@ -287,19 +426,38 @@ def execute_single_item(batch_id: str, item_id: int):
         except Exception as e:
             last_error = str(e)
             print(f"[BATCH {batch_id}] Item {item_id} attempt {attempt} failed: {e}")
-            if attempt < max_attempts:
-                time.sleep(2.0)
+            if not isinstance(e, FlowRequestError) or not e.retry_safe:
+                item["retry_safe"] = False
+                break
+            defer_not_submitted(batch_id, item, "image", e)
+            return
 
     if not success:
         item["status"] = "FAILED"
         item["error"] = last_error
-        item["message"] = f"Thất bại sau 3 lần thử: {last_error}"
+        item["message"] = f"Thất bại sau {attempt} lần thử: {last_error}"
         save_batch_job(batch_id)
         return
 
     # Auto-transfer to video Veo 3.1 if enabled
-    if auto_transfer_video and item.get("output_media_id"):
-        transfer_item_to_video(batch_id, item_id)
+    # Video submission gets its own fair queue turn; polling never holds a lane.
+
+
+def queue_batch_video(batch_id, item_id, motion_prompt=""):
+    with _batch_lock(batch_id):
+        batch = BATCH_JOBS.get(batch_id, {})
+        item = next((i for i in batch.get("items", []) if i["item_id"] == item_id), None)
+        if (not item or item.get("status") != "COMPLETED"
+                or item.get("video_status") in {"QUEUED", "SUBMITTING", "RENDERING", "COMPLETED"}
+                or item.get("video_retry_safe") is False):
+            return False
+        item.update(video_status="QUEUED", queued_motion_prompt=motion_prompt)
+        batch["queue_version"] = 1
+        save_batch_job(batch_id)
+    scheduler = batch_scheduler()
+    scheduler.register(batch_id)
+    scheduler.start()
+    return True
 
 
 def transfer_item_to_video(batch_id: str, item_id: int, motion_prompt: str = ""):
@@ -322,29 +480,23 @@ def transfer_item_to_video(batch_id: str, item_id: int, motion_prompt: str = "")
     bdir = WORK_DIR / f"batch_{batch_id}"
     item_img = bdir / f"item_{item_id}.jpg"
 
-    v_prompt = motion_prompt or (
+    v_prompt = motion_prompt or item.get("queued_motion_prompt") or (
         "Cinematic commercial fashion shot, model posing smoothly, subtle breathing movement, "
         "gentle fabric motion, product perfectly visible and stable, photorealistic 8k vertical video."
     )
 
-    item["video_status"] = "SUBMITTING"
-    item["video_error"] = None
-    save_batch_job(batch_id)
+    with _batch_lock(batch_id):
+        if item.get("video_status") in {"SUBMITTING", "RENDERING", "COMPLETED"}:
+            return
+        if item.get("video_retry_safe") is False:
+            return
+        item["video_status"] = "SUBMITTING"
+        item["video_error"] = None
+        save_batch_job(batch_id)
 
     try:
-        # Guarantee start image exists on active FlowKit worker
-        start_mid = None
-        if item_img.exists():
-            try:
-                start_mid = upload_image_flowkit(item_img)
-                item["output_media_id"] = start_mid
-                print(f"[BATCH VIDEO] Item {item_id} re-uploaded to active worker media_id: {start_mid}")
-            except Exception as up_err:
-                print(f"[BATCH VIDEO] Could not re-upload item {item_id}, fallback to existing media_id: {up_err}")
-                start_mid = item.get("output_media_id")
-        else:
-            start_mid = item.get("output_media_id")
-
+        # The generated UUID already pins its owner; do not reupload onto another nick.
+        start_mid = item.get("output_media_id")
         if not start_mid:
             raise RuntimeError(f"Không tìm thấy ảnh gốc cho item #{item_id}")
 
@@ -369,112 +521,106 @@ def transfer_item_to_video(batch_id: str, item_id: int, motion_prompt: str = "")
         item["video_status"] = "RENDERING"
         save_batch_job(batch_id)
 
-        # Background poller for this single video
-        def _poll_video():
-            start_t = time.time()
-            time.sleep(25)  # initial settling delay
-            while time.time() - start_t < 900:
-                time.sleep(8)
-                try:
-                    p_body = {"operations": [{"operation": {"name": op_name}}]}
-                    p_res = call_flowkit_api("/api/flow/check-status", p_body, timeout=40)
-                    ret_ops = p_res.get("operations") or (p_res.get("data") or {}).get("operations") or []
-                    for op_item in ret_ops:
-                        st = op_item.get("status")
-                        meta = (op_item.get("operation") or {}).get("metadata", {})
-                        fife = meta.get("video", {}).get("fifeUrl")
-                        if st == "MEDIA_GENERATION_STATUS_SUCCESSFUL" or fife:
-                            vpath = bdir / f"video_{item_id}.mp4"
-                            urllib.request.urlretrieve(fife, str(vpath))
-                            item["video_status"] = "COMPLETED"
-                            item["video_url"] = f"/batch/{batch_id}/video/{item_id}"
-                            save_batch_job(batch_id)
-                            print(f"[BATCH VIDEO] Item {item_id} video downloaded to {vpath.name}!")
-                            return
-                        elif "FAIL" in str(st).upper():
-                            item["video_status"] = "FAILED"
-                            item["video_error"] = str(op_item)
-                            save_batch_job(batch_id)
-                            return
-                except Exception as p_err:
-                    print(f"[BATCH VIDEO] Polling err item {item_id}: {p_err}")
-
-        threading.Thread(target=_poll_video, daemon=True).start()
+        item["video_poll_started_at"] = time.time()
+        item.pop("video_next_attempt_at", None)
+        save_batch_job(batch_id)
+        start_video_poller(batch_id, item_id)
 
     except Exception as exc:
+        if isinstance(exc, FlowRequestError) and exc.retry_safe:
+            defer_not_submitted(batch_id, item, "video", exc)
+            return
         item["video_status"] = "FAILED"
+        item["video_retry_safe"] = False
         item["video_error"] = str(exc)
         save_batch_job(batch_id)
 
 
+_VIDEO_POLLERS = set()
+_VIDEO_POLLERS_LOCK = threading.Lock()
+
+
+def start_video_poller(batch_id, item_id):
+    key = (batch_id, item_id)
+    with _VIDEO_POLLERS_LOCK:
+        if key in _VIDEO_POLLERS:
+            return
+        _VIDEO_POLLERS.add(key)
+    threading.Thread(target=_poll_batch_video, args=key, daemon=True, name="BatchVideoPoll").start()
+
+
+def _poll_batch_video(batch_id, item_id):
+    item = next(i for i in BATCH_JOBS[batch_id]["items"] if i["item_id"] == item_id)
+    op_name = item["video_op_name"]
+    deadline = item.get("video_poll_started_at", time.time()) + 900
+    try:
+        while time.time() < deadline:
+            try:
+                result = call_flowkit_api("/api/flow/check-status", {"operations": [{"operation": {"name": op_name}}]}, timeout=40)
+                ops = result.get("operations") or (result.get("data") or {}).get("operations") or []
+                for op in ops:
+                    status = str(op.get("status", ""))
+                    url = (op.get("operation") or {}).get("metadata", {}).get("video", {}).get("fifeUrl")
+                    if url:
+                        path = WORK_DIR / f"batch_{batch_id}" / f"video_{item_id}.mp4"
+                        urllib.request.urlretrieve(url, str(path))
+                        item.update(video_status="COMPLETED", video_url=f"/batch/{batch_id}/video/{item_id}", video_error=None)
+                        save_batch_job(batch_id)
+                        return
+                    if "FAIL" in status.upper():
+                        item.update(video_status="FAILED", video_retry_safe=False, video_error=str(op))
+                        save_batch_job(batch_id)
+                        return
+            except Exception as exc:
+                print(f"[BATCH VIDEO] Poll failed for {batch_id}/{item_id}: {type(exc).__name__}")
+            time.sleep(8)
+        item.update(video_status="FAILED", video_retry_safe=False,
+                    video_error="UPSTREAM_TIMEOUT: chưa có kết quả; giữ mã thao tác để đối soát, không tạo lại.")
+        save_batch_job(batch_id)
+    finally:
+        with _VIDEO_POLLERS_LOCK:
+            _VIDEO_POLLERS.discard((batch_id, item_id))
+
+
 def start_batch_pipeline(batch_id: str):
-    """Manage queue execution with designated concurrency (5 or 10 parallel items)."""
+    """Prepare references once and persist dispatchable work before scheduling."""
     b = BATCH_JOBS.get(batch_id)
     if not b:
         return
+    try:
+        prepare_batch_references(batch_id)
+    except Exception as exc:
+        with _batch_lock(batch_id):
+            for item in b.get("items", []):
+                if item.get("status") == "PENDING":
+                    item.update(status="FAILED", error=str(exc), message="Không nạp đủ ảnh tham chiếu; chưa gửi tạo ảnh.")
+            save_batch_job(batch_id)
+        return
+    with _batch_lock(batch_id):
+        b["queue_version"] = 1
+        for item in b.get("items", []):
+            if item.get("status") == "PENDING":
+                item.update(status="QUEUED", message="Đang chờ lượt.")
+                item.pop("error", None)
+        save_batch_job(batch_id)
+    scheduler = batch_scheduler()
+    scheduler.register(batch_id)
+    scheduler.start()
 
-    bdir = WORK_DIR / f"batch_{batch_id}"
-    cfg = b.get("config", {})
-    concurrency = int(cfg.get("imageRunMode", 5))
-    concurrency = max(1, min(10, concurrency))
 
-    # First, ensure all reference media IDs are uploaded to FlowKit
-    b["message"] = "Đang nạp ảnh tham chiếu (Dual-Reference) vào cụm Google AI..."
-    save_batch_job(batch_id)
-
-    # 1. Upload face models
-    for m in b.get("face_models", []):
-        if not m.get("media_id"):
-            p = bdir / m["filename"]
-            if p.exists():
-                try:
-                    m["media_id"] = upload_image_flowkit(p)
-                    print(f"[BATCH {batch_id}] Uploaded model {m['filename']} -> {m['media_id']}")
-                except Exception as e:
-                    print(f"[BATCH {batch_id}] Error uploading model {m['filename']}: {e}")
-
-    # 2. Upload outfits
-    for o in b.get("outfits", []):
-        if not o.get("media_id"):
-            p = bdir / o["filename"]
-            if p.exists():
-                try:
-                    o["media_id"] = upload_image_flowkit(p)
-                    print(f"[BATCH {batch_id}] Uploaded outfit {o['filename']} -> {o['media_id']}")
-                except Exception as e:
-                    print(f"[BATCH {batch_id}] Error uploading outfit {o['filename']}: {e}")
-
-    # Update items with resolved media IDs
-    face_map = {m["index"]: m.get("media_id") for m in b.get("face_models", [])}
-    outfit_map = {o["index"]: o.get("media_id") for o in b.get("outfits", [])}
-
-    for item in b.get("items", []):
-        if not item.get("face_media_id"):
-            item["face_media_id"] = face_map.get(item.get("face_index"))
-        if not item.get("outfit_media_id"):
-            item["outfit_media_id"] = outfit_map.get(item.get("outfit_index"))
-
-    b["message"] = f"Đang điều phối hàng đợi Banana Pro 2 ({concurrency} ảnh song song)..."
-    save_batch_job(batch_id)
-
-    items = b.get("items", [])
-    print(f"[BATCH PIPELINE] Starting batch {batch_id} with {len(items)} items (Concurrency: {concurrency})...")
-
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [
-            executor.submit(execute_single_item, batch_id, it["item_id"])
-            for it in items
-            if it.get("status") in ["PENDING", "FAILED"]
-        ]
-        for f in futures:
-            try:
-                f.result()
-            except Exception as e:
-                print(f"[BATCH PIPELINE] Worker thread exception: {e}")
-
-    b["message"] = "Đã hoàn tất toàn bộ tiến trình hàng đợi!"
-    save_batch_job(batch_id)
-    print(f"[BATCH PIPELINE] Batch {batch_id} all tasks finished!")
+def parse_auto_transfer(value=False):
+    """Multipart fields are strings: bool('false') must never enable paid video."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "on", "yes"}:
+            return True
+        if normalized in {"false", "0", "off", "no", ""}:
+            return False
+    raise ValueError("autoTransferToVideo must be true or false")
 
 
 def create_batch_image_job(
@@ -517,7 +663,7 @@ def create_batch_image_job(
     image_res = config.get("imageResolution", "2K")
     variants_per_outfit = max(1, min(4, int(config.get("imageCountPerOutfit", 1))))
     image_run_mode = max(1, min(10, int(config.get("imageRunMode", 5))))
-    auto_transfer = bool(config.get("autoTransferToVideo", False))
+    auto_transfer = parse_auto_transfer(config.get("autoTransferToVideo", False))
     preset = config.get("preset", "fashion_studio")
     custom_prompt = config.get("customPrompt", "").strip()
 
@@ -584,6 +730,7 @@ def create_batch_image_job(
         "message": "Đang chuẩn bị nạp dữ liệu..."
     }
 
+    batch_record["queue_version"] = 1
     BATCH_JOBS[batch_id] = batch_record
     save_batch_job(batch_id)
 
@@ -632,7 +779,7 @@ def create_batch_outfit_job(
     aspect_ratio = config.get("aspectRatio", "9:16")
     image_res = config.get("imageResolution", "2K")
     image_run_mode = max(1, min(10, int(config.get("imageRunMode", 5))))
-    auto_transfer = bool(config.get("autoTransferToVideo", False))
+    auto_transfer = parse_auto_transfer(config.get("autoTransferToVideo", False))
 
     note_part = f" Styling note: {outfit_note}." if outfit_note else ""
     swap_prompt = (
@@ -704,6 +851,7 @@ def create_batch_outfit_job(
         "message": "Đang chuẩn bị nạp dữ liệu..."
     }
 
+    batch_record["queue_version"] = 1
     BATCH_JOBS[batch_id] = batch_record
     save_batch_job(batch_id)
 

@@ -17,7 +17,12 @@ from agent.services.omni_flash import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/flow", tags=["flow"])
+import sys
+_existing_mod = sys.modules.get("agent.api.flow")
+if _existing_mod and hasattr(_existing_mod, "router"):
+    router = _existing_mod.router
+else:
+    router = APIRouter(prefix="/flow", tags=["flow"])
 
 
 def _rewrite_image_media(result: dict, base_url: str):
@@ -46,6 +51,16 @@ def _respond_flow_result(result: dict):
         return result.get("data", result)
 
     error_str = str(result.get("error") or result.get("data") or "")
+    if result.get("error_code") == "upstream_submission_unknown" or "SUBMISSION_OUTCOME_UNKNOWN" in error_str:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "UPSTREAM_SUBMISSION_UNKNOWN", "detail": error_str,
+            "error_code": "upstream_submission_unknown", "retryable": False,
+        })
+    if "_NOT_SUBMITTED" in error_str:
+        return JSONResponse(status_code=429, content={
+            "ok": False, "error": "FLOW_REQUEST_NOT_SUBMITTED", "detail": error_str,
+            "retryable": True, "retry_after_s": 3, "proxy_rotated": False,
+        }, headers={"Retry-After": "3"})
     is_transient = (
         result.get("proxy_rotated")
         or "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in error_str
@@ -67,13 +82,23 @@ def _respond_flow_result(result: dict):
                 "error": "PUBLIC_ERROR_UNUSUAL_ACTIVITY",
                 "message": msg,
                 "detail": msg,
-                "proxy_rotated": True,
+                "proxy_rotated": bool(result.get("proxy_rotated")),
                 "new_proxy": new_proxy,
                 "retryable": True,
                 "retry_after_s": 3,
             },
             headers={"Retry-After": "3"},
         )
+
+    if result.get("error_code") == "all_workers_parked":
+        # Nothing was submitted upstream, so this is safe to retry — but only
+        # once a nick is back, which is minutes away, not seconds.
+        retry_after = int(result.get("retry_after_s") or 60)
+        return JSONResponse(status_code=503, content={
+            "ok": False, "error": "ALL_WORKERS_PARKED", "detail": error_str,
+            "error_code": "all_workers_parked", "retryable": True,
+            "retry_after_s": retry_after,
+        }, headers={"Retry-After": str(retry_after)})
 
     status = result.get("status", 502)
     if not isinstance(status, int) or status < 400:
@@ -173,6 +198,7 @@ class UploadImageRequest(BaseModel):
     mime_type: str = ""
     project_id: str = ""
     file_name: str = "image.png"
+    reference_media_id: str = ""
 
 
 class CheckStatusRequest(BaseModel):
@@ -253,6 +279,17 @@ async def generate_image(body: GenerateImageRequest, request: Request):
         character_media_ids=body.character_media_ids,
         image_model=body.image_model,
     )
+    if result.get("error") and (result.get("proxy_rotated") or "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in str(result.get("error") or "")):
+        logger.info("generate_image encountered transient rotation; retrying transparently after 2.0s settle...")
+        await asyncio.sleep(2.0)
+        result = await client.generate_images(
+            prompt=body.prompt,
+            project_id=body.project_id or "",
+            aspect_ratio=body.aspect_ratio,
+            user_paygate_tier=body.user_paygate_tier,
+            character_media_ids=body.character_media_ids,
+            image_model=body.image_model,
+        )
     if result.get("status") == 200:
         base_url = str(request.base_url).rstrip("/")
         _rewrite_image_media(result, base_url)
@@ -305,8 +342,47 @@ async def generate_video(body: GenerateVideoRequest):
             end_image_media_id=body.end_image_media_id,
             user_paygate_tier=body.user_paygate_tier,
         )
+        if result.get("error") and result.get("retryable") is not False and "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in str(result.get("error") or ""):
+            logger.info("generate_video encountered transient rotation; retrying transparently after 2.0s settle...")
+            await asyncio.sleep(2.0)
+            result = await client.generate_video(
+                start_image_media_id=body.start_image_media_id,
+                prompt=body.prompt,
+                project_id=body.project_id,
+                scene_id=body.scene_id,
+                aspect_ratio=body.aspect_ratio,
+                end_image_media_id=body.end_image_media_id,
+                user_paygate_tier=body.user_paygate_tier,
+            )
 
+    _save_video_replay(client, result, "generate_video", body.model_dump())
     return _respond_flow_result(result)
+
+
+def _save_video_replay(client, result: dict, request_type: str, payload: dict) -> None:
+    """Persist request history with the operation's own worker for recovery."""
+    try:
+        from agent.services.flow_failover import save_operation_replay
+        ops = (result.get("data") or {}).get("operations") if isinstance(result.get("data"), dict) else result.get("operations")
+        if isinstance(ops, list):
+            for op_entry in ops:
+                op_id = ""
+                if isinstance(op_entry, dict):
+                    op_id = (op_entry.get("operation") or {}).get("name") or op_entry.get("name") or ""
+                elif isinstance(op_entry, str):
+                    op_id = op_entry
+                if op_id:
+                    clean_id = op_id.removeprefix("operations/")
+                    profiles = getattr(client, "_operation_profiles", {})
+                    op_worker = profiles.get(clean_id) or profiles.get(op_id) or ""
+                    save_operation_replay(
+                        operation_id=op_id,
+                        request_type=request_type,
+                        payload=payload,
+                        worker_id=op_worker,
+                    )
+    except Exception as exc:
+        logger.warning("Could not persist video replay: %s", exc)
 
 
 @router.post("/generate-video-refs")
@@ -335,12 +411,49 @@ async def generate_video_refs(body: GenerateVideoRefsRequest):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+    elif len(body.reference_media_ids) == 1:
+        # 1 reference image is functionally an Image-to-Video (i2v) operation.
+        # Direct Veo i2v (eb1hJf) bypasses StreamChat conversational stalls and ask_for_permission credit locks.
+        import re
+        clean_prompt = re.sub(r"(?i)<IMAGE_\d+>", "", body.prompt).strip() or body.prompt
+        result = await client.generate_video(
+            start_image_media_id=body.reference_media_ids[0],
+            prompt=clean_prompt,
+            project_id=body.project_id,
+            scene_id=body.scene_id,
+            aspect_ratio=body.aspect_ratio,
+            user_paygate_tier=body.user_paygate_tier,
+        )
     else:
         result = await client.generate_video_from_references(
             **body.model_dump(exclude={"model_family", "duration_s"})
         )
 
+    if result.get("error") and result.get("retryable") is not False and "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in str(result.get("error") or ""):
+        logger.info("generate_video_refs encountered transient rotation; retrying transparently after 2.0s settle...")
+        await asyncio.sleep(2.0)
+        if len(body.reference_media_ids) == 1:
+            result = await client.generate_video(
+                start_image_media_id=body.reference_media_ids[0],
+                prompt=clean_prompt,
+                project_id=body.project_id,
+                scene_id=body.scene_id,
+                aspect_ratio=body.aspect_ratio,
+                user_paygate_tier=body.user_paygate_tier,
+            )
+        else:
+            result = await client.generate_video_from_references(
+                **body.model_dump(exclude={"model_family", "duration_s"})
+            )
+
+    _save_video_replay(client, result, "generate_video_refs", body.model_dump())
     return _respond_flow_result(result)
+
+
+@router.post("/generate-video-with-references")
+async def generate_video_with_references(body: GenerateVideoRefsRequest):
+    """Alias for /generate-video-refs with transparent replay persistence."""
+    return await generate_video_refs(body)
 
 
 @router.post("/generate-video-omni")
@@ -578,6 +691,59 @@ def decode_upload_image(body: UploadImageRequest) -> tuple[str, str, str]:
     return b64, mime, body.file_name or "image.png"
 
 
+def optimize_image_for_upload(
+    b64: str, mime: str, name: str, max_edge: int = 1536, max_bytes: int = 500_000
+) -> tuple[str, str, str]:
+    """Optimize high-resolution or heavy images before sending through browser proxy.
+
+    Google Flow reference images are conditioned at video/image generation resolutions
+    (~1024-1280px). Uploading uncompressed 2MB-8MB images over proxy tunnels causes
+    50s+ transfer times and timeouts. Compressing/resizing to <=1536px JPEG (~150-250KB)
+    reduces upload time to 4-7s with no quality loss for generation.
+    """
+    import base64
+    try:
+        raw_bytes = base64.b64decode(b64)
+        if len(raw_bytes) <= max_bytes:
+            from PIL import Image
+            import io
+            with Image.open(io.BytesIO(raw_bytes)) as img:
+                w, h = img.size
+                if max(w, h) <= max_edge and img.mode in ("RGB", "L"):
+                    return b64, mime, name
+
+        from PIL import Image
+        import io
+
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            w, h = img.size
+            if img.mode in ("RGBA", "LA", "P"):
+                rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                rgb_img.paste(img, mask=img.split()[-1] if "A" in img.mode else None)
+                img = rgb_img
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            if max(w, h) > max_edge:
+                scale = max_edge / max(w, h)
+                new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85, optimize=True)
+            out_bytes = buf.getvalue()
+
+            if len(out_bytes) < len(raw_bytes) or max(w, h) > max_edge or mime != "image/jpeg":
+                new_b64 = base64.b64encode(out_bytes).decode("ascii")
+                new_name = name.rsplit(".", 1)[0] + ".jpg" if "." in name else name + ".jpg"
+                return new_b64, "image/jpeg", new_name
+    except Exception:
+        pass
+    return b64, mime, name
+
+
 @router.post("/upload-image")
 async def upload_image(body: UploadImageRequest):
     """Upload an image to Google Flow and get a media_id UUID.
@@ -594,8 +760,10 @@ async def upload_image(body: UploadImageRequest):
         raise HTTPException(404, f"File not found: {exc}") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    b64, mime, file_name = optimize_image_for_upload(b64, mime, file_name)
     result = await client.upload_image(
         b64, mime_type=mime, project_id=body.project_id, file_name=file_name,
+        reference_media_id=body.reference_media_id or None,
     )
     if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
         return _respond_flow_result(result)
@@ -657,3 +825,70 @@ async def get_unusual_threshold():
     return audit_mgr.compute_threshold_analysis()
 
 
+class BatchRpcRequest(BaseModel):
+    rpcid: str
+    freq: str
+    captcha_action: Optional[str] = None
+    profile_id: Optional[str] = None
+    project_id: Optional[str] = None
+    timeout: float = 120.0
+
+
+async def execute_batch_rpc(body: BatchRpcRequest):
+    client = get_flow_client()
+    if not client.connected:
+        raise HTTPException(503, "Extension not connected")
+    token = None
+    if body.profile_id or body.project_id:
+        from agent.services.flow_client import _current_route
+        route = {"profile_id": body.profile_id, "project_id": body.project_id, "pinned": True}
+        for ws, sess in list(client._extensions.items()):
+            if body.profile_id and sess.get("profile_id") == body.profile_id:
+                route["ws"] = ws
+                break
+            elif body.project_id and client._session_project(sess) == body.project_id:
+                route["ws"] = ws
+                break
+        token = _current_route.set(route)
+    try:
+        res = await client.batch_rpc(
+            body.rpcid,
+            body.freq,
+            body.captcha_action,
+            timeout=body.timeout,
+        )
+        return res
+    finally:
+        if token is not None:
+            _current_route.reset(token)
+
+
+class RememberMediaRequest(BaseModel):
+    media_id: str
+    profile_id: str
+
+
+async def execute_remember_media(body: RememberMediaRequest):
+    client = get_flow_client()
+    client._remember_media(body.media_id, body.profile_id)
+    return {"ok": True}
+
+
+_existing_route_paths = {getattr(r, "path", "") for r in router.routes}
+if not any(p.endswith("/batch-rpc") for p in _existing_route_paths):
+    router.add_api_route("/batch-rpc", execute_batch_rpc, methods=["POST"])
+if not any(p.endswith("/remember-media") for p in _existing_route_paths):
+    router.add_api_route("/remember-media", execute_remember_media, methods=["POST"])
+
+try:
+    import sys
+    if "agent.main" in sys.modules:
+        _main_app = getattr(sys.modules["agent.main"], "app", None)
+        if _main_app:
+            existing_app_paths = {getattr(r, "path", "") for r in _main_app.routes}
+            if "/api/flow/batch-rpc" not in existing_app_paths:
+                _main_app.add_api_route("/api/flow/batch-rpc", execute_batch_rpc, methods=["POST"])
+            if "/api/flow/remember-media" not in existing_app_paths:
+                _main_app.add_api_route("/api/flow/remember-media", execute_remember_media, methods=["POST"])
+except Exception as e:
+    logger.exception("Failed to bind batch-rpc to app: %s", e)
