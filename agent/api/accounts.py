@@ -1,6 +1,9 @@
 """CRUD + proxy check + Chrome launch for Flow nicks."""
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -17,6 +20,7 @@ from agent.services.accounts import (
 )
 from agent.services.chrome_nicks import (
     check_proxy,
+    chrome_running,
     launch_nick,
     launch_status,
     stop_nick,
@@ -28,6 +32,8 @@ from agent.services.proxy_pool import (
     rotate_nick_proxy,
 )
 from agent.services.proxy_url import ProxyURLError, parse_proxy_url
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
@@ -156,14 +162,41 @@ async def replace_accounts(body: AccountsReplace):
     return {"accounts": _decorate(saved, reveal=True)}
 
 
+async def _relaunch_quiet(nick_id: str) -> dict:
+    """Best-effort relaunch after a rename. Never turns a good save into a 500."""
+    try:
+        res = await launch_nick(nick_id)
+        return {"ok": bool(res.get("ok")), "id": nick_id}
+    except Exception as exc:
+        logger.warning("relaunch after rename failed for %s: %s", nick_id, exc)
+        return {"ok": False, "id": nick_id, "error": str(exc)}
+
+
 @router.post("")
 async def upsert(body: AccountBody):
+    old_id = (body.old_id or "").strip()
+    renaming = bool(old_id and old_id != body.id.strip())
+    # The data dir cannot be moved under a live browser, so stop it here instead
+    # of 400-ing the way every rename from the dashboard used to.
+    relaunch = renaming and chrome_running(old_id)
+    if relaunch:
+        await stop_nick(old_id)
     try:
-        saved = upsert_account(body.model_dump(), old_id=body.old_id)
+        # upsert_account can spend ~40s probing pool proxies for a new nick.
+        # On the event loop that froze the whole dashboard, /health included.
+        saved = await asyncio.to_thread(upsert_account, body.model_dump(), None, body.old_id)
     except (ValueError, ProxyURLError) as exc:
+        if relaunch:
+            await _relaunch_quiet(old_id)
         raise HTTPException(400, str(exc)) from exc
     _reload_router()
-    return _live_row(saved, reveal=True)
+    relaunched = await _relaunch_quiet(saved["id"]) if relaunch else None
+    # Row is read after the relaunch, or it reports chrome_running: false for a
+    # nick whose Chrome is already back up.
+    row = _live_row(saved, reveal=True)
+    if relaunched is not None:
+        row["relaunched"] = relaunched
+    return row
 
 
 @router.get("/proxy-health")
@@ -242,6 +275,16 @@ async def reset_accounts_metrics(body: dict | None = None):
     worker_id = (body or {}).get("worker_id") if body else None
     get_nick_metrics_tracker().reset(worker_id=worker_id)
     return {"ok": True, "message": f"Metrics reset for {worker_id or 'all workers'}"}
+
+
+@router.get("/auth-report")
+async def auth_report_endpoint(window_s: int = 3600):
+    """Which nicks are 401, judged from raw netlog status codes.
+
+    Static path, registered before /{nick_id} or it is captured as an id.
+    """
+    from agent.services.nick_auth import auth_report
+    return await asyncio.to_thread(auth_report, window_s)
 
 
 @router.get("/{nick_id}")
@@ -351,12 +394,23 @@ async def sync_nick_project(nick_id: str, body: dict | None = None):
 @router.post("/{nick_id}/rename")
 async def rename_nick(nick_id: str, body: RenameBody):
     from agent.services.accounts import rename_account
+    relaunch = chrome_running(nick_id)
+    if relaunch:
+        await stop_nick(nick_id)
     try:
-        saved = rename_account(nick_id, body.new_id)
-    except ValueError as exc:
+        saved = await asyncio.to_thread(rename_account, nick_id, body.new_id)
+    except (ValueError, ProxyURLError) as exc:
+        if relaunch:
+            await _relaunch_quiet(nick_id)
         raise HTTPException(400, str(exc)) from exc
     _reload_router()
-    return _live_row(saved, reveal=True)
+    relaunched = await _relaunch_quiet(saved["id"]) if relaunch else None
+    # Row is read after the relaunch, or it reports chrome_running: false for a
+    # nick whose Chrome is already back up.
+    row = _live_row(saved, reveal=True)
+    if relaunched is not None:
+        row["relaunched"] = relaunched
+    return row
 
 
 @router.get("/{nick_id}/metrics")
@@ -366,5 +420,81 @@ async def get_nick_metrics(nick_id: str):
     return get_nick_metrics_tracker().get_metrics(nick_id)
 
 
+@router.get("/{nick_id}/auth")
+async def nick_auth_endpoint(nick_id: str, window_s: int = 3600):
+    """Netlog verdict for one nick, with the per-rpc status breakdown."""
+    if get_account(nick_id) is None:
+        raise HTTPException(404, f"unknown account {nick_id}")
+    from agent.services.nick_auth import evidence_for
+    return await asyncio.to_thread(evidence_for, nick_id, window_s)
 
 
+@router.post("/{nick_id}/focus")
+async def focus_nick(nick_id: str, launch: bool = True):
+    """Raise this nick's Chrome window with the Flow tab in front.
+
+    Wayland has no wmctrl/xdotool here, so the only way to point at one window
+    out of nine is to ask that nick's own extension to activate its tab.
+    """
+    if get_account(nick_id) is None:
+        raise HTTPException(404, f"unknown account {nick_id}")
+    launched = None
+    if not chrome_running(nick_id):
+        if not launch:
+            raise HTTPException(409, f"Chrome is not running for {nick_id}")
+        try:
+            launched = await launch_nick(nick_id)
+        except (KeyError, ProxyURLError, RuntimeError) as exc:
+            raise HTTPException(400, f"could not launch Chrome: {exc}") from exc
+        # The extension needs to connect before it can be told anything.
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            if any(w.get("profile_id") == nick_id for w in get_flow_client().workers()):
+                break
+    # Short timeout: an extension copy predating focus_flow_tab answers
+    # UNKNOWN_METHOD, and an even older one does not answer at all.
+    res = await get_flow_client().profile_control(nick_id, "focus_flow_tab", {}, timeout=15)
+    if not res.get("ok"):
+        err = str(res.get("error") or "could not focus the Flow tab")
+        if "UNKNOWN_METHOD" in err or "TIMEOUT" in err.upper():
+            err = (
+                f"{nick_id}'s Chrome is running an extension copy without focus support. "
+                "Stop and relaunch this nick to update it."
+            )
+        raise HTTPException(400, err)
+    return {"ok": True, "id": nick_id, "launched": launched, "result": res}
+
+
+@router.post("/{nick_id}/enable")
+async def enable_nick(nick_id: str, enabled: bool = True):
+    """Put an auto-disabled nick back in rotation (or take one out by hand).
+
+    Enabling also clears the soft-auth strikes and un-parks the worker, so the
+    nick is usable on the next dispatch instead of after the 30m park expires,
+    and resolves its open ACCOUNT_AUTH_EXPIRED incident.
+    """
+    row = get_account(nick_id)
+    if row is None:
+        raise HTTPException(404, f"unknown account {nick_id}")
+    updated = {**row, "enabled": enabled}
+    try:
+        saved = await asyncio.to_thread(upsert_account, updated)
+    except (ValueError, ProxyURLError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    cleared = {}
+    resolved = 0
+    if enabled:
+        client = get_flow_client()
+        if hasattr(client, "clear_auth_strikes"):
+            cleared = client.clear_auth_strikes(nick_id)
+        try:
+            from agent.services.incident_manager import get_incident_manager
+            resolved = get_incident_manager().resolve_by_sub(
+                "worker", nick_id, error_code="ACCOUNT_AUTH_EXPIRED", action_taken="MANUAL_REENABLE"
+            )
+        except Exception as exc:
+            logger.warning("could not resolve auth incidents for %s: %s", nick_id, exc)
+    _reload_router()
+    out = _live_row(saved, reveal=True)
+    out["auth_reset"] = {**cleared, "incidents_resolved": resolved}
+    return out

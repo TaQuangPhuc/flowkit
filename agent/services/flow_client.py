@@ -518,6 +518,45 @@ class FlowClient:
             })
         return out
 
+    def auth_strike_report(self) -> dict[str, dict]:
+        """Soft-auth strike counters per nick, for the dashboard's 401 panel.
+
+        These were only ever read inside the failure path, so a nick one strike
+        from being disabled looked identical to a healthy one from outside.
+        """
+        now = time.time()
+        parked: dict[str, float] = {}
+        for session in self._extensions.values():
+            pid = session.get("profile_id")
+            if not pid:
+                continue
+            until = float(session.get("unavailable_until") or 0)
+            parked[pid] = max(parked.get(pid, 0.0), max(0.0, until - now))
+        out: dict[str, dict] = {}
+        for pid in set(self._auth_strikes) | set(parked):
+            last = self._auth_strike_ts.get(pid, 0.0)
+            # Expired strikes are not strikes; report what the next failure sees.
+            strikes = self._auth_strikes.get(pid, 0)
+            if last and now - last > _config.AUTH_STRIKE_TTL_S:
+                strikes = 0
+            out[pid] = {
+                "strikes": strikes,
+                "last_strike_at": last or None,
+                "parked_for_s": round(parked.get(pid, 0.0), 1),
+            }
+        return out
+
+    def clear_auth_strikes(self, profile_id: str) -> dict:
+        """Forget a nick's soft-auth history and un-park it (manual re-enable)."""
+        had = self._auth_strikes.pop(profile_id, 0)
+        self._auth_strike_ts.pop(profile_id, None)
+        unparked = 0
+        for session in self._extensions.values():
+            if session.get("profile_id") == profile_id and session.get("unavailable_until", 0) > time.time():
+                session["unavailable_until"] = 0
+                unparked += 1
+        return {"profile_id": profile_id, "cleared_strikes": had, "unparked": unparked}
+
     @traced("worker.route")
     async def _run_on_profile(
         self,

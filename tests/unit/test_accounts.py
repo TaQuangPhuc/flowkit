@@ -307,6 +307,11 @@ def api_client(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(accounts_api, "launch_status", fake_launch_status)
+    # Otherwise every POST /api/accounts probes real pool proxies over the
+    # network — 4s per created nick, and flaky offline.
+    monkeypatch.setattr(
+        "agent.services.proxy_pool.get_verified_proxy_for_nick", lambda nick_id, **kw: ""
+    )
 
     app = FastAPI()
     app.include_router(accounts_api.router, prefix="/api")
@@ -913,3 +918,189 @@ class TestProxyRotationAndResolution:
 
 
 
+
+
+class TestNickAuthActions:
+    """/nicks needed a place to see 401s and a way to act on one nick."""
+
+    def test_auth_report_static_path_is_not_captured_as_an_id(self, api_client, monkeypatch):
+        client, path = api_client
+        monkeypatch.setattr(
+            "agent.services.nick_auth.auth_report",
+            lambda window_s=3600: {"counts": {"total": 0}, "nicks": [], "window_s": window_s},
+        )
+        res = client.get("/api/accounts/auth-report")
+        assert res.status_code == 200
+        assert res.json()["counts"] == {"total": 0}
+
+    def test_focus_asks_that_nick_own_extension(self, api_client, monkeypatch):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "n1"})
+        sent = {}
+
+        class Flow(FakeFlow):
+            async def profile_control(self, profile_id, method, params, timeout=75):
+                sent["call"] = (profile_id, method, timeout)
+                return {"ok": True, "tabId": 7}
+
+        monkeypatch.setattr(accounts_api, "get_flow_client", lambda: Flow())
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: True)
+        res = client.post("/api/accounts/n1/focus")
+        assert res.status_code == 200
+        assert sent["call"][0] == "n1"
+        assert sent["call"][1] == "focus_flow_tab"
+        # Short timeout: an old extension copy must not hold the request for 75s.
+        assert sent["call"][2] <= 15
+
+    def test_focus_launches_chrome_when_it_is_not_running(self, api_client, monkeypatch):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "n1"})
+        launched = []
+
+        class Flow(FakeFlow):
+            def workers(self):
+                return [{"profile_id": "n1"}]
+
+            async def profile_control(self, profile_id, method, params, timeout=75):
+                return {"ok": True}
+
+        async def fake_launch(nick_id):
+            launched.append(nick_id)
+            return {"ok": True, "id": nick_id}
+
+        monkeypatch.setattr(accounts_api, "get_flow_client", lambda: Flow())
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: False)
+        monkeypatch.setattr(accounts_api, "launch_nick", fake_launch)
+        res = client.post("/api/accounts/n1/focus")
+        assert res.status_code == 200
+        assert launched == ["n1"]
+
+    def test_focus_on_an_outdated_extension_says_what_to_do(self, api_client, monkeypatch):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "n1"})
+
+        class Flow(FakeFlow):
+            async def profile_control(self, profile_id, method, params, timeout=75):
+                return {"ok": False, "error": "UNKNOWN_METHOD:focus_flow_tab"}
+
+        monkeypatch.setattr(accounts_api, "get_flow_client", lambda: Flow())
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: True)
+        res = client.post("/api/accounts/n1/focus")
+        assert res.status_code == 400
+        assert "relaunch" in res.json()["detail"].lower()
+
+    def test_focus_unknown_nick_is_404(self, api_client):
+        client, _ = api_client
+        assert client.post("/api/accounts/ghost/focus").status_code == 404
+
+    def test_enable_clears_strikes_and_resolves_the_incident(self, api_client, monkeypatch):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "n1", "enabled": False})
+        cleared, resolved = [], []
+
+        class Flow(FakeFlow):
+            def clear_auth_strikes(self, profile_id):
+                cleared.append(profile_id)
+                return {"profile_id": profile_id, "cleared_strikes": 3, "unparked": 1}
+
+        class Incidents:
+            def resolve_by_sub(self, module, sub_id, error_code=None, action_taken=""):
+                resolved.append((module, sub_id, error_code, action_taken))
+                return 2
+
+        monkeypatch.setattr(accounts_api, "get_flow_client", lambda: Flow())
+        monkeypatch.setattr("agent.services.incident_manager.get_incident_manager", lambda: Incidents())
+        res = client.post("/api/accounts/n1/enable")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["enabled"] is True
+        assert body["auth_reset"]["cleared_strikes"] == 3
+        assert body["auth_reset"]["incidents_resolved"] == 2
+        assert cleared == ["n1"]
+        assert resolved[0][:3] == ("worker", "n1", "ACCOUNT_AUTH_EXPIRED")
+
+    def test_disable_does_not_clear_strikes(self, api_client, monkeypatch):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "n1"})
+
+        class Flow(FakeFlow):
+            def clear_auth_strikes(self, profile_id):
+                raise AssertionError("must not clear strikes while disabling")
+
+        monkeypatch.setattr(accounts_api, "get_flow_client", lambda: Flow())
+        res = client.post("/api/accounts/n1/enable?enabled=false")
+        assert res.status_code == 200
+        assert res.json()["enabled"] is False
+
+
+class TestRenameThroughTheApi:
+    """Renaming from the dashboard used to 400 on every nick that was in use."""
+
+    def test_rename_stops_chrome_then_puts_it_back(self, api_client, monkeypatch):
+        from agent.services import chrome_nicks
+
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "old@x.com", "project_id": PA})
+        running = {"old@x.com"}
+        events = []
+
+        async def fake_stop(nick_id):
+            events.append(("stop", nick_id))
+            running.discard(nick_id)
+            return True
+
+        async def fake_launch(nick_id):
+            events.append(("launch", nick_id))
+            running.add(nick_id)
+            return {"ok": True, "id": nick_id}
+
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: nick_id in running)
+        monkeypatch.setattr(chrome_nicks, "chrome_running", lambda nick_id: nick_id in running)
+        monkeypatch.setattr(accounts_api, "stop_nick", fake_stop)
+        monkeypatch.setattr(accounts_api, "launch_nick", fake_launch)
+
+        res = client.post("/api/accounts", json={"id": "new@x.com", "old_id": "old@x.com"})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["id"] == "new@x.com"
+        # Fields the modal did not send must survive the rename.
+        assert body["project_id"] == PA
+        assert events == [("stop", "old@x.com"), ("launch", "new@x.com")]
+        assert body["relaunched"]["ok"] is True
+        ids = [a["id"] for a in json.loads(path.read_text())["accounts"]]
+        assert ids == ["new@x.com"]
+
+    def test_a_failed_rename_puts_the_old_chrome_back(self, api_client, monkeypatch):
+        from agent.services import chrome_nicks
+
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "a@x.com"})
+        client.post("/api/accounts", json={"id": "b@x.com"})
+        events = []
+
+        async def fake_stop(nick_id):
+            events.append(("stop", nick_id))
+            return True
+
+        async def fake_launch(nick_id):
+            events.append(("launch", nick_id))
+            return {"ok": True, "id": nick_id}
+
+        monkeypatch.setattr(accounts_api, "chrome_running", lambda nick_id: True)
+        monkeypatch.setattr(chrome_nicks, "chrome_running", lambda nick_id: False)
+        monkeypatch.setattr(accounts_api, "stop_nick", fake_stop)
+        monkeypatch.setattr(accounts_api, "launch_nick", fake_launch)
+
+        res = client.post("/api/accounts", json={"id": "b@x.com", "old_id": "a@x.com"})
+        assert res.status_code == 400
+        assert "already exists" in res.json()["detail"]
+        assert events == [("stop", "a@x.com"), ("launch", "a@x.com")]
+
+    def test_renaming_a_nick_that_is_gone_does_not_create_a_second_account(self, api_client):
+        client, path = api_client
+        client.post("/api/accounts", json={"id": "a@x.com"})
+        res = client.post("/api/accounts", json={"id": "c@x.com", "old_id": "ghost@x.com"})
+        assert res.status_code == 400
+        assert "nothing to rename" in res.json()["detail"]
+        ids = [a["id"] for a in json.loads(path.read_text())["accounts"]]
+        assert ids == ["a@x.com"]

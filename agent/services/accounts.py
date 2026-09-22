@@ -132,11 +132,17 @@ def upsert_account(row: dict, path: Path | None = None, old_id: str | None = Non
 
         if any(r["id"] == nick_id for r in rows):
             raise ValueError(f"account with id {nick_id!r} already exists")
+        if not any(r["id"] == old_nick_id for r in rows):
+            # Without this the rename fell through to the add path below and
+            # silently created a second account instead of renaming one.
+            raise ValueError(f"account {old_nick_id!r} not found (nothing to rename)")
         for i, existing in enumerate(rows):
             if existing["id"] == old_nick_id:
-                if not row.get("proxy_url") and existing.get("proxy_url"):
-                    row["proxy_url"] = existing["proxy_url"]
-                item = _normalize(row)
+                # Keep every field the caller did not send (proxy, project,
+                # note): a rename posted from the edit modal must not blank them.
+                merged = {**existing, **{k: v for k, v in row.items() if v not in ("", None)}}
+                merged["id"] = nick_id
+                item = _normalize(merged)
                 rows[i] = item
                 save_accounts(rows, path)
                 try:

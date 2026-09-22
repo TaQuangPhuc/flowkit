@@ -199,6 +199,31 @@ prunes `flow_operation_replay` / `flow_operation_failover`, and trims
 `age≈0h` is a live problem being re-recorded each sweep; an old one with no
 matching symptom is ledger residue, so confirm against `/health` before acting.
 
+**Where to see which nick is 401 (dashboard `/nicks` → "Auth" panel).** The
+panel reads raw netlog status codes, not the classifier, so it disagrees with an
+incident when the incident is wrong:
+
+| Endpoint | What it gives |
+|----------|---------------|
+| `GET /api/accounts/auth-report?window_s=3600` | Every nick, worst first: `verdict`, `advice`, last-401/last-200 timestamps, per-rpcid counts, soft-auth `strikes` + `parked_for_s`, open `ACCOUNT_AUTH_EXPIRED` incident, `enabled`. Plus counts `{total, needs_attention, signed_out, blocked, disabled}` |
+| `GET /api/accounts/{nick_id}/auth` | The same evidence for one nick |
+| `POST /api/accounts/{nick_id}/focus` | Raises that nick's Chrome window and activates its Flow tab (launches Chrome first if it is down). Wayland has no `wmctrl`/`xdotool`, so the extension does it from inside its own browser — this is how you avoid hunting through nine Chrome windows |
+| `POST /api/accounts/{nick_id}/enable` | Put the nick back in rotation: sets `enabled`, clears soft-auth strikes, un-parks the worker, resolves the `ACCOUNT_AUTH_EXPIRED` incident |
+
+Verdict vocabulary (`agent/services/nick_auth.py`, from `.scratch/ext-netlog.jsonl`):
+
+| Verdict | Evidence | Action |
+|---------|----------|--------|
+| `SIGNED_OUT` | 401 on every rpcid, no 200s (or the newest sample is a 401) | Sign in on that nick's Flow tab — `POST /{id}/focus` to find the window — then `POST /{id}/enable` |
+| `ACCOUNT_BLOCKED` | 401 only on the generation rpcs (`maseQ`, `ogiZ0b`, `eb1hJf`, `YhhmEf`) while `StreamChat`/`nzlxg` still answer 200 | **Re-login will not fix it.** Account-level block: keep the nick out of rotation and check it by hand in the Flow UI |
+| `RECOVERED` | 401s in the window but the newest sample is a 200 | Nothing — it healed. `POST /{id}/enable` if a strike disabled it |
+| `OK` | No 401 in the window | Nothing |
+| `NO_EVIDENCE` | No netlog samples (a freshly added nick) | Nothing; send it one job |
+
+If the extension answers focus with `UNKNOWN_METHOD:focus_flow_tab`, that
+Chrome is running a pre-focus copy of the extension — stop and relaunch the nick
+(`scripts/flow-chrome.sh <nick>`) to pick up the current one.
+
 ### D. YouTube upload errors (`youtube/upload.py`)
 
 | Error | Cause | Fix |

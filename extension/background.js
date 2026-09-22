@@ -589,6 +589,8 @@ function connectToAgent() {
         sendToAgent({ id: msg.id, result });
       } else if (msg.method === 'reload_flow_tab') {
         await handleReloadFlowTab(msg);
+      } else if (msg.method === 'focus_flow_tab') {
+        await handleFocusFlowTab(msg);
       } else if (msg.method === 'get_status') {
         sendToAgent({
           id: msg.id,
@@ -610,6 +612,10 @@ function connectToAgent() {
         console.log('[FlowAgent] Received callback secret');
       } else if (msg.type === 'pong') {
         // keepalive response
+      } else if (msg.id && msg.method) {
+        // Answer instead of dropping: an unknown method used to leave the agent
+        // waiting out its whole 75s timeout after an extension downgrade.
+        sendToAgent({ id: msg.id, status: 400, error: `UNKNOWN_METHOD:${msg.method}` });
       }
     } catch (e) {
       console.error('[FlowAgent] Message error:', e);
@@ -879,6 +885,31 @@ async function handleReloadFlowTab(msg) {
     await flowGate.pause(id);
     const result = await flowGate.resume(id, reloadFlowTab);
     sendToAgent({ id, result });
+  } catch (err) {
+    sendToAgent({ id, result: { ok: false, error: err?.message || String(err) } });
+  }
+}
+
+async function handleFocusFlowTab(msg) {
+  // Wayland has no wmctrl/xdotool, so the only way to raise one nick's window
+  // out of nine is from inside that nick's own Chrome.
+  const { id } = msg;
+  try {
+    const tabs = await chrome.tabs.query({ url: flowUrls });
+    let tab = tabs.find(t => !t.discarded) || tabs[0];
+    let created = false;
+    if (!tab) {
+      tab = await chrome.tabs.create({ url: FLOW_TAB_URL, active: true });
+      created = true;
+    } else {
+      await chrome.tabs.update(tab.id, { active: true });
+    }
+    if (tab.windowId != null) {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true, drawAttention: true, state: 'normal' });
+      } catch (_) {}
+    }
+    sendToAgent({ id, result: { ok: true, tabId: tab.id, windowId: tab.windowId ?? null, created, profileId } });
   } catch (err) {
     sendToAgent({ id, result: { ok: false, error: err?.message || String(err) } });
   }

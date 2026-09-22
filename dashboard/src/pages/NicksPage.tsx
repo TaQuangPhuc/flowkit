@@ -13,6 +13,9 @@ import {
   TrendingUp,
   RotateCcw,
   Gauge,
+  ShieldAlert,
+  ExternalLink,
+  PlayCircle,
 } from 'lucide-react'
 import { fetchAPI } from '../api/client'
 import { useTranslation } from '../i18n/useTranslation'
@@ -128,6 +131,51 @@ interface ProxyHealthReport {
   proxies: ProxyHealthRecord[]
 }
 
+type AuthVerdict = 'SIGNED_OUT' | 'ACCOUNT_BLOCKED' | 'RECOVERED' | 'OK' | 'NO_EVIDENCE'
+
+interface NickAuth {
+  nick_id: string
+  enabled: boolean
+  verdict: AuthVerdict
+  advice: string
+  samples: number
+  ok: number
+  unauthorized: number
+  gen_unauthorized: number
+  last_ok_at: string | null
+  last_unauthorized_at: string | null
+  auth_strikes: number
+  parked_for_s: number
+  open_incidents: { id: string; message: string; created_at?: number }[]
+  needs_attention: boolean
+}
+
+interface AuthReport {
+  window_s: number
+  generated_at: string | null
+  netlog_available: boolean
+  counts: { total: number; needs_attention: number; signed_out: number; blocked: number; disabled: number }
+  nicks: NickAuth[]
+}
+
+const VERDICT_STYLE: Record<AuthVerdict, string> = {
+  SIGNED_OUT: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
+  ACCOUNT_BLOCKED: 'bg-orange-500/10 text-orange-300 border-orange-500/30',
+  RECOVERED: 'bg-amber-500/10 text-amber-300 border-amber-500/30',
+  OK: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+  NO_EVIDENCE: 'bg-white/5 text-[var(--muted)] border-[var(--border)]',
+}
+
+function verdictKey(v: AuthVerdict): TranslationKey {
+  return `nicks.auth.verdict.${v}` as TranslationKey
+}
+
+function shortTs(ts: string | null): string {
+  if (!ts) return '—'
+  const d = new Date(ts)
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleTimeString()
+}
+
 const EMPTY_DRAFT: NickDraft = {
   id: '',
   label: '',
@@ -205,6 +253,10 @@ export default function NicksPage() {
   const [healthChecking, setHealthChecking] = useState(false)
   const [showHealthTable, setShowHealthTable] = useState(false)
   const [copiedProxy, setCopiedProxy] = useState<string | null>(null)
+  const [auth, setAuth] = useState<AuthReport | null>(null)
+  const [showAllAuth, setShowAllAuth] = useState(false)
+  // Saving is tracked apart from `busy`: a save no longer holds the page.
+  const [saving, setSaving] = useState<string | null>(null)
 
   const load = useCallback(() => {
     return fetchAPI<{ accounts: Nick[] }>('/api/accounts')
@@ -220,9 +272,15 @@ export default function NicksPage() {
       .catch(() => {})
   }, [])
 
+  const loadAuth = useCallback(() => {
+    return fetchAPI<AuthReport>('/api/accounts/auth-report')
+      .then(res => setAuth(res))
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     let cancelled = false
-    Promise.all([load(), loadHealth()]).finally(() => {
+    Promise.all([load(), loadHealth(), loadAuth()]).finally(() => {
       if (!cancelled) setLoading(false)
     })
     const id = setInterval(() => {
@@ -231,11 +289,16 @@ export default function NicksPage() {
         loadHealth()
       }
     }, 4000)
+    // The auth verdict reads a log tail; every 12s is plenty for a 60m window.
+    const authId = setInterval(() => {
+      if (!cancelled) loadAuth()
+    }, 12000)
     return () => {
       cancelled = true
       clearInterval(id)
+      clearInterval(authId)
     }
-  }, [load, loadHealth])
+  }, [load, loadHealth, loadAuth])
 
   const clusterConcurrency = nicks.reduce((acc, n) => acc + (n.metrics?.current_concurrency || 0), 0)
   const clusterPeakConcurrency = Math.max(0, ...nicks.map(n => n.metrics?.peak_concurrency || 0))
@@ -339,28 +402,31 @@ export default function NicksPage() {
       flash('err', t('nicks.error', { msg: t('nicks.field.id') }))
       return
     }
-    setBusy('save')
+    const payload = {
+      id,
+      old_id: editing !== 'new' ? draft.old_id : undefined,
+      label: draft.label.trim() || id,
+      project_id: draft.project_id.trim(),
+      proxy_url: draft.proxy_url.trim(),
+      note: draft.note,
+      enabled: draft.enabled,
+    }
+    // Adding a nick verifies a pool proxy, which takes seconds. Holding the
+    // modal and the global `busy` lock for that looked like a frozen page, so
+    // the dialog closes now and the request finishes in the background.
+    setEditing(null)
+    setSaving(id)
+    flash('ok', t('nicks.savingBg', { id }))
     try {
-      await fetchAPI<Nick>('/api/accounts', {
-        method: 'POST',
-        body: JSON.stringify({
-          id,
-          old_id: editing !== 'new' ? draft.old_id : undefined,
-          label: draft.label.trim() || id,
-          project_id: draft.project_id.trim(),
-          proxy_url: draft.proxy_url.trim(),
-          note: draft.note,
-          enabled: draft.enabled,
-        }),
-      })
-      setEditing(null)
+      await fetchAPI<Nick>('/api/accounts', { method: 'POST', body: JSON.stringify(payload) })
       flash('ok', t('nicks.saved', { id }))
       await load()
       loadHealth()
+      loadAuth()
     } catch (err) {
       flash('err', t('nicks.error', { msg: String((err as Error).message || err) }))
     } finally {
-      setBusy(null)
+      setSaving(null)
     }
   }
 
@@ -466,6 +532,45 @@ export default function NicksPage() {
     }
   }
 
+  async function focusNick(id: string) {
+    setBusy(`focus:${id}`)
+    try {
+      await fetchAPI(`/api/accounts/${encodeURIComponent(id)}/focus`, { method: 'POST' })
+      flash('ok', t('nicks.focused', { id }))
+      await load()
+    } catch (err) {
+      flash('err', t('nicks.error', { msg: String((err as Error).message || err) }))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function reloadTab(id: string) {
+    setBusy(`reload:${id}`)
+    try {
+      await fetchAPI(`/api/accounts/${encodeURIComponent(id)}/reload-tab`, { method: 'POST' })
+      flash('ok', t('nicks.reloadedTab', { id }))
+      await Promise.all([load(), loadAuth()])
+    } catch (err) {
+      flash('err', t('nicks.error', { msg: String((err as Error).message || err) }))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function reenable(id: string) {
+    setBusy(`enable:${id}`)
+    try {
+      await fetchAPI(`/api/accounts/${encodeURIComponent(id)}/enable`, { method: 'POST' })
+      flash('ok', t('nicks.reenabled', { id }))
+      await Promise.all([load(), loadAuth()])
+    } catch (err) {
+      flash('err', t('nicks.error', { msg: String((err as Error).message || err) }))
+    } finally {
+      setBusy(null)
+    }
+  }
+
   function copyText(text: string, id: string) {
     navigator.clipboard.writeText(text).then(() => {
       setCopiedProxy(id)
@@ -484,9 +589,17 @@ export default function NicksPage() {
           <h1 className="m-0 text-lg font-semibold" style={{ color: 'var(--text)' }}>{t('nicks.title')}</h1>
           <p className="text-[11px] mt-1 leading-relaxed" style={{ color: 'var(--muted)' }}>{t('nicks.intro')}</p>
         </div>
-        <ActionBtn tone="primary" onClick={startNew} disabled={busy !== null}>
-          + {t('nicks.add')}
-        </ActionBtn>
+        <div className="flex items-center gap-2">
+          {saving && (
+            <span className="text-[11px] inline-flex items-center gap-1" style={{ color: 'var(--muted)' }}>
+              <RefreshCw className="w-3 h-3 animate-spin" />
+              {saving}
+            </span>
+          )}
+          <ActionBtn tone="primary" onClick={startNew} disabled={busy !== null}>
+            + {t('nicks.add')}
+          </ActionBtn>
+        </div>
       </div>
 
       {message && (
@@ -501,6 +614,19 @@ export default function NicksPage() {
           <span>{message.text}</span>
         </div>
       )}
+
+      {/* 401 / auth watch — the only place that says which nick is signed out */}
+      <AuthPanel
+        report={auth}
+        busy={busy}
+        t={t}
+        showAll={showAllAuth}
+        onToggleAll={() => setShowAllAuth(v => !v)}
+        onRefresh={loadAuth}
+        onFocus={focusNick}
+        onReloadTab={reloadTab}
+        onReenable={reenable}
+      />
 
       {/* Proxy Health Monitor Widget */}
       <Card className="py-3 px-4 border border-[var(--border)]">
@@ -736,9 +862,11 @@ export default function NicksPage() {
             <NickCard
               key={nick.id}
               nick={nick}
+              auth={auth?.nicks.find(a => a.nick_id === nick.id)}
               check={checks[nick.id]}
               busy={busy}
               t={t}
+              onFocus={() => focusNick(nick.id)}
               onEdit={() => startEdit(nick)}
               onDelete={() => remove(nick.id)}
               onCheck={() => check(nick.id)}
@@ -907,11 +1035,141 @@ export default function NicksPage() {
   )
 }
 
+function AuthPanel({
+  report,
+  busy,
+  t,
+  showAll,
+  onToggleAll,
+  onRefresh,
+  onFocus,
+  onReloadTab,
+  onReenable,
+}: {
+  report: AuthReport | null
+  busy: string | null
+  t: (key: TranslationKey, params?: Record<string, string | number>) => string
+  showAll: boolean
+  onToggleAll: () => void
+  onRefresh: () => void
+  onFocus: (id: string) => void
+  onReloadTab: (id: string) => void
+  onReenable: (id: string) => void
+}) {
+  if (!report) return null
+  const locked = busy !== null
+  const problems = report.nicks.filter(n => n.needs_attention)
+  const rows = showAll ? report.nicks : problems
+  const windowMin = Math.round(report.window_s / 60)
+
+  return (
+    <Card className="py-3 px-4 border border-[var(--border)]">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <ShieldAlert className={`w-4 h-4 shrink-0 ${problems.length ? 'text-rose-400' : 'text-emerald-400'}`} />
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--text)' }}>
+              {t('nicks.auth.title')}
+            </div>
+            <div className="text-[11px]" style={{ color: 'var(--muted)' }}>
+              {t('nicks.auth.desc')} · {t('nicks.auth.window', { n: windowMin })}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 ml-auto text-[11px] font-mono">
+          {problems.length > 0 ? (
+            <span className="px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20">
+              🔴 {t('nicks.auth.needsAttention', { n: problems.length })}
+            </span>
+          ) : (
+            <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+              🟢 {t('nicks.auth.allOk')}
+            </span>
+          )}
+          <ActionBtn onClick={onRefresh} disabled={locked} tone="default">
+            <RefreshCw className="w-3 h-3 inline mr-1" />
+            {t('nicks.auth.refresh')}
+          </ActionBtn>
+          <button
+            type="button"
+            onClick={onToggleAll}
+            className="text-[11px] px-2 py-1 rounded text-[var(--muted)] hover:text-[var(--text)] transition-colors inline-flex items-center gap-1 cursor-pointer"
+          >
+            <span>{showAll ? t('nicks.auth.hideAll') : t('nicks.auth.showAll')}</span>
+            {showAll ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+          </button>
+        </div>
+      </div>
+
+      {rows.length > 0 && (
+        <div className="mt-3 flex flex-col gap-1.5">
+          {rows.map(row => (
+            <div
+              key={row.nick_id}
+              className="flex flex-wrap items-center gap-2 px-2 py-1.5 rounded border border-[var(--border)] bg-black/20"
+            >
+              <span className={`px-1.5 py-0.5 rounded text-[10px] border font-medium shrink-0 ${VERDICT_STYLE[row.verdict]}`}>
+                {t(verdictKey(row.verdict))}
+              </span>
+              <span className="text-[11px] font-mono truncate max-w-[220px]" style={{ color: 'var(--text)' }} title={row.nick_id}>
+                {row.nick_id}
+              </span>
+              {!row.enabled && (
+                <span className="px-1.5 py-0.5 rounded text-[10px] bg-rose-500/10 text-rose-400 border border-rose-500/30">
+                  {t('nicks.auth.disabled')}
+                </span>
+              )}
+              {row.auth_strikes > 0 && (
+                <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/30">
+                  {t('nicks.auth.strikes', { n: row.auth_strikes })}
+                </span>
+              )}
+              <span className="text-[10px] font-mono" style={{ color: 'var(--muted)' }}>
+                {row.samples === 0
+                  ? t('nicks.auth.noEvidenceHint')
+                  : t('nicks.auth.counts', { ok: row.ok, bad: row.unauthorized })}
+                {row.last_unauthorized_at ? ` · ${t('nicks.auth.lastBad', { ts: shortTs(row.last_unauthorized_at) })}` : ''}
+              </span>
+
+              <div className="flex items-center gap-1.5 ml-auto">
+                <ActionBtn tone="primary" onClick={() => onFocus(row.nick_id)} disabled={locked} title={t('nicks.focusHint')}>
+                  <ExternalLink className="w-3 h-3 inline mr-1" />
+                  {busy === `focus:${row.nick_id}` ? '…' : t('nicks.focus')}
+                </ActionBtn>
+                <ActionBtn onClick={() => onReloadTab(row.nick_id)} disabled={locked}>
+                  <RotateCw className="w-3 h-3 inline mr-1" />
+                  {busy === `reload:${row.nick_id}` ? '…' : t('nicks.reloadTab')}
+                </ActionBtn>
+                {!row.enabled && (
+                  <ActionBtn onClick={() => onReenable(row.nick_id)} disabled={locked}>
+                    <PlayCircle className="w-3 h-3 inline mr-1" />
+                    {busy === `enable:${row.nick_id}` ? '…' : t('nicks.reenable')}
+                  </ActionBtn>
+                )}
+              </div>
+
+              {(row.verdict === 'SIGNED_OUT' || row.verdict === 'ACCOUNT_BLOCKED') && (
+                <div className="w-full text-[10px] pl-0.5" style={{ color: 'var(--muted)' }}>
+                  {row.advice}
+                  {row.open_incidents.length > 0 ? ` · ${row.open_incidents[0].message}` : ''}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  )
+}
+
 function NickCard({
   nick,
+  auth,
   check,
   busy,
   t,
+  onFocus,
   onEdit,
   onDelete,
   onCheck,
@@ -921,9 +1179,11 @@ function NickCard({
   onRotateProxy,
 }: {
   nick: Nick
+  auth?: NickAuth
   check?: ProxyCheck
   busy: string | null
   t: (key: TranslationKey, params?: Record<string, string | number>) => string
+  onFocus: () => void
   onEdit: () => void
   onDelete: () => void
   onCheck: () => void
@@ -952,7 +1212,17 @@ function NickCard({
               <Pencil className="w-3 h-3 inline" />
             </button>
           </CardTitle>
-          <Badge variant="outline">{nick.enabled ? t('nicks.field.enabled') : t('common.dash')}</Badge>
+          <div className="flex items-center gap-1.5">
+            {auth && auth.verdict !== 'OK' && auth.verdict !== 'NO_EVIDENCE' && (
+              <span
+                title={auth.advice}
+                className={`px-1.5 py-0.5 rounded text-[10px] border font-medium ${VERDICT_STYLE[auth.verdict]}`}
+              >
+                {t(verdictKey(auth.verdict))}
+              </span>
+            )}
+            <Badge variant="outline">{nick.enabled ? t('nicks.field.enabled') : t('common.dash')}</Badge>
+          </div>
         </div>
         <CardDescription className="text-[11px] font-mono truncate" title={nick.id}>
           {nick.id}
@@ -1112,6 +1382,11 @@ function NickCard({
 
         <ActionBtn onClick={onCheck} disabled={locked || !nick.has_proxy}>
           {busy === `check:${nick.id}` ? t('nicks.checking') : t('nicks.checkProxy')}
+        </ActionBtn>
+
+        <ActionBtn onClick={onFocus} disabled={locked} tone="default" title={t('nicks.focusHint')}>
+          <ExternalLink className="w-3 h-3 inline mr-1" />
+          {busy === `focus:${nick.id}` ? '…' : t('nicks.focus')}
         </ActionBtn>
 
         {nick.chrome_running ? (

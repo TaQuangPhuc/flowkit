@@ -255,12 +255,37 @@ def chrome_data_dir(nick_id: str) -> Path:
     return root / nick_id
 
 
+_PS_CACHE: dict[str, object] = {"ts": 0.0, "lines": []}
+# The dashboard polls every 4s and asked launch_status() per nick, i.e. one
+# pgrep fork per nick per poll. Chrome does not start or stop between two nicks
+# in the same poll, so one snapshot serves them all.
+_PS_TTL_S = 2.0
+
+
+def _chrome_ps(force: bool = False) -> list[str]:
+    """Cached `pgrep -af chrome` lines."""
+    now = time.monotonic()
+    if not force and now - float(_PS_CACHE["ts"] or 0) < _PS_TTL_S:
+        return list(_PS_CACHE["lines"])  # type: ignore[arg-type]
+    try:
+        lines = subprocess.check_output(["pgrep", "-af", "chrome"], text=True).splitlines()
+    except Exception:
+        lines = []
+    _PS_CACHE["ts"] = now
+    _PS_CACHE["lines"] = lines
+    return list(lines)
+
+
+def invalidate_chrome_ps() -> None:
+    """Drop the snapshot after anything that starts or kills a Chrome."""
+    _PS_CACHE["ts"] = 0.0
+
+
 def find_running_chrome_pid(nick_id: str) -> Optional[int]:
     """Find OS PID of an already running Chrome browser for this nick."""
     data = str(chrome_data_dir(nick_id))
     try:
-        out = subprocess.check_output(["pgrep", "-af", "chrome"], text=True)
-        for line in out.splitlines():
+        for line in _chrome_ps():
             # Main browser process matches user-data-dir and is not a child worker/renderer
             if data in line and "--type=" not in line:
                 parts = line.strip().split()
@@ -288,8 +313,7 @@ def running_chrome_proxy_port(nick_id: str) -> Optional[int]:
     import re
     data = str(chrome_data_dir(nick_id))
     try:
-        out = subprocess.check_output(["pgrep", "-af", "chrome"], text=True)
-        for line in out.splitlines():
+        for line in _chrome_ps():
             if data in line and "--proxy-server=http://127.0.0.1:" in line:
                 m = re.search(r"--proxy-server=http://127\.0\.0\.1:(\d+)", line)
                 if m:
@@ -505,6 +529,7 @@ async def launch_nick(nick_id: str) -> dict:
             f"Chrome exited immediately (code {proc.returncode}). "
             "Is a display available?"
         )
+    invalidate_chrome_ps()
     return {
         "ok": True,
         "id": nick_id,
@@ -531,8 +556,8 @@ def get_all_chrome_pids_for_nick(nick_id: str) -> list[int]:
     data = str(chrome_data_dir(nick_id))
     pids = []
     try:
-        out = subprocess.check_output(["pgrep", "-af", "chrome"], text=True)
-        for line in out.splitlines():
+        # Kill paths must see the live process list, never a 2s-old snapshot.
+        for line in _chrome_ps(force=True):
             if data in line:
                 parts = line.strip().split()
                 if parts and parts[0].isdigit():
@@ -629,6 +654,7 @@ async def stop_nick(nick_id: str) -> bool:
 
     drop_stale_chrome_lock(chrome_data_dir(nick_id), force=True)
     await stop_bridge(nick_id)
+    invalidate_chrome_ps()
     return stopped
 
 
