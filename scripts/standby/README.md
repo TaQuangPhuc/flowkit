@@ -20,6 +20,7 @@ Dự phòng cho trường hợp máy chính mất điện/rớt mạng. Máy nh�
 
 - **Cold standby**: mọi service flowkit trên máy nhà `disabled` — chỉ `backup-sync.timer` chạy. Tunnel `-R` tự chặn double-fleet (main còn sống → máy nhà bind fail).
 - **Bắt buộc WSL2**: Chrome profile cookies mã hoá `v11` Linux OSCrypt — Windows Chrome (DPAPI) không giải mã được → session chết → phải relogin. WSL2 giữ nguyên Linux semantics → session sống.
+- **Keyring phải đi cùng**: cookie key KHÔNG nằm trong profile dir — nó nằm trong **gnome-keyring** của máy chính (items "Chrome Safe Storage" + "Chromium Safe Storage"). `backup-sync.sh` export 2 secret này về `~/.flowkit-keyring.json`; `import-keyring.sh` nạp vào gnome-keyring máy nhà → cookies giải mã được → **không phải sign-in lại**. Thiếu bước này = mọi nick signed-out.
 - **Gateway bỏ netns**: netns chỉ là cách ly, OVPN vẫn tunnel qua mạng nhà ra đúng Surfshark egress. User unit, không cần root.
 
 ## Setup 1 lần trên máy nhà
@@ -42,7 +43,8 @@ echo -e "[boot]\nsystemd=true" | sudo tee /etc/wsl.conf
 
 ```bash
 sudo apt update
-sudo apt install -y rsync sqlite3 openssh-client curl ffmpeg python3 python3-venv git
+sudo apt install -y rsync sqlite3 openssh-client curl ffmpeg python3 python3-venv git \
+    gnome-keyring libsecret-tools dbus-user-session python3-dbus
 
 # Google Chrome (GUI chạy qua WSLg — hiện cửa sổ lên desktop Windows)
 wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
@@ -105,6 +107,7 @@ Sync gì:
 | `~/.flowkit` còn lại | coccoc-browser, misc | `chrome/` (đã sync trên) |
 | `~/.ssh` config+keys | `~/.ssh` | — |
 | `~/.config/systemd/user/flowkit*` | units | — |
+| gnome-keyring os_crypt secrets | `~/.flowkit-keyring.json` (0600) → import vào keyring máy nhà | chỉ chrome/chromium Safe Storage |
 
 ### Failover (máy chính chết)
 

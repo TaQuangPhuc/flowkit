@@ -89,4 +89,19 @@ rsync -az --include='flowkit*' --exclude='*' \
     || true
 systemctl --user daemon-reload 2>/dev/null || true
 
+# --- 7. gnome-keyring os_crypt secrets — WITHOUT these the synced cookies ---
+# --- stay encrypted and every nick is signed out on the standby. -----------
+KEYRING_JSON="$HOME/.flowkit-keyring.json"
+if ssh "$MAIN_HOST" \
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$UID/bus python3 -" \
+    < "$FLOWKIT_DIR/scripts/standby/export-keyring.py" \
+    > "$KEYRING_JSON.new" 2>/dev/null \
+    && python3 -c "import json,sys; d=json.load(open('$KEYRING_JSON.new')); assert d.get('chrome')" 2>/dev/null; then
+    mv "$KEYRING_JSON.new" "$KEYRING_JSON" && chmod 600 "$KEYRING_JSON"
+    log "keyring secrets synced ($(python3 -c "import json;print(','.join(json.load(open('$KEYRING_JSON')).keys()))"))"
+else
+    rm -f "$KEYRING_JSON.new"
+    [ -f "$KEYRING_JSON" ] || log "WARN: keyring export failed and no prior copy — standby cookies will NOT decrypt"
+fi
+
 log "sync complete."

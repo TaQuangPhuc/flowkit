@@ -9,6 +9,10 @@ set -euo pipefail
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
+log "0/5 keyring secrets (cookie decryption for synced profiles)"
+bash "$HOME/flowkit/scripts/standby/import-keyring.sh" 2>/dev/null \
+    || echo "WARN: keyring import failed — synced profiles may be signed out"
+
 log "1/5 gateway (Surfshark proxy :18888, no netns on standby)"
 systemctl --user start flowkit-gateway.service
 

@@ -7,7 +7,7 @@
 #      then `wsl --shutdown` from PowerShell and reopen.
 #   3. Create user `pc` with sudo — keeps every path identical to the main PC.
 #   4. sudo apt update && sudo apt install -y rsync sqlite3 ssh curl ffmpeg \
-#        python3 python3-venv
+#        python3 python3-venv gnome-keyring libsecret-tools dbus-user-session
 #   5. Google Chrome for Linux:
 #        wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 #        sudo apt install -y ./google-chrome-stable_current_amd64.deb
@@ -31,7 +31,8 @@ echo "== 1. environment =="
     || warn "user is $(id -un) — paths differ from /home/pc, adjust units/scripts"
 systemctl --version >/dev/null 2>&1 && ok "systemd present" \
     || bad "no systemd — enable [boot] systemd=true in /etc/wsl.conf"
-for c in rsync sqlite3 ssh curl python3 google-chrome ffmpeg; do
+for c in rsync sqlite3 ssh curl python3 google-chrome ffmpeg \
+         gnome-keyring-daemon secret-tool dbus-daemon; do
     command -v "$c" >/dev/null 2>&1 && ok "$c" || bad "$c missing"
 done
 [ -n "${WAYLAND_DISPLAY:-}" ] && ok "WSLg wayland available (GUI Chrome works)" \
@@ -64,6 +65,10 @@ echo "== 5. first sync =="
 if [ "$FAIL" = 0 ]; then
     MAIN_HOST="$MAIN_HOST" bash "$HOME/flowkit/scripts/standby/backup-sync.sh" \
         && ok "first sync done" || bad "first sync failed"
+    # keyring secrets → this machine's gnome-keyring (cookie decryption)
+    bash "$HOME/flowkit/scripts/standby/import-keyring.sh" \
+        && ok "keyring imported — synced sessions will decrypt" \
+        || warn "keyring import failed — synced cookies stay encrypted (signed out)"
 else
     warn "skipping first sync — fix FAILs above"
 fi
