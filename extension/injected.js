@@ -225,7 +225,8 @@ function classifyFlowPage() {
     /unusual traffic|unusual activity|systems have detected|not a robot|verify you.{0,25}human|automated queries/i.test(text);
   const signin = /sign in to (your )?google|sign in to continue|đăng nhập/i.test(text) ||
     !!document.querySelector('a[href*="accounts.google.com/ServiceLogin"], a[href*="accounts.google.com/signin"]');
-  const errorPage = /something went wrong|can’t be reached|can't be reached|took too long|err_[a-z_]+/i.test(text);
+  const errorPage = /something went wrong|can’t be reached|can't be reached|took too long|err_[a-z_]+|that'?s an error|that'?s all we know|service unavailable/i.test(text)
+    || /\b5\d\d\b|error/i.test(title);
   let state = 'unknown';
   if (wizReady) state = 'app_ready';
   else if (unusual) state = 'unusual_wall';

@@ -171,6 +171,9 @@ class FlowClient:
         # nick → monotonic time a warm probe last saw app_ready. Distinguishes
         # a session Google revoked mid-watch from a clone that was born dead.
         self._ready_seen: dict[str, float] = {}
+        # nick → last time a stale (no page_state) extension was auto-
+        # relaunched to pick up current code. 20min cooldown prevents churn.
+        self._ext_refresh: dict[str, float] = {}
         # Canary probe: when a hold-out window elapses we fire one cheap RPC
         # before re-admitting real traffic, so a still-flagged session eats a
         # synthetic request instead of a paying one.
@@ -2997,13 +3000,12 @@ class FlowClient:
         """Poll a freshly connected Flow tab until it reports app_ready.
 
         The router keeps the nick unavailable (warming_until) while this
-        runs, so real jobs never land on a cold tab. Releases early on
-        app_ready; on timeout releases anyway — the strike path still
-        catches a genuinely dead tab.
+        runs, so real jobs never land on a cold tab. Runs until app_ready
+        or the socket dies — a nick that never readies stays gated instead
+        of aging back into routing and eating NO_AT_TOKEN failures.
         """
-        deadline = time.monotonic() + 1800
         try:
-            while time.monotonic() < deadline:
+            while True:
                 session = self._extensions.get(ws)
                 if session is None or session.get("profile_id") != sid:
                     return
@@ -3019,9 +3021,10 @@ class FlowClient:
                     health = {}
                 res = (health or {}).get("result") or {}
                 state = res.get("page_state")
-                if state == "app_ready" or (state is None and res.get("alive")):
+                if state == "app_ready" or res.get("app_ready") is True:
                     session["warming_until"] = 0
                     session.pop("signed_out", None)
+                    session.pop("tab_reload_tries", None)
                     self._ready_seen[sid] = time.time()
                     _ledger.record_event("EXT_WARMED", nick=sid,
                                          detail={"page_state": state})
@@ -3032,18 +3035,76 @@ class FlowClient:
                         "via": "warm_probe",
                         "cause": self._signed_out_cause(sid),
                     })
+                if (state is None and res.get("alive")
+                        and "page_state" not in res):
+                    # Legacy extension — "alive" only proves the content
+                    # bridge answered; a grey Google error page answers too.
+                    # Relaunch once per 20min so sync_extension_copy drops a
+                    # current ext that actually reports page_state.
+                    try:
+                        from agent.services.accounts import get_account
+                        disabled = not (get_account(sid) or {}).get("enabled", True)
+                    except Exception:
+                        disabled = False
+                    if (not disabled
+                            and time.time() - self._ext_refresh.get(sid, 0) > 1200):
+                        self._ext_refresh[sid] = time.time()
+                        _ledger.record_event("EXT_STALE_REFRESH", nick=sid, detail={
+                            "guard": session.get("flow_guard_version")})
+                        asyncio.create_task(self._relaunch_nick(sid))
+                else:
+                    # error_page / unknown / dead tab — reload clears
+                    # transient Google 5xx and grey loads. Bounded: 3 tries,
+                    # ≥60s apart; after that the gate just stays closed.
+                    err_like = state in ("error_page", "unknown") \
+                        or not res.get("alive")
+                    tries = int(session.get("tab_reload_tries") or 0)
+                    last = float(session.get("tab_reload_at") or 0)
+                    # Grace: a tab still booting after connect reads
+                    # alive:false — don't reload a page mid-load.
+                    booting = time.time() - float(
+                        session.get("connected_at") or 0) < 45
+                    if (err_like and not booting and tries < 3
+                            and time.time() - last > 60):
+                        session["tab_reload_tries"] = tries + 1
+                        session["tab_reload_at"] = time.time()
+                        _ledger.record_event("TAB_RELOAD", nick=sid, detail={
+                            "state": state, "try": tries + 1})
+                        try:
+                            tok = _current_route.set(
+                                {"ws": ws, "profile_id": sid, "pinned": True})
+                            try:
+                                await self._send(
+                                    "reload_flow_tab", {}, timeout=15)
+                            finally:
+                                _current_route.reset(tok)
+                        except Exception:
+                            pass
                 # Anything that isn't app_ready — signed_out, unusual_wall,
                 # loading, dead tab — keeps the gate closed while we probe.
                 # A tab that can't serve work shouldn't take requests just
                 # because the initial warm window elapsed.
                 session["warming_until"] = time.time() + 45
                 await asyncio.sleep(15)
-            if ws in self._extensions:
-                self._extensions[ws]["warming_until"] = 0
         finally:
             session = self._extensions.get(ws)
             if session is not None:
                 session.pop("warm_task", None)
+
+    async def _relaunch_nick(self, sid: str) -> None:
+        """Stop+start a nick's Chrome so sync_extension_copy refreshes its
+        baked extension to the current code (page_state reporting)."""
+        try:
+            from agent.services.chrome_nicks import stop_nick, launch_nick
+            await stop_nick(sid)
+            res = await launch_nick(sid)
+            if not res.get("ok"):
+                _ledger.record_event("EXT_REFRESH_FAIL", nick=sid,
+                                     detail={"error": res.get("error")})
+        except Exception as exc:
+            logger.warning("stale-ext relaunch of %s failed: %s", sid, exc)
+            _ledger.record_event("EXT_REFRESH_FAIL", nick=sid,
+                                 detail={"error": str(exc)[:200]})
 
     def _signed_out_cause(self, sid: str) -> dict:
         """Classify WHY a nick is signed_out, from evidence the kernel has.
