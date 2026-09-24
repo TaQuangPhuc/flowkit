@@ -1,6 +1,6 @@
 /* Coordinate only browser requests, never the lifetime of accepted renders. */
 class FlowRequestGate {
-  constructor({ queueMs = 30000, drainMs = 65000, leaseMs = 120000 } = {}) {
+  constructor({ queueMs = 120000, drainMs = 65000, leaseMs = 120000 } = {}) {
     this.queueMs = queueMs;
     this.drainMs = drainMs;
     this.leaseMs = leaseMs;

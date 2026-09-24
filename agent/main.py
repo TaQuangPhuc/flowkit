@@ -325,6 +325,15 @@ async def ext_netlog(request: Request):
     # One disk write per Flow RPC. Doing it inline blocked the event loop, and
     # nothing ever trimmed the file (it reached 129MB).
     await asyncio.to_thread(_append_netlog, rec)
+    try:
+        from agent.services.request_ledger import record_rpc
+        await asyncio.to_thread(
+            record_rpc,
+            rec.get("profileId"), rec.get("rpcid"), rec.get("statusCode"),
+            data.get("elapsedMs") or data.get("elapsed_ms"), session, rec.get("ts"),
+        )
+    except Exception:
+        pass
     profile_id = data.get("profileId") or None
     if session:
         get_flow_client().remember_chat_session(session, profile_id=profile_id)

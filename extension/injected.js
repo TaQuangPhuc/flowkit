@@ -211,12 +211,37 @@ window.__flowExecuteBatchOnce = function (request) {
   return entry.promise;
 };
 
+function classifyFlowPage() {
+  // Kernel-level visibility: WHY the page yields no AT token. WIZ_global_data
+  // only exists once the Flow app actually boots; everything else is a wall,
+  // a sign-in gate, or a dead load — and each needs a different remedy.
+  const wizReady = !!window.WIZ_global_data?.SNlM0e;
+  const text = (document.body?.innerText || '').slice(0, 4000);
+  const title = (document.title || '').slice(0, 120);
+  const hasCaptcha = !!document.querySelector(
+    'iframe[src*="recaptcha"], iframe[src*="captcha"], iframe[src*="/sorry/"], #captcha'
+  );
+  const unusual = hasCaptcha ||
+    /unusual traffic|unusual activity|systems have detected|not a robot|verify you.{0,25}human|automated queries/i.test(text);
+  const signin = /sign in to (your )?google|sign in to continue|đăng nhập/i.test(text) ||
+    !!document.querySelector('a[href*="accounts.google.com/ServiceLogin"], a[href*="accounts.google.com/signin"]');
+  const errorPage = /something went wrong|can’t be reached|can't be reached|took too long|err_[a-z_]+/i.test(text);
+  let state = 'unknown';
+  if (wizReady) state = 'app_ready';
+  else if (unusual) state = 'unusual_wall';
+  else if (signin) state = 'signed_out';
+  else if (errorPage) state = 'error_page';
+  else if (document.readyState !== 'complete') state = 'loading';
+  return { ready: wizReady, documentId: FLOW_DOCUMENT_ID, page_state: state,
+           url: location.href.slice(0, 200), title };
+}
+
 window.addEventListener('message', async (event) => {
   if (event.source !== window) return;
   const data = event.data;
   if (!data || !['FLOW_BATCH_RPC', 'FLOW_PAGE_STATUS'].includes(data.type)) return;
   const result = data.type === 'FLOW_PAGE_STATUS'
-    ? { ready: !!window.WIZ_global_data?.SNlM0e, documentId: FLOW_DOCUMENT_ID }
+    ? classifyFlowPage()
     : await window.__flowExecuteBatchOnce(data);
   window.postMessage({
     type: 'FLOW_BATCH_RPC_RESULT',

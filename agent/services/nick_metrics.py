@@ -195,11 +195,17 @@ class NickMetricsTracker:
         success: bool,
         latency_ms: int = 0,
         error: str = "",
+        queue_ms: int | None = None,
     ) -> None:
         """Record the completion of an RPC request."""
         with self._lock:
             w = self._get_worker(worker_id)
             w.record_completion(success=success, latency_ms=latency_ms, error=error)
+        try:
+            from agent.services.request_ledger import record_outcome
+            record_outcome(worker_id, success, latency_ms, error, queue_ms=queue_ms)
+        except Exception:
+            pass
 
     def get_metrics(self, worker_id: str) -> dict[str, Any]:
         """Get snapshot metrics for a single worker."""

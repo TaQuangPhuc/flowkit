@@ -271,6 +271,11 @@ class UnusualAuditManager:
                 "global_burst_10s": global_10s,
             }
 
+    def proxy_request_count(self, proxy_url: str) -> int:
+        """Lifetime requests recorded for an exact proxy URL (0 if unseen)."""
+        rec = self._proxy_records.get(proxy_url.strip())
+        return rec.total_requests if rec else 0
+
     def record_request_success(self, worker_id: str, proxy_url: str = "") -> None:
         """Record successful RPC execution on this worker's proxy."""
         with self._lock:

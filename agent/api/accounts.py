@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import time
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -20,6 +23,7 @@ from agent.services.accounts import (
 )
 from agent.services.chrome_nicks import (
     check_proxy,
+    chrome_data_dir,
     chrome_running,
     launch_nick,
     launch_status,
@@ -50,6 +54,8 @@ class AccountBody(BaseModel):
     proxy_url: str = ""
     note: str = ""
     enabled: bool = True
+    mint_only: bool = False
+    browser: str = ""
     old_id: str | None = None
 
 
@@ -149,11 +155,15 @@ async def list_accounts(reveal: bool = False):
     rows = load_accounts()
     if not rows:
         rows = seed_accounts_from_template()
+    # Gen-capable nicks always first, mint-only at the bottom — stable order.
+    rows = sorted(rows, key=lambda r: bool(r.get("mint_only")))
     return {"accounts": _decorate(rows, reveal=reveal)}
 
 
 @router.put("")
 async def replace_accounts(body: AccountsReplace):
+    if not body.accounts:
+        raise HTTPException(400, "refusing to replace accounts with an empty list")
     try:
         saved = save_accounts([a.model_dump() for a in body.accounts])
     except (ValueError, ProxyURLError) as exc:
@@ -277,6 +287,66 @@ async def reset_accounts_metrics(body: dict | None = None):
     return {"ok": True, "message": f"Metrics reset for {worker_id or 'all workers'}"}
 
 
+@router.get("/metrics/outcomes")
+async def metrics_outcomes(hours: float = 24.0):
+    """Persistent outcome ledger: failure breakdown by normalized error class
+    and per-nick success rates — the data source for fleet optimization."""
+    from agent.services.request_ledger import outcome_summary
+    return outcome_summary(hours)
+
+
+@router.get("/metrics/rpc")
+async def metrics_rpc(hours: float = 24.0):
+    """Per-RPC transport stats from the extension netlog ledger."""
+    from agent.services.request_ledger import rpc_summary
+    return rpc_summary(hours)
+
+
+@router.get("/metrics/events")
+async def metrics_events(hours: float = 24.0, nick: str | None = None,
+                         kind: str | None = None, limit: int = 200):
+    """Unified lifecycle event stream — EXT_CONNECT/DISCONNECT, STRIKE_*,
+    HOLDOUT_*, PROXY_*, TAB_DEAD, BIND_*, MINT_*, ROUTE_*."""
+    from agent.services.request_ledger import event_summary, recent_events
+    kinds = [k.strip() for k in kind.split(",")] if kind else None
+    return {
+        "summary": event_summary(hours),
+        "events": recent_events(hours=hours, nick=nick, kinds=kinds, limit=limit),
+    }
+
+
+@router.get("/{nick_id}/diagnose")
+async def diagnose_nick_endpoint(nick_id: str, hours: float = 24.0):
+    """'Why' report for one nick: live state + outcomes + events + findings."""
+    return await get_flow_client().diagnose_nick(nick_id, hours=hours)
+
+
+@router.get("/diagnose")
+async def diagnose_fleet(hours: float = 24.0):
+    """Fleet-level 'why': per-nick findings for every known nick."""
+    from agent.services.accounts import load_accounts
+    client = get_flow_client()
+    nicks = {a.get("id") for a in load_accounts() if a.get("id")}
+    nicks |= {s.get("profile_id") for s in client._extensions.values()
+              if s.get("profile_id")}
+    import asyncio
+    reports = [
+        r if isinstance(r, dict) else {"error": str(r)}
+        for r in await asyncio.gather(
+            *(client.diagnose_nick(n, hours=hours) for n in sorted(nicks)),
+            return_exceptions=True)
+    ]
+    # Fleet-wide events not tied to one nick (ROUTE_ALL_PARKED etc.)
+    from agent.services.request_ledger import recent_events
+    global_events = [e for e in recent_events(hours=hours, limit=300)
+                     if not e.get("nick")]
+    return {
+        "hours": hours,
+        "nicks": reports,
+        "global_events": global_events,
+    }
+
+
 @router.get("/auth-report")
 async def auth_report_endpoint(window_s: int = 3600):
     """Which nicks are 401, judged from raw netlog status codes.
@@ -363,6 +433,91 @@ async def launch(nick_id: str):
 async def stop(nick_id: str):
     stopped = await stop_nick(nick_id)
     return {"ok": True, "stopped": stopped, "id": nick_id}
+
+
+_SNAPSHOT_EXCLUDES = (
+    "Cache", "Code Cache", "GPUCache", "Service Worker/CacheStorage",
+    "Crashpad", "BrowserMetrics*", "*.log", "locks", "SingletonLock",
+    "SingletonSocket", "SingletonCookie", "DevToolsActivePort",
+)
+
+
+def _snapshot_dir(nick_id: str) -> Path:
+    return Path.home() / ".flowkit" / "profile_snapshots" / nick_id
+
+
+@router.post("/{nick_id}/profile-snapshot")
+async def profile_snapshot(nick_id: str):
+    """Snapshot a nick's Chrome profile while it is clean and logged in.
+
+    UNUSUAL_ACTIVITY flags live in the profile's persistent site data — a
+    snapshot taken now is a 'known-good restore point': future flags get
+    fixed by profile-restore instead of a manual re-login.
+    """
+    if get_account(nick_id) is None:
+        raise HTTPException(404, f"unknown account {nick_id}")
+    if chrome_running(nick_id):
+        raise HTTPException(409, "stop the nick's Chrome first — a live profile cannot be snapshotted safely")
+    src = chrome_data_dir(nick_id)
+    if not src.exists():
+        raise HTTPException(404, f"no profile dir at {src}")
+    dest = _snapshot_dir(nick_id)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    def _copy():
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(
+            src, dest,
+            ignore=shutil.ignore_patterns(*_SNAPSHOT_EXCLUDES),
+            symlinks=True,
+        )
+    try:
+        await asyncio.to_thread(_copy)
+    except Exception as exc:
+        raise HTTPException(500, f"snapshot failed: {exc}") from exc
+    return {"ok": True, "id": nick_id, "snapshot": str(dest)}
+
+
+@router.post("/{nick_id}/profile-restore")
+async def profile_restore(nick_id: str):
+    """Restore a nick's Chrome profile from the clean snapshot.
+
+    Stops Chrome, swaps the live profile dir for the snapshot, and relaunches.
+    The nick must have been snapshotted while clean (profile-snapshot).
+    """
+    if get_account(nick_id) is None:
+        raise HTTPException(404, f"unknown account {nick_id}")
+    snap = _snapshot_dir(nick_id)
+    if not snap.exists():
+        raise HTTPException(404, "no snapshot — run profile-snapshot while the nick was clean")
+    live = chrome_data_dir(nick_id)
+
+    stopped = await stop_nick(nick_id)
+
+    def _swap():
+        backup = live.with_name(live.name + f".burned-{int(time.time())}")
+        if live.exists():
+            live.rename(backup)
+        shutil.copytree(snap, live, symlinks=True)
+        return backup
+    try:
+        backup = await asyncio.to_thread(_swap)
+    except Exception as exc:
+        raise HTTPException(500, f"restore failed: {exc}") from exc
+
+    try:
+        launch_res = await launch_nick(nick_id)
+    except Exception as exc:
+        return {"ok": True, "id": nick_id, "restored_from": str(snap),
+                "backup": str(backup), "launch_error": str(exc)}
+    # Drop the hold-out state too — the restored profile is clean, and the
+    # strike counters would otherwise keep it parked on stale evidence.
+    client = get_flow_client()
+    cleared = client.clear_auth_strikes(nick_id) if hasattr(client, "clear_auth_strikes") else {}
+    _reload_router()
+    return {"ok": True, "id": nick_id, "restored_from": str(snap),
+            "backup": str(backup), "launch": launch_res, "cleared": cleared}
 
 
 @router.post("/{nick_id}/rotate-proxy")

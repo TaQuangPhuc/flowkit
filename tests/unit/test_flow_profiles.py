@@ -134,14 +134,27 @@ class TestRunOnProfile:
         assert result["error_code"] == "upstream_submission_unknown"
         assert len(client.calls) == 1
 
-    async def test_mixed_reference_owners_fail_before_google_submission(self, client):
+    async def test_mixed_reference_owners_fail_before_google_submission(self, client, monkeypatch):
         attach(client, "nick-a", PA)
         attach(client, "nick-b", PB)
         client._media_profiles.update({MEDIA: "nick-a", OPERATION: "nick-b"})
+        # Rebind failing leaves the ids in place, so the mismatch check still
+        # fires before anything reaches Google.
+        monkeypatch.setattr(client, "_rebind_media", AsyncMock(return_value=None))
         result = await client.generate_video_from_references([MEDIA, OPERATION], "go", "0", "scene-1")
         assert result["error_code"] == "media_profile_mismatch"
         assert result["retryable"] is False
         assert not client.calls
+
+    async def test_mixed_reference_owners_auto_rebind(self, client, monkeypatch):
+        attach(client, "nick-a", PA)
+        attach(client, "nick-b", PB)
+        client._media_profiles.update({MEDIA: "nick-a", OPERATION: "nick-b"})
+        # Consolidation rebinds OPERATION's ref onto nick-a's account before
+        # the mismatch check — the request proceeds with a single owner.
+        monkeypatch.setattr(client, "_rebind_media", AsyncMock(return_value=OPERATION + "-re"))
+        result = await client.generate_video_from_references([MEDIA, OPERATION], "go", "0", "scene-1")
+        assert result.get("error_code") != "media_profile_mismatch"
 
     async def test_explicit_profile_cannot_use_another_nicks_image(self, client):
         attach(client, "nick-a", PA)
@@ -464,6 +477,7 @@ async def test_per_worker_video_pacing_and_cooldown(client, monkeypatch):
     from agent import config as _cfg
     monkeypatch.setattr(_cfg, "PER_WORKER_VIDEO_COOLDOWN_MIN", 0.10)
     monkeypatch.setattr(_cfg, "PER_WORKER_VIDEO_COOLDOWN_MAX", 0.15)
+    monkeypatch.setattr(_cfg, "PER_WORKER_RPC_MIN_GAP_S", 0.05)
 
     ws1 = object()
     ws2 = object()
@@ -503,6 +517,159 @@ async def test_per_worker_video_pacing_and_cooldown(client, monkeypatch):
     # Since worker-1 and worker-2 are distinct, they should run nearly simultaneously
     assert (t_end - t_start) < 0.25
 
+
+async def test_external_captcha_token_modes(client, monkeypatch):
+    from agent import config as _cfg
+    from agent.services.flow_client import _current_route
+    monkeypatch.setattr(_cfg, "CAPTCHA_SOLVER_API_KEY", "test-key")
+    solve = AsyncMock(return_value="solver-token")
+    monkeypatch.setattr("agent.services.captcha_solver.solve_recaptcha_v3", solve)
+
+    # off → never calls the solver
+    monkeypatch.setattr(_cfg, "CAPTCHA_SOLVER_MODE", "off")
+    assert await client._foreign_captcha_token("VIDEO_GENERATION") is None
+    solve.assert_not_called()
+
+    # always → solver token for any captcha call
+    monkeypatch.setattr(_cfg, "CAPTCHA_SOLVER_MODE", "always")
+    assert await client._foreign_captcha_token("VIDEO_GENERATION") == "solver-token"
+    assert solve.await_count == 1
+
+    # fallback → only the pending nick's retry consumes it, once
+    monkeypatch.setattr(_cfg, "CAPTCHA_SOLVER_MODE", "fallback")
+    token = _current_route.set({"profile_id": "nick-a"})
+    try:
+        assert await client._foreign_captcha_token("IMAGE_GENERATION") is None
+        client._solver_retry_pending.add("nick-a")
+        assert await client._foreign_captcha_token("IMAGE_GENERATION") == "solver-token"
+        assert "nick-a" not in client._solver_retry_pending
+    finally:
+        _current_route.reset(token)
+    assert solve.await_count == 2
+
+    # solver failure → None so the extension falls back to in-page mint
+    solve.side_effect = RuntimeError("solver down")
+    monkeypatch.setattr(_cfg, "CAPTCHA_SOLVER_MODE", "always")
+    assert await client._foreign_captcha_token("VIDEO_GENERATION") is None
+
+
+async def test_foreign_mint_modes(client, monkeypatch):
+    from agent import config as _cfg
+    from agent.services.flow_client import _current_route
+
+    monkeypatch.setattr(_cfg, "CAPTCHA_SOLVER_API_KEY", "")
+    mint = AsyncMock(return_value="foreign-token")
+    monkeypatch.setattr(client, "_mint_on_sibling", mint)
+
+    # off → never mints on a sibling
+    monkeypatch.setattr(_cfg, "CAPTCHA_FOREIGN_MINT", "off")
+    assert await client._foreign_captcha_token("VIDEO_GENERATION") is None
+    mint.assert_not_called()
+
+    # always → foreign token for any captcha call
+    monkeypatch.setattr(_cfg, "CAPTCHA_FOREIGN_MINT", "always")
+    assert await client._foreign_captcha_token("VIDEO_GENERATION") == "foreign-token"
+    assert mint.await_count == 1
+
+    # fallback → only the flagged nick's retry consumes it, once
+    monkeypatch.setattr(_cfg, "CAPTCHA_FOREIGN_MINT", "fallback")
+    token = _current_route.set({"profile_id": "nick-b"})
+    try:
+        assert await client._foreign_captcha_token("IMAGE_GENERATION") is None
+        client._foreign_mint_pending.add("nick-b")
+        assert await client._foreign_captcha_token("IMAGE_GENERATION") == "foreign-token"
+        assert "nick-b" not in client._foreign_mint_pending
+    finally:
+        _current_route.reset(token)
+    assert mint.await_count == 2
+
+    # mint failure → None so the extension falls back to in-page mint
+    mint.return_value = None
+    monkeypatch.setattr(_cfg, "CAPTCHA_FOREIGN_MINT", "always")
+    assert await client._foreign_captcha_token("VIDEO_GENERATION") is None
+
+
+async def test_minter_route_selection(client, monkeypatch, tmp_path):
+    from agent import config as _cfg
+    import time as _t
+
+    client._mint_audit_path = tmp_path / "mint_audit.jsonl"
+
+    # mint_only_nicks() is cached module state — another test file may have
+    # populated it with real accounts, so stub it for deterministic routes.
+    monkeypatch.setattr("agent.services.accounts.mint_only_nicks",
+                        lambda *a, **k: frozenset())
+
+    ws_a, ws_b, ws_c = object(), object(), object()
+    client._extensions = {
+        ws_a: {"profile_id": "mint-a", "in_flight": 0, "connected_at": 1},
+        ws_b: {"profile_id": "mint-b", "in_flight": 0, "connected_at": 1},
+        ws_c: {"profile_id": "gen-nick", "in_flight": 0, "connected_at": 1},
+    }
+
+    # No minter list → any sibling is eligible, excluding the requester
+    monkeypatch.setattr(_cfg, "CAPTCHA_MINTER_NICKS", set())
+    route, _ = client._minter_route(exclude="gen-nick")
+    assert route["profile_id"] in {"mint-a", "mint-b"}
+    route, _ = client._minter_route(exclude="mint-a")
+    assert route["profile_id"] in {"mint-b", "gen-nick"}
+
+    # With a farm list → only listed nicks mint, and they are excluded from
+    # work candidates
+    monkeypatch.setattr(_cfg, "CAPTCHA_MINTER_NICKS", {"mint-a", "mint-b"})
+    route, _ = client._minter_route(exclude="gen-nick")
+    assert route["profile_id"] in {"mint-a", "mint-b"}
+    _, cands = client._profile_candidates()
+    assert {c["profile_id"] for c in cands} == {"gen-nick"}
+
+    # Fail-cooldown removes a minter
+    client._minter_fail_until["mint-a"] = _t.time() + 60
+    route, skipped = client._minter_route(exclude="gen-nick")
+    assert route["profile_id"] == "mint-b"
+    assert skipped == ["cooled"]
+
+    # Rate cap: mint-b over CAPTCHA_MINTER_MAX_PER_MIN → no route left
+    monkeypatch.setattr(_cfg, "CAPTCHA_MINTER_MAX_PER_MIN", 1)
+    from collections import deque as _dq
+    client._minter_mint_ts["mint-b"] = _dq([_t.time()])
+    route, skipped = client._minter_route(exclude="gen-nick")
+    assert route is None and set(skipped) == {"cooled", "rate_limited"}
+    monkeypatch.setattr(_cfg, "CAPTCHA_MINTER_MAX_PER_MIN", 0)
+
+
+
+async def test_consolidate_media_ids_rebinds_unroutable(client, monkeypatch):
+    from agent import config as _cfg
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr("agent.services.accounts.mint_only_nicks",
+                        lambda *a, **k: frozenset())
+
+    ws_gen, ws_mint = object(), object()
+    client._extensions = {
+        ws_gen: {"profile_id": "gen-nick", "in_flight": 0, "connected_at": 1},
+        ws_mint: {"profile_id": "mint-nick", "in_flight": 0, "connected_at": 1},
+    }
+    monkeypatch.setattr(_cfg, "CAPTCHA_MINTER_NICKS", {"mint-nick"})
+    client._media_profiles = {"ref-a": "gen-nick", "ref-b": "mint-nick"}
+
+    rebind = AsyncMock(return_value="ref-b-new")
+    monkeypatch.setattr(client, "_rebind_media", rebind)
+
+    out = await client._consolidate_media_ids(["ref-a", "ref-b"], "proj")
+    # ref-b's owner is mint-only → rebind onto gen-nick; ref-a already there
+    assert out == ["ref-a", "ref-b-new"]
+    rebind.assert_awaited_once_with("ref-b", "mint-nick", "gen-nick", "proj")
+
+    # Single routable owner → untouched
+    client._media_profiles = {"ref-a": "gen-nick"}
+    assert await client._consolidate_media_ids(["ref-a"], "proj") == ["ref-a"]
+    assert rebind.await_count == 1
+
+    # Rebind failure → original id kept so the normal error path still fires
+    client._media_profiles = {"ref-b": "mint-nick"}
+    rebind.return_value = None
+    assert await client._consolidate_media_ids(["ref-b"], "proj") == ["ref-b"]
 
 
 def _denied(rpcid: str) -> dict:
@@ -588,12 +755,19 @@ class TestModelAccessDenied:
         await client.generate_video(None, "go", "0", "scene-1")
         assert client.model_denied_nicks() == ["nick-a"]
 
-        # Non-video work still routes to nick-a, and one clean call there means
-        # the account has access again.
+        # Non-video success must NOT un-park — image/upload calls never touch
+        # the video model, so healing on them re-admitted denied nicks and the
+        # next video job failed again (deny↔heal loop).
         async def ok(_pid):
             return {"data": "ok"}
 
         await client._run_on_profile(ok)
+        assert client.model_denied_nicks() == ["nick-a"]
+
+        # Park expiry re-admits the nick; a successful video submission then
+        # clears the flag — the only call type that proves video access.
+        client._model_denied["nick-a"] = time.time() - 1
+        await client._run_on_profile(ok, video_submission=True)
         assert client.model_denied_nicks() == []
 
     async def test_a_success_closes_the_session_flagged_incident(self, client, monkeypatch):

@@ -81,7 +81,7 @@ async def test_failed_candidate_keeps_account_and_bridge(tmp_path, failure):
     assert not result["ok"]
     assert path.read_bytes() == before
     bridge.assert_not_called()
-    assert probe.call_count == 1
+    assert probe.call_count == 3  # redraw loop retries failed sessions
 
 
 @pytest.mark.asyncio

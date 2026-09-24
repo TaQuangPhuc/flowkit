@@ -128,6 +128,7 @@ class GenerateImageRequest(BaseModel):
 
     prompt: str
     project_id: Optional[str] = ""
+    profile_id: Optional[str] = None
     aspect_ratio: str = Field(default="IMAGE_ASPECT_RATIO_PORTRAIT", alias="aspectRatio")
     user_paygate_tier: str = "PAYGATE_TIER_ONE"
     character_media_ids: Optional[list[str]] = None
@@ -273,6 +274,32 @@ async def extension_status():
     }
 
 
+@router.get("/proxy-accounts")
+async def proxy_accounts():
+    """Surfshark account pool status — per-auth worker counts + worker list.
+    Written by the gateway every 15s to gateway/status.json. Surfshark creds
+    are short-lived (~7d) and die randomly; ready_per_auth going to 0 means
+    that account is dead and should be replaced."""
+    import json as _json
+    from pathlib import Path as _Path
+    status_path = _Path(__file__).resolve().parents[2] / "gateway" / "status.json"
+    try:
+        data = _json.loads(status_path.read_text())
+    except (OSError, _json.JSONDecodeError):
+        raise HTTPException(503, "gateway status unavailable")
+    data["age_s"] = int(__import__("time").time()) - int(data.get("updated_at", 0))
+    data["stale"] = data["age_s"] > 45
+    return data
+
+
+@router.get("/minters")
+async def minter_health():
+    """Trusted-minter telemetry: per-minter mint/pass/fail counters, rate in
+    the trailing minute, cooldown state, and the configured per-minute cap.
+    Events also stream to logs/captcha_mint_audit.jsonl."""
+    return get_flow_client().minter_health()
+
+
 @router.get("/credits")
 async def get_credits():
     """Get user credits from Google Flow."""
@@ -298,6 +325,7 @@ async def generate_image(body: GenerateImageRequest, request: Request):
         user_paygate_tier=body.user_paygate_tier,
         character_media_ids=body.character_media_ids,
         image_model=body.image_model,
+        profile_id=body.profile_id,
     )
     if result.get("error") and (result.get("proxy_rotated") or "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in str(result.get("error") or "")):
         logger.info("generate_image encountered transient rotation; retrying transparently after 2.0s settle...")
@@ -309,6 +337,7 @@ async def generate_image(body: GenerateImageRequest, request: Request):
             user_paygate_tier=body.user_paygate_tier,
             character_media_ids=body.character_media_ids,
             image_model=body.image_model,
+            profile_id=body.profile_id,
         )
     if result.get("status") == 200:
         base_url = str(request.base_url).rstrip("/")
@@ -823,6 +852,26 @@ async def get_proxy_health_stats():
         "ok": True,
         "health": audit_mgr.get_audit_summary().get("proxy_pool_health", []),
     }
+
+
+@router.post("/diagnostics/test-cross-captcha")
+async def test_cross_captcha_endpoint(mint_worker: str, use_worker: str,
+                                      foreign_token: str | None = None,
+                                      kind: str = "upload"):
+    """Mint a captcha token on mint_worker, spend it on use_worker's upload.
+
+    Decides whether Enterprise tokens are transferable across environments:
+    a foreign token passing means a dedicated trusted minter (or a solver)
+    can work; failing means tokens are environment-bound and the whole
+    external-token approach is dead.
+    """
+    client = get_flow_client()
+    try:
+        return await client.test_cross_captcha(
+            mint_worker=mint_worker, use_worker=use_worker,
+            foreign_token=foreign_token, kind=kind)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @router.get("/diagnostics/test-recaptcha")

@@ -51,3 +51,4 @@ ds-bundle/
 scratch/
 gateway/
 .tabnine/
+agent/proxy_burned_ips.json

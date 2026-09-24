@@ -23,6 +23,45 @@ GOOGLE_FLOW_API = "https://aisandbox-pa.googleapis.com"
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY")
 RECAPTCHA_SITE_KEY = os.environ.get("RECAPTCHA_SITE_KEY", "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV")
 
+# External reCAPTCHA solver (anticaptcha.top). Mints the Enterprise token in
+# the solver's environment instead of the Flow tab — experiment to measure how
+# much of the trust score is IP/session-bound.
+#   off      = never call the solver (default)
+#   fallback = solver token only for the auto-retry after UNUSUAL_ACTIVITY
+#   always   = solver token for every captcha-consuming call (A/B test)
+CAPTCHA_SOLVER_API_KEY = os.environ.get("CAPTCHA_SOLVER_API_KEY", "")
+CAPTCHA_SOLVER_PROVIDER = os.environ.get("CAPTCHA_SOLVER_PROVIDER", "anticaptcha")
+CAPTCHA_SOLVER_BASE = os.environ.get("CAPTCHA_SOLVER_BASE", "https://anticaptcha.top")
+CAPTCHA_SOLVER_MODE = os.environ.get("CAPTCHA_SOLVER_MODE", "off")
+CAPTCHA_SOLVER_TIMEOUT_S = float(os.environ.get("CAPTCHA_SOLVER_TIMEOUT_S", "45"))
+
+# Trusted-minter pool: a token minted inside one nick's logged-in Flow page is
+# accepted on another nick's generate call — measured 2026-09-22, including a
+# nick mid-UNUSUAL_ACTIVITY wave whose own-minted token failed. Farm nicks
+# (CAPTCHA_MINTER_NICKS) connect like normal workers but are kept out of gen
+# routing; with the list empty any healthy sibling mints for the others.
+CAPTCHA_FOREIGN_MINT = os.environ.get("CAPTCHA_FOREIGN_MINT", "off")  # off|fallback|always
+CAPTCHA_MINTER_NICKS = {s.strip() for s in os.environ.get("CAPTCHA_MINTER_NICKS", "").split(",") if s.strip()}
+CAPTCHA_MINTER_FAIL_COOLDOWN_S = float(os.environ.get("CAPTCHA_MINTER_FAIL_COOLDOWN_S", "900"))
+# A foreign token failing usually means the target's fresh IP is still flagged,
+# not that the minter minted a bad token — so the first miss benches briefly and
+# only consecutive misses escalate toward FAIL_COOLDOWN_S.
+CAPTCHA_MINTER_TOKEN_FAIL_COOL_S = float(os.environ.get("CAPTCHA_MINTER_TOKEN_FAIL_COOL_S", "90"))
+# Standby pool of pre-minted foreign captcha tokens, kept per action so a
+# strike retry consumes one instantly instead of minting serially mid-retry.
+# reCAPTCHA Enterprise tokens live ~2min; TTL here stays conservative.
+CAPTCHA_TOKEN_POOL_SIZE = int(os.environ.get("CAPTCHA_TOKEN_POOL_SIZE", "2"))
+CAPTCHA_TOKEN_TTL_S = float(os.environ.get("CAPTCHA_TOKEN_TTL_S", "90"))
+CAPTCHA_TOKEN_POOL_TICK_S = int(os.environ.get("CAPTCHA_TOKEN_POOL_TICK_S", "20"))
+# When every candidate nick is parked, hold the request in-band until the
+# soonest park expires (up to this cap) — a short wait beats an instant 503.
+PARKED_WAIT_S = float(os.environ.get("PARKED_WAIT_S", "75"))
+# Soft cap on mints per minter per minute. 0 = measure only — the real safe
+# mint rate is unknown until the audit log shows where trust decays.
+CAPTCHA_MINTER_MAX_PER_MIN = int(os.environ.get("CAPTCHA_MINTER_MAX_PER_MIN", "0"))
+CAPTCHA_MINTER_PROBE_SECS = int(os.environ.get("CAPTCHA_MINTER_PROBE_SECS", "60"))
+CAPTCHA_MINTER_RELOAD_SECS = int(os.environ.get("CAPTCHA_MINTER_RELOAD_SECS", "90"))
+
 # ─── Flow batchexecute (the current path) ───────────────────
 # Every call is signed in the page with the session cookie plus a per-page `at`
 # token, so the extension runs it inside a signed-in flow.google.com tab. Set
@@ -57,11 +96,26 @@ STALE_PROCESSING_TIMEOUT = int(os.environ.get("STALE_PROCESSING_TIMEOUT", "600")
 # Nova (and everything else) still talks to one URL on :8100. Behind it, each
 # Chrome profile is one Flow nick + one sticky proxy + one Flow project.
 # Concurrent slots are per nick; credits are not multiplied.
-PROFILE_MAX_CONCURRENT = int(os.environ.get("PROFILE_MAX_CONCURRENT", "20"))
+PROFILE_MAX_CONCURRENT = int(os.environ.get("PROFILE_MAX_CONCURRENT", "4"))
+# When a nick graduates to SESSION_TERMINAL (flag follows the Google session
+# through rotations), auto-clone its Chrome profile onto a fresh proxy IP and
+# keep working — empirically the flag binds to browser-instance+IP pairing,
+# not the account, so the clone is clean. Original is disabled for repair.
+AUTO_CLONE_ON_TERMINAL = os.environ.get("AUTO_CLONE_ON_TERMINAL", "1") == "1"
+AUTO_CLONE_MAX_DEPTH = int(os.environ.get("AUTO_CLONE_MAX_DEPTH", "2"))
+AUTO_CLONE_COUNTRIES = [
+    c.strip() for c in os.environ.get(
+        "AUTO_CLONE_COUNTRIES", "us,de,jp,gb,ca,au,sg,br,nl").split(",")
+    if c.strip()
+]
 # Randomized human-like jitter cooldown (seconds) between video generation dispatches on the same worker
 PER_WORKER_VIDEO_COOLDOWN_MIN = float(os.environ.get("PER_WORKER_VIDEO_COOLDOWN_MIN", "2.0"))
 PER_WORKER_VIDEO_COOLDOWN_MAX = float(os.environ.get("PER_WORKER_VIDEO_COOLDOWN_MAX", "3.0"))
 PER_WORKER_VIDEO_COOLDOWN = PER_WORKER_VIDEO_COOLDOWN_MAX
+# Minimum spacing (seconds) between ANY two RPC dispatches on the same worker.
+# UNUSUAL_ACTIVITY audit shows the rate-burst signature is gap<1.2s or
+# >=3 req/10s — non-video RPCs were previously dispatched back-to-back.
+PER_WORKER_RPC_MIN_GAP_S = float(os.environ.get("PER_WORKER_RPC_MIN_GAP_S", "1.5"))
 PROFILES_FILE = Path(os.environ.get("FLOW_PROFILES_FILE", Path(__file__).parent / "profiles.json"))
 
 # ─── Smart Late-Replay (Rescuing stalled Google Veo 3 queue jobs) ───

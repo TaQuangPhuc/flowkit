@@ -7,6 +7,7 @@ import re
 import os
 import tempfile
 import threading
+import time
 from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
@@ -58,6 +59,12 @@ def _normalize(row: dict, *, require_id: bool = True) -> dict:
         "proxy_url": proxy,
         "note": str(row.get("note") or ""),
         "enabled": bool(row.get("enabled", True)),
+        # Trusted-minter farm member: still connects and mints captcha tokens
+        # for other nicks, but is excluded from real work routing.
+        "mint_only": bool(row.get("mint_only", False)),
+        # Alternate browser binary for this nick ("coccoc" → ~/.flowkit/coccoc-browser).
+        # Empty = default Google Chrome.
+        "browser": str(row.get("browser") or "").strip(),
     }
 
 
@@ -240,6 +247,21 @@ def get_account(nick_id: str, path: Path | None = None) -> Optional[dict]:
     return None
 
 
+_MINT_CACHE = {"ts": 0.0, "nicks": frozenset()}
+
+
+def mint_only_nicks(path: Path | None = None, ttl: float = 5.0) -> frozenset:
+    """Nicks flagged mint_only, cached briefly — called on the dispatch hot
+    path where a disk read per RPC would be wasteful."""
+    now = time.monotonic()
+    if path is None and now - _MINT_CACHE["ts"] < ttl:
+        return _MINT_CACHE["nicks"]
+    nicks = frozenset(r["id"] for r in load_accounts(path) if r.get("mint_only"))
+    if path is None:
+        _MINT_CACHE.update(ts=now, nicks=nicks)
+    return nicks
+
+
 def seed_accounts_from_template(path: Path | None = None) -> list[dict]:
     """Create accounts.json from committed profiles.json if it does not exist."""
     target = _path(path)
@@ -287,6 +309,8 @@ def public_account(row: dict, *, reveal: bool = False) -> dict:
         "has_proxy": bool(proxy),
         "note": row.get("note") or "",
         "enabled": bool(row.get("enabled", True)),
+        "mint_only": bool(row.get("mint_only", False)),
+        "browser": str(row.get("browser") or ""),
     }
 
 

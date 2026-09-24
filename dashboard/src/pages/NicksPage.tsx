@@ -70,6 +70,7 @@ interface Nick {
   has_proxy: boolean
   note: string
   enabled: boolean
+  browser?: string
   chrome_running: boolean
   pid: number | null
   data_dir: string
@@ -88,6 +89,7 @@ interface NickDraft {
   proxy_url: string
   note: string
   enabled: boolean
+  browser: string
   old_id?: string
 }
 
@@ -185,6 +187,7 @@ const EMPTY_DRAFT: NickDraft = {
   proxy_url: '',
   note: '',
   enabled: true,
+  browser: '',
 }
 
 const fieldStyle: CSSProperties = {
@@ -384,6 +387,7 @@ export default function NicksPage() {
         proxy_url: full.proxy_url,
         note: full.note,
         enabled: full.enabled,
+        browser: full.browser || '',
       })
       setEditing(nick.id)
     } catch (err) {
@@ -412,6 +416,7 @@ export default function NicksPage() {
       proxy_url: draft.proxy_url.trim(),
       note: draft.note,
       enabled: draft.enabled,
+      browser: draft.browser,
     }
     // Adding a nick verifies a pool proxy, which takes seconds. Holding the
     // modal and the global `busy` lock for that looked like a frozen page, so
@@ -999,6 +1004,18 @@ export default function NicksPage() {
                       )}
                     </div>
                   </div>
+                </Field>
+
+                <Field label={t('nicks.field.browser')}>
+                  <select
+                    className={inputClass()}
+                    style={fieldStyle}
+                    value={draft.browser}
+                    onChange={e => setDraft(d => ({ ...d, browser: e.target.value }))}
+                  >
+                    <option value="">{t('nicks.browser.default')}</option>
+                    <option value="coccoc">Cốc Cốc</option>
+                  </select>
                 </Field>
 
                 <Field label={t('nicks.field.note')}>

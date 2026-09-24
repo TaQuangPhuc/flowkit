@@ -22,9 +22,12 @@ import json
 import logging
 import os
 import random
+import re
+import shutil
 import time
 import urllib.request
 import uuid
+from collections import deque
 from typing import Awaitable, Callable, Optional
 
 from agent.config import (
@@ -39,6 +42,7 @@ from agent.config import (
 )
 from agent import config as _config
 from agent.services import flow_batch as fb
+from agent.services import request_ledger as _ledger
 from agent.services.headers import random_headers
 
 from agent.services.video_evidence import transition as video_evidence
@@ -51,6 +55,14 @@ _MEDIA_PROFILES_PATH = BASE_DIR / ".scratch" / "media_profiles.json"
 _GETSESSION_DUMP = BASE_DIR / ".scratch" / "getsession-last.txt"
 _LISTING_DUMP = BASE_DIR / ".scratch" / "listing-last.txt"
 _R2V_AS29S_CAP = 12
+# Measured from unusual_activity_audit + netlog (2026-09-23): gen submits that
+# arrive <10min after the nick's last strike re-flag 57-87% of the time; at
+# 10-20min quiet that drops to ~21%, and beyond 30min gains are marginal.
+# 12min captures the decay knee without parking capacity for an hour.
+_UNUSUAL_FLAG_DECAY_S = 720
+# Forensic threshold (check_unusual_threshold): clean residential exits take a
+# median 139 requests before Google flags them; rotate at 110 to stay under.
+_PROACTIVE_ROTATE_AFTER_REQUESTS = 110
 
 # Which Chrome nick the current RPC is running on. `_send` reads this so a
 # high-level call can pin (or fail over) without every envelope builder
@@ -58,6 +70,12 @@ _R2V_AS29S_CAP = 12
 _current_route: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "flow_route", default=None,
 )
+
+
+class _SessionFlagged(Exception):
+    """Sentinel: skip rotate+retry on a session-flagged nick so the request
+    falls through to cross-nick failover instead of burning ~40s and a fresh
+    proxy IP on a rotation that cannot help."""
 
 
 class FlowClient:
@@ -85,6 +103,11 @@ class FlowClient:
         # exist on another Google account.
         self._operation_profiles: dict[str, str] = {}
         self._media_profiles: dict[str, str] = {}
+        # Negative cache: media ids that already returned "No urls" — expired
+        # or never existed. Re-polling burns an RPC per attempt and callers
+        # were seen re-polling the same dead id 35+ times; answer from cache
+        # for DEAD_MEDIA_TTL_S instead.
+        self._dead_media: dict[str, float] = {}
         # r2v StreamChat: the submit uuid is often a chat-message id, not the
         # listing key. Poll then asks GetSession (GN0Bre) on this conversation.
         self._operation_chat_sessions: dict[str, str] = {}
@@ -104,14 +127,56 @@ class FlowClient:
         self._configured_profiles: list[dict] = load_nick_pins()
         self._profile_semaphores: dict[str, asyncio.Semaphore] = {}
         self._retrying_profiles: set[str] = set()
+        self._solver_retry_pending: set[str] = set()
+        self._foreign_mint_pending: set[str] = set()
+        # Trusted-minter bookkeeping: minter nick -> unix ts until which its
+        # tokens are distrusted, and target nick -> minter that supplied the
+        # in-flight token (for pass/fail attribution).
+        self._minter_fail_until: dict[str, float] = {}
+        self._minter_token_fails: dict[str, int] = {}
+        self._active_minter: dict[str, str] = {}
+        # Successful mints per minter — tiebreaks _minter_route so load
+        # round-robins instead of pinning the first session in dict order.
+        self._minter_use_count: dict[str, int] = {}
+        # Mint telemetry: per-minter counters + recent-mint timestamps for
+        # rate measurement, mirrored to logs/captcha_mint_audit.jsonl.
+        self._minter_stats: dict[str, dict] = {}
+        self._minter_mint_ts: dict[str, deque] = {}
+        self._minter_page_dead: dict[str, float] = {}
+        self._minter_reload_at: dict[str, float] = {}
+        self._minter_probe_task: asyncio.Task | None = None
+        # Standby token pool: action -> deque of {token, minter, minted_at}.
+        # Strike retries pop a warm token instead of minting mid-retry.
+        self._token_pool: dict[str, deque] = {}
+        self._token_pool_lock = asyncio.Lock()
+        self._token_pool_task: asyncio.Task | None = None
+        self._mint_audit_path = BASE_DIR / "logs" / "captcha_mint_audit.jsonl"
         self._last_route: Optional[dict] = None
         self._operation_complaints: dict[str, str] = {}
         self._profile_dispatched_counts: dict[str, int] = {}
         self._profile_in_flight: dict[str, int] = {}
         self._worker_dispatch_locks: dict[str, asyncio.Lock] = {}
         self._worker_last_video_dispatch: dict[str, float] = {}
+        self._worker_last_dispatch: dict[str, float] = {}
         self._replay_in_progress: set[str] = set()
         self._unusual_strikes: dict[str, int] = {}
+        self._unusual_strike_ts: dict[str, float] = {}
+        # Terminal flag: strikes kept landing after hold-out releases and
+        # proxy rotations — the flag follows the Google session, so rotating
+        # again only burns clean IPs. Terminal nicks leave routing entirely
+        # until an operator repair (clear_auth_strikes).
+        self._session_terminal: dict[str, float] = {}
+        # Auto-clone dedupe: one clone attempt per terminal nick per boot.
+        self._clone_pending: set[str] = set()
+        # Canary probe: when a hold-out window elapses we fire one cheap RPC
+        # before re-admitting real traffic, so a still-flagged session eats a
+        # synthetic request instead of a paying one.
+        self._canary_pending: set[str] = set()
+        # Flag-depth escalation: a nick that re-strikes right after its
+        # hold-out release gets a doubled decay each time (12m→24m→48m→96m→192m).
+        # Deep flags (hundreds of strikes) don't clear in one 12min window.
+        self._flag_depth: dict[str, int] = {}
+        self._flag_released: set[str] = set()
         # Strike counts live in memory only, so after a restart nothing knows a
         # nick still carries an open ACCOUNT_SESSION_FLAGGED row. Seeded once
         # from the ledger, lazily, so a success can still close it.
@@ -176,6 +241,10 @@ class FlowClient:
         # authenticated extension. It becomes active after token_captured.
         if self._extension_ws is None:
             self._extension_ws = ws
+        if self._minter_probe_task is None or self._minter_probe_task.done():
+            self._minter_probe_task = asyncio.create_task(self._minter_probe_loop())
+        if self._token_pool_task is None or self._token_pool_task.done():
+            self._token_pool_task = asyncio.create_task(self._token_pool_loop())
         self._ws_connect_count += 1
         self._ws_connected_at = time.time()
         logger.info(
@@ -184,6 +253,10 @@ class FlowClient:
             self._ws_connect_count,
             len(self._extensions),
         )
+        _ledger.record_event("EXT_CONNECT", detail={
+            "active": len(self._extensions),
+            "connect_count": self._ws_connect_count,
+        })
 
     def clear_extension(self, ws=None):
         """Called when extension disconnects."""
@@ -191,9 +264,17 @@ class FlowClient:
         if disconnected_ws is None:
             return
 
-        self._extensions.pop(disconnected_ws, None)
+        session = self._extensions.pop(disconnected_ws, None)
         self._ws_disconnect_count += 1
         self._ws_last_disconnect_at = time.time()
+        _ledger.record_event("EXT_DISCONNECT",
+                             nick=(session or {}).get("profile_id"),
+                             detail={
+                                 "pending_cancelled": sum(
+                                     1 for _, pws in list(self._pending_ws.items())
+                                     if pws is disconnected_ws),
+                                 "active": len(self._extensions),
+                             })
 
         # Only cancel requests that were sent through the disconnected socket.
         # Requests owned by other Chrome profiles are still valid.
@@ -251,8 +332,13 @@ class FlowClient:
         """Return usable extensions, least-busy first."""
         now = time.time()
         candidates = []
+        mint_only = self._minter_nicks()
         for ws, session in self._extensions.items():
             if require_token and not session.get("flow_key"):
+                continue
+            # Mint-only farm nicks never serve real work — unrouted calls land
+            # here, so without this a farm nick could pick up gen traffic.
+            if session.get("profile_id") in mint_only:
                 continue
             recency = (
                 session.get("token_captured_at")
@@ -318,6 +404,24 @@ class FlowClient:
         flow_project = (data.get("flowProjectId") or "").strip() or None
         if profile_id:
             session["profile_id"] = profile_id
+            # A relaunched Chrome brings a fresh ws while the old socket can
+            # linger half-open — same profile_id on two sessions means the
+            # router may dispatch into a dead socket. Resolve by liveness:
+            # a socket that answers stays, the other is the zombie. Blind
+            # "newest wins" ping-pongs because the evicted extension just
+            # reconnects and re-evicts the survivor.
+            for other_ws, other in list(self._extensions.items()):
+                if other_ws is not ws and other.get("profile_id") == profile_id:
+                    logger.warning(
+                        "Duplicate WS session for %s — resolving by liveness",
+                        profile_id,
+                    )
+                    try:
+                        asyncio.get_running_loop().create_task(
+                            self._resolve_dup_ws(other_ws, ws, profile_id))
+                    except RuntimeError:
+                        # No loop (shouldn't happen) — keep the new conn.
+                        self.clear_extension(other_ws)
             cached = self._profile_chat_sessions.get(profile_id)
             if cached and not session.get("chat_session_id"):
                 session["chat_session_id"] = cached
@@ -387,12 +491,30 @@ class FlowClient:
             media_ids=media_ids,
             operation_id=operation_id,
         )
+        # Ghost pin: pinned nick has no account row (renamed/deleted since the
+        # pin was recorded — e.g. media/operation/caller still points at an old
+        # nick id). Dropping it lets unpinned routing pick a live nick instead
+        # of hard-failing with NO_FLOW_TAB; media rebind upstream fixes refs.
+        if pin:
+            try:
+                from agent.services.accounts import get_account
+                if get_account(pin) is None:
+                    logger.warning(
+                        "Pin %s resolves to no configured nick — dropping pin, routing unpinned",
+                        pin,
+                    )
+                    pin = None
+            except Exception:
+                pass
         now = time.time()
+        mint_only = self._minter_nicks()
         routes = []
         for ws, session in self._extensions.items():
             if require_token and not session.get("flow_key"):
                 continue
             sid = session.get("profile_id")
+            if sid and sid in mint_only:
+                continue
             if pin and ws is not pin:
                 if not sid or str(sid).strip().lower() != str(pin).strip().lower():
                     continue
@@ -421,7 +543,46 @@ class FlowClient:
             if video_submission and sid and self._model_denied.get(sid, 0.0) > now:
                 continue
 
-            is_avail = (session.get("unavailable_until", 0) <= now) and not is_quar
+            # Session-flagged nicks (recent UNUSUAL_ACTIVITY strikes) cannot
+            # produce: Google rejects their submits at the account level
+            # regardless of exit IP. Dispatching to them anyway wastes ~10s,
+            # records another strike, and deepens the Google-side flag, so
+            # hold them out of rotation until the 30min strike window decays
+            # — matching the decay semantics at the strike site below. The
+            # ledger call is cached, so this only hits sqlite once per boot.
+            # Terminal sessions never re-enter rotation: the flag followed
+            # the Google session through multiple IP rotations, so more
+            # rotating only burns clean proxy IPs. Cleared by operator
+            # repair (clear_auth_strikes) — i.e. after a fresh login.
+            if sid and sid in self._session_terminal:
+                continue
+
+            self._flagged_from_ledger()
+            if sid and self._unusual_strikes.get(sid, 0) >= 2:
+                last_ts = self._unusual_strike_ts.get(sid, 0)
+                decay = _UNUSUAL_FLAG_DECAY_S << min(self._flag_depth.get(sid, 0), 4)
+                if now - last_ts <= decay:
+                    continue
+                # Hold-out elapsed — canary first: fire one cheap ListSessions
+                # and only re-admit the nick if Google answers clean. A still
+                # -flagged session burns the synthetic probe, not a real job.
+                if sid in self._canary_pending:
+                    continue
+                self._canary_pending.add(sid)
+                try:
+                    asyncio.get_running_loop().create_task(self._canary_probe(sid))
+                except RuntimeError:
+                    # No loop (sync caller) — fall back to immediate release.
+                    self._canary_pending.discard(sid)
+                    self._unusual_strikes[sid] = 0
+                    self._flag_released.add(sid)
+                continue
+
+            is_avail = (
+                session.get("unavailable_until", 0) <= now
+                and session.get("warming_until", 0) <= now
+                and not is_quar
+            )
             cur_dispatched = max(
                 int(session.get("dispatched_count") or 0),
                 self._profile_dispatched_counts.get(sid, 0) if sid else 0,
@@ -570,6 +731,185 @@ class FlowClient:
         now = time.time()
         return sorted(nick for nick, until in self._model_denied.items() if until > now)
 
+    async def diagnose_nick(self, nick: str, hours: float = 24.0) -> dict:
+        """Correlated 'why' report for one nick: live state + persistent
+        outcomes + lifecycle events, reduced to human-readable findings."""
+        now = time.time()
+        from agent.services.accounts import get_account
+        acc = get_account(nick) or {}
+        session = next(
+            (s for s in self._extensions.values()
+             if s.get("profile_id") == nick),
+            None,
+        )
+
+        # ---- live state -------------------------------------------------
+        state: dict = {
+            "account_row": bool(acc),
+            "enabled": bool(acc.get("enabled", True)),
+            "mint_only": bool(acc.get("mint_only")),
+            "connected": session is not None,
+            "chat_session": bool((session or {}).get("chat_session_id")),
+            "in_flight": int((session or {}).get("in_flight") or 0),
+            "unusual_strikes": self._unusual_strikes.get(nick, 0),
+            "flag_depth": self._flag_depth.get(nick, 0),
+            "session_terminal": nick in self._session_terminal,
+            "canary_pending": nick in self._canary_pending,
+            "auth_strikes": self._auth_strikes.get(nick, 0),
+            "proxy_url": acc.get("proxy_url"),
+            "egress_ip": acc.get("last_egress_ip"),
+            "page_state": (session or {}).get("page_state"),
+            "page_title": (session or {}).get("page_title"),
+        }
+        parked_until = float((session or {}).get("unavailable_until") or 0)
+        state["parked_for_s"] = round(max(0.0, parked_until - now), 1)
+
+        # hold-out check mirrors _profile_candidates
+        decay = _UNUSUAL_FLAG_DECAY_S << min(self._flag_depth.get(nick, 0), 4)
+        last_strike = self._unusual_strike_ts.get(nick, 0)
+        state["holdout"] = bool(
+            state["unusual_strikes"] >= 2 and last_strike
+            and now - last_strike <= decay
+        )
+        if state["holdout"]:
+            state["holdout_lifts_in_s"] = round(decay - (now - last_strike), 1)
+
+        quar = None
+        if acc.get("proxy_url"):
+            try:
+                from agent.services.proxy_checker import is_quarantined
+                quar = bool(is_quarantined(acc["proxy_url"]))
+            except Exception:
+                quar = None
+        state["proxy_quarantined"] = quar
+
+        # Live page introspection — what the Flow tab is actually showing
+        # right now (unusual_wall / signed_out / app_ready / ...). Turns
+        # NO_AT_TOKEN from a symptom into a named cause.
+        if session is not None:
+            try:
+                route = {"ws": ws, "profile_id": nick, "pinned": True}
+                tok_probe = _current_route.set(route)
+                try:
+                    health = await self._send("flow_tab_health", {}, timeout=10)
+                finally:
+                    _current_route.reset(tok_probe)
+                hr = health.get("result") or {}
+                if hr.get("page_state"):
+                    state["page_state"] = hr["page_state"]
+                    session["page_state"] = hr["page_state"]
+                if hr.get("title"):
+                    state["page_title"] = hr["title"]
+                    session["page_title"] = hr["title"]
+                state["tab_alive"] = hr.get("alive")
+                if hr.get("url"):
+                    state["tab_url"] = hr["url"][:160]
+            except Exception:
+                pass
+
+        # ---- ledger pull -------------------------------------------------
+        outcomes = _ledger.recent_outcomes(nick=nick, hours=hours, limit=500)
+        events = _ledger.recent_events(hours=hours, nick=nick, limit=100)
+        fails: dict[str, int] = {}
+        queue_samples = []
+        for o in outcomes:
+            if not o["ok"]:
+                fails[o["error_class"]] = fails.get(o["error_class"], 0) + 1
+            if o.get("queue_ms"):
+                queue_samples.append(o["queue_ms"])
+        ok_n = sum(1 for o in outcomes if o["ok"])
+        avg_queue = round(sum(queue_samples) / len(queue_samples)) if queue_samples else 0
+        max_queue = max(queue_samples) if queue_samples else 0
+
+        # ---- findings ----------------------------------------------------
+        findings: list[str] = []
+        if not acc:
+            findings.append("Không có account row — pin/request vào nick này sẽ được drop (ghost pin)")
+        elif not state["enabled"]:
+            findings.append("Account disabled — không nhận việc; cần re-login/enable lại")
+        if state["mint_only"]:
+            findings.append("mint_only — chỉ dùng mint captcha, không route gen")
+        if not state["connected"]:
+            findings.append("Extension chưa connect — Chrome không chạy hoặc WS rớt")
+        elif not state["chat_session"] and not state["mint_only"]:
+            findings.append("Chưa có chat session — r2v chưa sẵn sàng")
+        if state["session_terminal"]:
+            findings.append(
+                "SESSION_TERMINAL — flag theo Google session, đã rút hẳn khỏi routing; "
+                "cần re-login rồi clear strikes"
+            )
+        elif state["canary_pending"]:
+            findings.append("Đang canary-probe sau hold-out — chờ kết quả")
+        elif state["holdout"]:
+            findings.append(
+                f"Đang HOLD-OUT: {state['unusual_strikes']} strike unusual, "
+                f"mở lại sau ~{int(state['holdout_lifts_in_s'])}s"
+            )
+        elif state["unusual_strikes"]:
+            findings.append(f"{state['unusual_strikes']} strike unusual còn trong window (chưa đủ 2 để hold-out)")
+        pstate = state.get("page_state")
+        if pstate == "unusual_wall":
+            findings.append(
+                "Flow page đang dính UNUSUAL-ACTIVITY WALL (captcha/verify) — "
+                "session×IP này bị Google chặn ngay khi load; rotate IP hoặc clone sang instance khác"
+            )
+        elif pstate == "signed_out":
+            findings.append(
+                "Flow page đang SIGNED-OUT — cookies không còn hiệu lực với Google; cần re-login"
+            )
+        elif pstate == "error_page":
+            findings.append("Flow page đang ở trang lỗi — reload tab")
+        elif pstate == "loading":
+            findings.append("Flow page vẫn đang load — NO_AT_TOKEN chỉ là chưa boot xong")
+        if state["parked_for_s"] > 0:
+            findings.append(f"Đang park auth {int(state['parked_for_s'])}s — session Google có vấn đề")
+        if quar:
+            findings.append("Proxy đang quarantine — request bị chặn cho tới khi hết cooldown")
+        tab_dead = sum(1 for e in events if e["kind"] == "TAB_DEAD")
+        if tab_dead:
+            findings.append(f"Tab Flow chết {tab_dead} lần trong {hours:g}h — crash/xám, không phải Google flag")
+        bind_fail = sum(1 for e in events if e["kind"] == "BIND_FAIL")
+        if bind_fail:
+            findings.append(f"Auto-bind r2v fail {bind_fail} lần — xem BIND_FAIL events")
+        rotates = sum(1 for e in events if e["kind"] == "PROXY_ROTATE")
+        if rotates:
+            findings.append(f"Proxy rotate {rotates} lần — IP không ổn định")
+        if avg_queue > 3000:
+            findings.append(
+                f"Queue chờ sema trung bình {avg_queue}ms (đỉnh {max_queue}ms) — "
+                "PROFILE_MAX_CONCURRENT đang thắt, cân nhắc nâng"
+            )
+        if fails:
+            top = max(fails.items(), key=lambda kv: kv[1])
+            cls_notes = {
+                "MEDIA_NOT_FOUND": "fail chủ yếu do media hết hạn/sai — lỗi data, không phải fleet",
+                "FLOW_BUSY": "gate tab nghẽn — submit serialize quá tải",
+                "TAB_DEAD": "tab/page chết — đã tách khỏi strike Google",
+                "UNUSUAL_ACTIVITY": "Google flag thật — session hoặc IP bị mark",
+                "AUTH": "session Google hết hạn — cần re-login",
+                "NO_AT_TOKEN": "trang Flow chưa sẵn sàng khi gọi RPC",
+            }
+            findings.append(
+                f"Lỗi nhiều nhất: {top[0]} x{top[1]} — {cls_notes.get(top[0], 'xem outcome_log')}"
+            )
+        if not findings:
+            findings.append("Không phát hiện vấn đề — nick đang khoẻ")
+
+        return {
+            "nick": nick,
+            "hours": hours,
+            "state": state,
+            "outcomes": {
+                "total": len(outcomes), "ok": ok_n,
+                "failed": len(outcomes) - ok_n,
+                "success_rate": round(100.0 * ok_n / len(outcomes), 1) if outcomes else None,
+                "by_class": fails,
+                "avg_queue_ms": avg_queue, "max_queue_ms": max_queue,
+            },
+            "events": events,
+            "findings": findings,
+        }
+
     def model_denied_report(self) -> dict:
         now = time.time()
         return {
@@ -600,20 +940,135 @@ class FlowClient:
                         nick = inc.get("job_id") or inc.get("sub_id")
                         if nick:
                             self._flagged_nicks.add(nick)
+                            # Seed the in-memory strike counters as well — a
+                            # restart wipes them, and without this a flagged
+                            # nick re-enters rotation and re-burns fresh
+                            # dispatches before re-earning its hold-out.
+                            self._unusual_strikes[nick] = max(
+                                self._unusual_strikes.get(nick, 0), 2
+                            )
+                            inc_ts = float(inc.get("created_at") or time.time())
+                            self._unusual_strike_ts[nick] = max(
+                                self._unusual_strike_ts.get(nick, 0), inc_ts
+                            )
+            except Exception:
+                pass
+            # Same restart gap, different source: today's strikes are written
+            # to the unusual-activity audit jsonl, not the incident ledger.
+            # Reseed per-nick strike counts from the last 30min of that log so
+            # a boot doesn't hand flagged nicks two free dispatches each.
+            try:
+                from agent.services.unusual_audit import AUDIT_LOG_FILE
+                import datetime as _dt
+                now = time.time()
+                if AUDIT_LOG_FILE.exists():
+                    for line in AUDIT_LOG_FILE.read_text(
+                        encoding="utf-8"
+                    ).splitlines():
+                        try:
+                            ev = json.loads(line)
+                            ts = _dt.datetime.fromisoformat(
+                                ev["timestamp_utc"].replace("Z", "+00:00")
+                            ).timestamp()
+                        except Exception:
+                            continue
+                        if now - ts > _UNUSUAL_FLAG_DECAY_S:
+                            continue
+                        wid = ev.get("worker_id")
+                        if not wid:
+                            continue
+                        # One recent strike is enough to hold the nick out:
+                        # with only count=1 it would still be routable and
+                        # immediately re-earn its second strike on the first
+                        # post-boot dispatch. A real success clears this.
+                        self._unusual_strikes[wid] = max(
+                            2, self._unusual_strikes.get(wid, 0) + 1
+                        )
+                        self._unusual_strike_ts[wid] = max(
+                            self._unusual_strike_ts.get(wid, 0), ts
+                        )
+            except Exception:
+                pass
+            # Terminal state must survive restarts too — otherwise a boot
+            # hands a dead session back into rotation until it re-earns
+            # terminal through fresh strikes. Latest lifecycle event wins:
+            # SESSION_TERMINAL sticks unless a later CANARY_OK /
+            # TERMINAL_CLEARED / repair cleared it.
+            try:
+                seen_nicks: set[str] = set()
+                for ev in _ledger.recent_events(
+                    hours=72, limit=500,
+                    kinds=["SESSION_TERMINAL", "CANARY_OK", "TERMINAL_CLEARED"],
+                ):
+                    nick = ev.get("nick")
+                    if not nick or nick in seen_nicks:
+                        continue
+                    seen_nicks.add(nick)
+                    if ev["kind"] == "SESSION_TERMINAL":
+                        self._session_terminal.setdefault(nick, ev["ts"])
+                    # newest event per nick wins: a later CANARY_OK /
+                    # TERMINAL_CLEARED leaves the nick out of terminal.
             except Exception:
                 pass
         return self._flagged_nicks
+
+    async def _maybe_proactive_rotate(self, prof_id: str) -> None:
+        """Swap the exit IP before it crosses Google's observed burn line.
+
+        Reactive rotation happens only AFTER an UNUSUAL_ACTIVITY strike — by
+        then the IP is already flagged. Forensics (check_unusual_threshold)
+        put the median clean-exit lifetime at 139 requests, so rotating at 110
+        keeps each egress under the line Google starts scoring against.
+        A failed rotate is non-fatal: the submit proceeds on the current IP.
+        """
+        try:
+            from agent.services.accounts import get_account
+            from agent.services.unusual_audit import get_unusual_audit
+            acc = get_account(prof_id)
+            p_url = (acc or {}).get("proxy_url") or ""
+            if not p_url:
+                return
+            total = get_unusual_audit().proxy_request_count(p_url)
+            if total < _PROACTIVE_ROTATE_AFTER_REQUESTS:
+                return
+            from agent.services.proxy_pool import rotate_nick_proxy
+            rot = await rotate_nick_proxy(prof_id, preflight=True)
+            if rot.get("ok"):
+                logger.info(
+                    "PROACTIVE_ROTATE %s: %d reqs on exit — new egress %s",
+                    prof_id, total, rot.get("egress_ip"),
+                )
+            else:
+                logger.warning(
+                    "PROACTIVE_ROTATE %s failed (%s) — continuing on current IP",
+                    prof_id, rot.get("error"),
+                )
+        except Exception as exc:
+            logger.debug("proactive rotate skipped for %s: %s", prof_id, exc)
 
     def clear_auth_strikes(self, profile_id: str) -> dict:
         """Forget a nick's soft-auth history and un-park it (manual re-enable)."""
         had = self._auth_strikes.pop(profile_id, 0)
         self._auth_strike_ts.pop(profile_id, None)
+        # Also drop the UNUSUAL_ACTIVITY hold-out state: a manual re-enable is
+        # the operator saying "I repaired this session" (browsed, solved the
+        # captcha, re-logged in) — keeping it parked would waste that work.
+        had_unusual = self._unusual_strikes.pop(profile_id, 0)
+        self._unusual_strike_ts.pop(profile_id, None)
+        was_terminal = self._session_terminal.pop(profile_id, None) is not None
+        if was_terminal:
+            _ledger.record_event("TERMINAL_CLEARED", nick=profile_id,
+                                 detail={"via": "operator_repair"})
+        had_depth = self._flag_depth.pop(profile_id, 0)
+        self._flag_released.discard(profile_id)
         unparked = 0
         for session in self._extensions.values():
             if session.get("profile_id") == profile_id and session.get("unavailable_until", 0) > time.time():
                 session["unavailable_until"] = 0
                 unparked += 1
-        return {"profile_id": profile_id, "cleared_strikes": had, "unparked": unparked}
+        return {"profile_id": profile_id, "cleared_strikes": had,
+                "cleared_unusual_strikes": had_unusual,
+                "cleared_flag_depth": had_depth, "unparked": unparked}
 
     @traced("worker.route")
     async def _run_on_profile(
@@ -664,8 +1119,26 @@ class FlowClient:
                     ),
                 }
             if pin:
+                _ledger.record_event("ROUTE_EMPTY", nick=pin, detail={
+                    "reason": "pinned_profile_not_connected",
+                    "project_id": requested_project,
+                    "video": video_submission,
+                    "connected": [
+                        s.get("profile_id") for s in self._extensions.values()
+                        if s.get("profile_id")
+                    ],
+                })
                 return {"error": f"NO_FLOW_TAB: profile {pin} is not connected"}
             if self._extensions:
+                _ledger.record_event("ROUTE_EMPTY", detail={
+                    "reason": "no_eligible_candidate",
+                    "project_id": requested_project,
+                    "video": video_submission,
+                    "connected": [
+                        s.get("profile_id") for s in self._extensions.values()
+                        if s.get("profile_id")
+                    ],
+                })
                 return {"error": "Extension not connected"}
             # Unit tests mock batch_rpc with no sockets. get_media / poll do
             # not always have a project; generate calls still need one.
@@ -676,9 +1149,33 @@ class FlowClient:
             return await builder(pid)
 
         # Every unpinned candidate parked means each nick just failed auth or
-        # sits on a quarantined proxy. Dispatching anyway burns the job on a
-        # known-dead session (and hides the real cause behind a Flow error), so
-        # answer 503 and let the worker re-queue until a nick comes back.
+        # sits on a quarantined proxy. If the soonest park lifts within
+        # PARKED_WAIT_S, hold the request in-band and re-check — a slow
+        # success beats an instant 503 the caller must retry around.
+        if not pin and not any(route.get("available") for route in candidates):
+            waits = [
+                float((self._extensions.get(route.get("ws")) or {}).get("unavailable_until") or 0)
+                for route in candidates
+            ]
+            soonest = min((w for w in waits if w > 0), default=0.0)
+            wait_s = soonest - time.time() if soonest else 0.0
+            if 0 < wait_s <= _config.PARKED_WAIT_S:
+                deadline = soonest + 1.5
+                logger.info(
+                    "All nicks parked; holding request %.0fs until %s bench lifts",
+                    wait_s, soonest and time.strftime("%H:%M:%S", time.localtime(soonest)),
+                )
+                while time.time() < deadline:
+                    await asyncio.sleep(min(2.0, max(0.1, deadline - time.time())))
+                    _, candidates = self._profile_candidates(
+                        project_id=requested_project,
+                        profile_id=profile_id,
+                        media_ids=media_ids,
+                        operation_id=operation_id,
+                        video_submission=video_submission,
+                    )
+                    if any(r.get("available") for r in candidates):
+                        break
         if not pin and not any(route.get("available") for route in candidates):
             parked = ", ".join(str(route.get("profile_id") or "?") for route in candidates)
             # Tell the client how long the park actually lasts. Without it the
@@ -689,6 +1186,11 @@ class FlowClient:
             ]
             soonest = min((w for w in waits if w > 0), default=0.0)
             retry_after = int(max(30, min(soonest - time.time(), 900))) if soonest else 60
+            _ledger.record_event("ROUTE_ALL_PARKED", detail={
+                "parked": [str(r.get("profile_id") or "?") for r in candidates],
+                "retry_after_s": retry_after,
+                "video": video_submission,
+            })
             return {
                 "status": 503,
                 "retryable": True,
@@ -736,8 +1238,9 @@ class FlowClient:
                 trace_emit("worker.wait", profile_hash=fingerprint(prof_id), attempt=index+1,
                            candidates=len(candidates), pinned=bool(pin), operation_id=trace_identifier(operation_id))
                 async with self._profile_sema(sema_key):
+                    queue_ms = round((time.time()-t_start)*1000)
                     trace_emit("worker.acquired", profile_hash=fingerprint(prof_id),
-                               queue_ms=round((time.time()-t_start)*1000))
+                               queue_ms=queue_ms)
                     if session is not None:
                         session["in_flight"] = int(session.get("in_flight") or 0) + 1
                         nick_metrics.record_in_flight(prof_id, session["in_flight"])
@@ -752,6 +1255,13 @@ class FlowClient:
                                     _config.PER_WORKER_VIDEO_COOLDOWN_MAX,
                                 )
                                 wait_s = cooldown_target - (now_m - last_disp)
+                                # Also respect the all-RPC min gap vs the last
+                                # dispatch of any kind on this worker.
+                                wait_s = max(
+                                    wait_s,
+                                    _config.PER_WORKER_RPC_MIN_GAP_S
+                                    - (now_m - self._worker_last_dispatch.get(prof_id, 0.0)),
+                                )
                                 if wait_s > 0:
                                     logger.info(
                                         "Worker %s human jitter video pacing: waiting %.2fs (target: %.2fs in [%.1fs, %.1fs])",
@@ -760,6 +1270,8 @@ class FlowClient:
                                     )
                                     await asyncio.sleep(wait_s)
                                 self._worker_last_video_dispatch[prof_id] = time.monotonic()
+                                self._worker_last_dispatch[prof_id] = time.monotonic()
+                                await self._maybe_proactive_rotate(prof_id)
                                 burst_metrics = audit_mgr.record_request_dispatched(prof_id)
                                 burst_metrics["rpc_in_flight"] = session.get("in_flight", 0) if session else 0
                                 nick_metrics.record_dispatch(prof_id)
@@ -768,6 +1280,20 @@ class FlowClient:
                                 except Exception as e:
                                     last = _batch_error(e)
                         else:
+                            # Min spacing between any two dispatches on the same
+                            # worker — the UNUSUAL_ACTIVITY rate-burst signature
+                            # is gap<1.2s or >=3 req/10s. Only the dispatch-start
+                            # times are serialized; the RPC itself still runs
+                            # concurrently so polls/uploads are not queued.
+                            async with self._worker_dispatch_lock(prof_id):
+                                now_m = time.monotonic()
+                                wait_s = _config.PER_WORKER_RPC_MIN_GAP_S - (
+                                    now_m - self._worker_last_dispatch.get(prof_id, 0.0)
+                                )
+                                if wait_s > 0:
+                                    await asyncio.sleep(wait_s)
+                                await self._maybe_proactive_rotate(prof_id)
+                                self._worker_last_dispatch[prof_id] = time.monotonic()
                             burst_metrics = audit_mgr.record_request_dispatched(prof_id)
                             burst_metrics["rpc_in_flight"] = session.get("in_flight", 0) if session else 0
                             nick_metrics.record_dispatch(prof_id)
@@ -795,7 +1321,7 @@ class FlowClient:
                 # payload, so matching it there would fail healthy responses —
                 # the bug class that disabled four signed-in nicks on 22 Sep.
                 if last.get("error") and "SUBMISSION_OUTCOME_UNKNOWN" in str(last["error"]):
-                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=raw_err[:200])
+                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms, error=raw_err[:200])
                     return {**last, "retryable": False, "error_code": "upstream_submission_unknown"}
                 if video_submission and last.get("error"):
                     # A dropped response may hide an accepted render. Only
@@ -810,7 +1336,7 @@ class FlowClient:
                     ))
                     if not safe_rejection:
                         nick_metrics.record_completion(prof_id, success=False,
-                                                       latency_ms=duration_ms, error=raw_err[:200])
+                                                       latency_ms=duration_ms, queue_ms=queue_ms, error=raw_err[:200])
                         return {**last, "retryable": False, "error_code": "upstream_submission_unknown"}
 
                 # Classify auth off the error channel and the real status code.
@@ -826,13 +1352,42 @@ class FlowClient:
                     "401 unauthorized", "unauthorized",
                 ))
                 is_auth_error = bool(err_text) and (hard_401 or any(m in low_err for m in (
-                    "no_at_token", "envelope in response",
+                    "envelope in response",
                 )))
-                if is_auth_error and session is not None:
+                no_at_token = bool(err_text) and "no_at_token" in low_err
+                if no_at_token and session is not None:
+                    # Page hasn't captured the AT token yet — tab boot or a
+                    # re-navigation, not an auth failure. Park briefly so the
+                    # router picks another nick while this one warms up; never
+                    # counts toward auth strikes or auto-disable (that's what
+                    # killed the dual nicks right after every restart).
+                    session["unavailable_until"] = max(
+                        session.get("unavailable_until", 0), time.time() + 45)
+                    # Kernel visibility: capture WHAT the page is showing so
+                    # NO_AT_TOKEN stops being a black box — unusual_wall,
+                    # signed_out, error_page, loading, or app_ready.
+                    detail = {"error": raw_err[:200], "park_s": 45}
+                    try:
+                        tok_probe = _current_route.set(route)
+                        try:
+                            health = await self._send("flow_tab_health", {}, timeout=10)
+                        finally:
+                            _current_route.reset(tok_probe)
+                        hr = health.get("result") or {}
+                        if hr.get("page_state"):
+                            detail["page_state"] = hr["page_state"]
+                            session["page_state"] = hr["page_state"]
+                        if hr.get("title"):
+                            detail["title"] = hr["title"]
+                            session["page_title"] = hr["title"]
+                    except Exception:
+                        pass
+                    _ledger.record_event("NO_AT_TOKEN", nick=prof_id, detail=detail)
+                elif is_auth_error and session is not None:
                     # A real 401 means the Google session is dead — parking in
                     # 30m loops just spams retries. Disable the account until
-                    # the user re-logs in and re-enables it. Tab-side issues
-                    # (no_at_token, destroyed context) stay a 30m park.
+                    # the user re-logs in and re-enables it. Soft failures
+                    # (envelope-less sign-in redirect) stay a 30m park.
                     if hard_401:
                         try:
                             from agent.services.accounts import upsert_account
@@ -863,6 +1418,53 @@ class FlowClient:
                         except Exception as dis_exc:
                             logger.warning("Could not disable %s after 401: %s", prof_id, dis_exc)
                     else:
+                        # A missing envelope only proves a sign-in redirect when
+                        # the tab itself is alive. A dead/crashed tab — or a WS
+                        # flap — produces the same empty response, and counting
+                        # those as auth failures disabled healthy nicks (burst
+                        # of 3 in-flight RPCs → auto-disable in ~1s). Probe the
+                        # tab first: dead → reload + TAB_UNRESPONSIVE, no
+                        # strike, no 30m park.
+                        tab_alive = None
+                        health: dict = {}
+                        try:
+                            tok_probe = _current_route.set(route)
+                            try:
+                                health = await self._send("flow_tab_health", {}, timeout=10)
+                            finally:
+                                _current_route.reset(tok_probe)
+                            if not health.get("error"):
+                                tab_alive = (health.get("result") or {}).get("alive")
+                        except Exception:
+                            tab_alive = None
+                        if tab_alive is not True:
+                            reason = "probe_failed"
+                            if isinstance(health, dict):
+                                reason = str((health.get("result") or {}).get("reason") or health.get("error") or "probe_failed")
+                            _ledger.record_event("TAB_DEAD", nick=prof_id, detail={
+                                "reason": reason,
+                                "masked_as": "auth_no_envelope",
+                            })
+                            try:
+                                tok_rel = _current_route.set(route)
+                                try:
+                                    await self._send("reload_flow_tab", {}, timeout=30)
+                                finally:
+                                    _current_route.reset(tok_rel)
+                            except Exception:
+                                pass
+                            session["unavailable_until"] = max(
+                                session.get("unavailable_until", 0), time.time() + 45)
+                            last["error"] = "TAB_UNRESPONSIVE"
+                            last["retryable"] = True
+                            last["message"] = (
+                                "Tab Flow không phản hồi (chết/mất kết nối) — đã reload. "
+                                "Không tính auth strike; retry sau vài giây."
+                            )
+                            nick_metrics.record_completion(
+                                prof_id, success=False, latency_ms=duration_ms,
+                                queue_ms=queue_ms, error="TAB_UNRESPONSIVE")
+                            return last
                         session["unavailable_until"] = max(session.get("unavailable_until", 0), time.time() + 1800)
                         # A soft auth failure hides its status code: the batch
                         # envelope is simply absent because the page answered a
@@ -876,6 +1478,11 @@ class FlowClient:
                             strikes = self._auth_strikes.get(prof_id, 0) + 1
                         self._auth_strikes[prof_id] = strikes
                         self._auth_strike_ts[prof_id] = now_s
+                        _ledger.record_event("STRIKE_AUTH", nick=prof_id, detail={
+                            "strikes": strikes,
+                            "error": raw_err[:200],
+                            "parked_30m": True,
+                        })
                         logger.warning(
                             "Auth / 401 failure on %s: %s; marked unavailable for 30m (strike %d)",
                             prof_id, raw_err[:120], strikes,
@@ -918,7 +1525,15 @@ class FlowClient:
                 if not last.get("error") and (
                     not isinstance(last.get("status"), int) or last["status"] < 400
                 ):
-                    nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms)
+                    nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms, queue_ms=queue_ms)
+                    # Foreign-mint attribution: which farm nick supplied the
+                    # token that just passed.
+                    minter = self._active_minter.pop(prof_id, None)
+                    if minter:
+                        self._minter_token_fails.pop(minter, None)
+                        self._mint_event("token_pass", minter=minter,
+                                         target=prof_id)
+                        logger.info("Foreign-minted captcha from %s passed for %s", minter, prof_id)
                     # Gated on the pop: only a nick that actually carried strikes
                     # has an ACCOUNT_SESSION_FLAGGED incident to close, so a plain
                     # success does not write to the ledger.
@@ -937,7 +1552,10 @@ class FlowClient:
                             )
                         except Exception:
                             pass
-                    if self._model_denied.pop(prof_id, None):
+                    # Only a video submission proves video-model access — an
+                    # image/upload success used to un-park the nick and the
+                    # next video job landed on it again (deny↔heal loop).
+                    if video_submission and self._model_denied.pop(prof_id, None):
                         logger.info("Model access restored on %s — un-parked for video", prof_id)
                         try:
                             from agent.services.incident_manager import get_incident_manager
@@ -962,10 +1580,74 @@ class FlowClient:
                             rpc_id = known_rpc
                             break
 
+                    # Tab-health gate before blaming Google: a crashed/error
+                    # page (grey screen) can't produce a real rejection — it
+                    # surfaces stale or mangled payloads instead. Probe the
+                    # tab; if dead, reload it and fail this call as
+                    # TAB_UNRESPONSIVE — no strike, no proxy rotation.
+                    try:
+                        tok_probe = _current_route.set(route)
+                        try:
+                            health = await self._send("flow_tab_health", {}, timeout=15)
+                        finally:
+                            _current_route.reset(tok_probe)
+                        health_result = health.get("result") or {}
+                        if not health.get("error") and health_result.get("alive") is False:
+                            logger.warning(
+                                "UNUSUAL_ACTIVITY payload on %s but Flow tab is dead (%s) — "
+                                "reloading tab instead of counting a strike",
+                                prof_id, health_result.get("reason"),
+                            )
+                            _ledger.record_event("TAB_DEAD", nick=prof_id, detail={
+                                "reason": health_result.get("reason"),
+                                "masked_as": "PUBLIC_ERROR_UNUSUAL_ACTIVITY",
+                            })
+                            tok_rel = _current_route.set(route)
+                            try:
+                                await self._send("reload_flow_tab", {}, timeout=30)
+                            finally:
+                                _current_route.reset(tok_rel)
+                            last["error"] = "TAB_UNRESPONSIVE"
+                            last["retryable"] = True
+                            last["message"] = (
+                                "Tab Flow của nick đã chết (trang xám/crash) — đã reload. "
+                                "Không tính strike; retry sau vài giây."
+                            )
+                            nick_metrics.record_completion(
+                                prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms,
+                                error="TAB_UNRESPONSIVE",
+                            )
+                            return last
+                    except Exception as probe_exc:
+                        logger.debug("tab health probe failed for %s: %s", prof_id, probe_exc)
+
                     logger.warning(
                         "UNUSUAL_ACTIVITY detected on %s (RPC %s)! Synchronously rotating proxy...",
                         prof_id, rpc_id,
                     )
+
+                    # Session-flag heuristic: strikes older than 30min decay.
+                    # Two+ recent strikes mean the flag follows the Google
+                    # session, not the IP — another rotate+retry would just
+                    # burn ~40s of caller latency and a fresh proxy IP.
+                    now = time.time()
+                    if now - self._unusual_strike_ts.get(prof_id, 0) > _UNUSUAL_FLAG_DECAY_S:
+                        self._unusual_strikes[prof_id] = 0
+                    session_flagged = self._unusual_strikes.get(prof_id, 0) >= 2
+                    self._unusual_strike_ts[prof_id] = now
+
+                    # Top up the standby pool for this call's action while the
+                    # proxy rotates — the mint overlaps the swap instead of
+                    # serializing inside the retry.
+                    prefetch_action = {
+                        fb.RPC_GEN_IMAGE: fb.CAPTCHA_IMAGE,
+                        fb.RPC_GEN_VIDEO: fb.CAPTCHA_VIDEO,
+                        fb.RPC_GEN_T2V: fb.CAPTCHA_VIDEO,
+                        fb.RPC_UPLOAD_IMAGE: fb.CAPTCHA_IMAGE,
+                        fb.RPC_STREAM_CHAT: fb.CAPTCHA_CHAT,
+                    }.get(rpc_id)
+                    if prefetch_action:
+                        asyncio.create_task(self._pool_prefetch(prefetch_action))
 
                     rotation_info = {
                         "rotation_triggered": False,
@@ -974,17 +1656,79 @@ class FlowClient:
                     }
 
                     try:
+                        # Terminal graduation: the flag survived rotations and
+                        # hold-out releases — it lives on the Google session,
+                        # so another rotate only burns a clean IP and deepens
+                        # the flag. Stop rotating; failover + leave routing.
+                        strikes_next = self._unusual_strikes.get(prof_id, 0) + 1
+                        terminal = (
+                            prof_id in self._session_terminal
+                            or self._flag_depth.get(prof_id, 0) >= 2
+                            or strikes_next >= 5
+                        )
+                        if terminal:
+                            if prof_id not in self._session_terminal:
+                                self._session_terminal[prof_id] = now
+                                _ledger.record_event("SESSION_TERMINAL", nick=prof_id, detail={
+                                    "via": "strike", "strikes": strikes_next,
+                                    "flag_depth": self._flag_depth.get(prof_id, 0),
+                                })
+                                self._schedule_terminal_clone(prof_id)
+                            rotation_info["skipped"] = "session_terminal"
+                            last["retryable"] = True
+                            last["message"] = (
+                                "UNUSUAL_ACTIVITY: session flagged vĩnh viễn — đã rút khỏi "
+                                "routing, cần re-login. Failover sang nick khác."
+                            )
+                            logger.warning(
+                                "UNUSUAL_ACTIVITY on %s → SESSION_TERMINAL (strike #%d, "
+                                "depth %d) — no more rotations, failing over",
+                                prof_id, strikes_next, self._flag_depth.get(prof_id, 0),
+                            )
+                            raise _SessionFlagged()
+                        if session_flagged:
+                            rotation_info["skipped"] = "session_flagged"
+                            last["retryable"] = True
+                            last["message"] = (
+                                "UNUSUAL_ACTIVITY: flag theo session, failover sang nick khác."
+                            )
+                            logger.warning(
+                                "UNUSUAL_ACTIVITY on %s is session-flagged (strike #%d) — "
+                                "skipping rotate, failing over",
+                                prof_id, self._unusual_strikes.get(prof_id, 0) + 1,
+                            )
+                            raise _SessionFlagged()
                         try:
-                            from agent.services.proxy_checker import quarantine_proxy
+                            from agent.services.proxy_checker import quarantine_proxy, mark_ip_burned
                             from agent.services.accounts import get_account
                             acc = get_account(prof_id)
                             if acc and acc.get("proxy_url"):
                                 quarantine_proxy(acc["proxy_url"], reason="PUBLIC_ERROR_UNUSUAL_ACTIVITY", cooldown_seconds=900)
+                                _ledger.record_event("PROXY_QUARANTINE", nick=prof_id, detail={
+                                    "proxy": acc["proxy_url"][:80],
+                                    "egress_ip": acc.get("last_egress_ip"),
+                                })
+                                # Blame the egress IP only on the first strike —
+                                # repeat flags on freshly rotated IPs mean the
+                                # flag follows the Google session, not the IP.
+                                if self._unusual_strikes.get(prof_id, 0) == 0:
+                                    burned_ip = acc.get("last_egress_ip")
+                                    if not burned_ip:
+                                        from agent.services.surfshark import is_surfshark_url, probe_egress
+                                        if is_surfshark_url(acc["proxy_url"]):
+                                            burned_ip = await asyncio.to_thread(probe_egress, acc["proxy_url"], 5)
+                                    if burned_ip:
+                                        mark_ip_burned(burned_ip, prof_id)
+                                        _ledger.record_event("PROXY_BURNED", nick=prof_id,
+                                                             detail={"ip": burned_ip})
                         except Exception as q_err:
                             logger.warning("Could not quarantine proxy for %s: %s", prof_id, q_err)
 
                         from agent.services.proxy_pool import rotate_nick_proxy
-                        rot_res = await rotate_nick_proxy(prof_id, preflight=True)
+                        # wait_s: if another rotation is mid-flight on this
+                        # nick, piggyback on its fresh IP instead of failing
+                        # the request with ROTATION_IN_PROGRESS.
+                        rot_res = await rotate_nick_proxy(prof_id, preflight=True, wait_s=20)
                         rotation_info["rotation_triggered"] = True
                         if not rot_res.get("ok"):
                             last["proxy_rotated"] = False
@@ -994,6 +1738,11 @@ class FlowClient:
                         rotation_info["new_proxy"] = rot_res.get("proxy")
                         rotation_info["new_proxy_ip"] = rot_res.get("egress_ip")
                         rotation_info["flow_tab_reloaded"] = bool(rot_res.get("flow_tab_reloaded"))
+                        _ledger.record_event("PROXY_ROTATE", nick=prof_id, detail={
+                            "new_proxy": rot_res.get("proxy"),
+                            "new_egress_ip": rot_res.get("egress_ip"),
+                            "reason": "UNUSUAL_ACTIVITY",
+                        })
 
                         last["proxy_rotated"] = True
                         last["new_proxy"] = rot_res.get("proxy")
@@ -1011,6 +1760,10 @@ class FlowClient:
 
                         if prof_id not in retrying and not video_submission:
                             retrying.add(prof_id)
+                            # Fallback mode: the retry's captcha comes from the
+                            # external solver, not the in-page mint.
+                            if _config.CAPTCHA_SOLVER_MODE == "fallback":
+                                self._solver_retry_pending.add(prof_id)
                             try:
                                 logger.info(
                                     "Auto-retrying request for %s on new proxy %s...",
@@ -1042,7 +1795,13 @@ class FlowClient:
                                         or retry_last["status"] < 400
                                     ):
                                         logger.info("Auto-retry on new proxy SUCCEEDED for %s!", prof_id)
-                                        nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms)
+                                        minter = self._active_minter.pop(prof_id, None)
+                                        if minter:
+                                            self._minter_token_fails.pop(minter, None)
+                                            self._mint_event("token_pass", minter=minter,
+                                                             target=prof_id, rpc_id=rpc_id)
+                                            logger.info("Foreign-minted captcha from %s passed for %s", minter, prof_id)
+                                        nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms, queue_ms=queue_ms)
                                         rotation_info["retry_success"] = True
                                         self._unusual_strikes.pop(prof_id, None)
                                         audit_mgr.record_unusual_event(
@@ -1059,8 +1818,35 @@ class FlowClient:
                                         return retry_last
 
                                     rotation_info["retry_success"] = False
+                                    minter = self._active_minter.pop(prof_id, None)
+                                    if minter:
+                                        # A foreign token that still fails is
+                                        # usually the TARGET's new IP still
+                                        # being flagged, not the minter's token
+                                        # being bad. Escalating cooldown: first
+                                        # miss only benches the minter briefly;
+                                        # consecutive misses converge on a
+                                        # genuinely decayed minter at the full
+                                        # cooldown. A token_pass resets it.
+                                        n = self._minter_token_fails.get(minter, 0) + 1
+                                        self._minter_token_fails[minter] = n
+                                        cool_s = min(
+                                            _config.CAPTCHA_MINTER_TOKEN_FAIL_COOL_S * n,
+                                            _config.CAPTCHA_MINTER_FAIL_COOLDOWN_S)
+                                        self._minter_fail_until[minter] = time.time() + cool_s
+                                        self._mint_event("token_fail", minter=minter,
+                                                         target=prof_id, rpc_id=rpc_id,
+                                                         reason=str(retry_last.get("error") or "retry_failed")[:120])
+                                        self._mint_event("cooldown", minter=minter,
+                                                         target=prof_id,
+                                                         cooldown_s=cool_s,
+                                                         cause="token_fail")
+                                        logger.warning(
+                                            "Foreign-minted captcha from %s failed for %s; minter cooled %.0fs (streak %d)",
+                                            minter, prof_id, cool_s, n,
+                                        )
                                     rotation_info["retry_error"] = str(retry_last.get("error") or "")[:200]
-                                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error="UNUSUAL_ACTIVITY_RETRY_FAILED")
+                                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms, error="UNUSUAL_ACTIVITY_RETRY_FAILED")
                                     last = retry_last
                                     last["proxy_rotated"] = True
                                     last["new_proxy"] = rot_res.get("proxy")
@@ -1073,10 +1859,12 @@ class FlowClient:
                                     _current_route.reset(token_retry)
                             finally:
                                 retrying.discard(prof_id)
+                    except _SessionFlagged:
+                        pass
                     except Exception as rot_exc:
                         logger.error("Auto-rotation failed for %s: %s", prof_id, rot_exc)
                         rotation_info["rotation_error"] = str(rot_exc)
-                        nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=str(rot_exc))
+                        nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms, error=str(rot_exc))
 
                     # Persist full audit record
                     audit_mgr.record_unusual_event(
@@ -1090,41 +1878,43 @@ class FlowClient:
                         proxy_url=audit_proxy_url,
                     )
 
-                    # Worker-level circuit breaker: every flag already rotates
-                    # the proxy, so a repeat flag means the fresh IP failed too
-                    # — that is an account/session trust problem, not an IP
-                    # problem. Park the worker so unpinned work routes to other
-                    # nicks while the session recovers; escalate to a re-login
-                    # incident instead of burning more proxy sessions.
-                    strikes = self._unusual_strikes.get(prof_id, 0) + 1
-                    self._unusual_strikes[prof_id] = strikes
-                    cooldown_s = 300 if strikes < 2 else 1800
-                    if session is not None:
-                        session["unavailable_until"] = max(
-                            session.get("unavailable_until", 0),
-                            time.time() + cooldown_s,
+                    # Strike counter only — first-strike IP blame above plus
+                    # resolving stale SESSION_FLAGGED rows on recovery. No
+                    # park: the nick stays routable and each strike rotates the
+                    # proxy until a request lands.
+                    if prof_id in self._flag_released:
+                        # It struck again right after hold-out release — the
+                        # flag is deeper than one decay window. Escalate.
+                        self._flag_released.discard(prof_id)
+                        self._flag_depth[prof_id] = min(
+                            self._flag_depth.get(prof_id, 0) + 1, 4
                         )
-                    if strikes >= 2:
-                        try:
-                            from agent.services.incident_manager import get_incident_manager
-                            get_incident_manager().record_incident(
-                                module="worker",
-                                job_id=prof_id,
-                                severity="CRITICAL",
-                                error_code="ACCOUNT_SESSION_FLAGGED",
-                                message=(
-                                    f"{prof_id} flagged UNUSUAL_ACTIVITY {strikes}x in a row "
-                                    "across rotated proxies — Google account session needs re-login"
-                                ),
-                                root_cause=(
-                                    "reCAPTCHA trust failure persists on fresh verified IPs; "
-                                    "the flag follows the Google session, not the proxy"
-                                ),
-                                action_taken=f"WORKER_PAUSED_{cooldown_s}S",
-                            )
-                            self._flagged_from_ledger().add(prof_id)
-                        except Exception:
-                            pass
+                        logger.warning(
+                            "UNUSUAL_ACTIVITY on %s right after release — flag depth %d, "
+                            "next hold-out %ds",
+                            prof_id, self._flag_depth[prof_id],
+                            _UNUSUAL_FLAG_DECAY_S << self._flag_depth[prof_id],
+                        )
+                    self._unusual_strikes[prof_id] = self._unusual_strikes.get(prof_id, 0) + 1
+                    _ledger.record_event("STRIKE_UNUSUAL", nick=prof_id, detail={
+                        "strikes": self._unusual_strikes[prof_id],
+                        "rpc_id": rpc_id,
+                        "rotated": rotation_info.get("rotation_triggered"),
+                        "new_egress_ip": rotation_info.get("new_proxy_ip"),
+                        "session_flagged": bool(rotation_info.get("skipped")),
+                    })
+                    if self._unusual_strikes[prof_id] == 2:
+                        _ledger.record_event("HOLDOUT_ENTER", nick=prof_id, detail={
+                            "reason": "unusual_strikes>=2",
+                            "flag_depth": self._flag_depth.get(prof_id, 0),
+                        })
+                    # Trusted-minter fallback: this nick's next captcha call —
+                    # whether the auto-retry above or a fresh dispatch — mints
+                    # on a farm/sibling nick instead of the flagged session.
+                    # Set at strike time so video submissions (which skip the
+                    # in-band retry) still get a foreign token next attempt.
+                    if _config.CAPTCHA_FOREIGN_MINT == "fallback":
+                        self._foreign_mint_pending.add(prof_id)
 
                 elif ("failed: [13]" in raw_err or "ogiz0b failed: [13]" in raw_err.lower()) and not getattr(self, "_in_retry_13", False):
                     prof_id = route.get("profile_id") or "worker"
@@ -1146,15 +1936,15 @@ class FlowClient:
                                 or retry_last["status"] < 400
                             ):
                                 logger.info("Auto-retry on RPC [13] SUCCEEDED for %s!", prof_id)
-                                nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms)
+                                nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms, queue_ms=queue_ms)
                                 return retry_last
                             last = retry_last
-                            nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error="RPC_13_RETRY_FAILED")
+                            nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms, error="RPC_13_RETRY_FAILED")
                         finally:
                             _current_route.reset(token_retry)
                     except Exception as r13_exc:
                         logger.error("Auto-retry on RPC [13] failed for %s: %s", prof_id, r13_exc)
-                        nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=str(r13_exc))
+                        nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms, error=str(r13_exc))
                     finally:
                         self._in_retry_13 = False
                 elif "PUBLIC_ERROR_MODEL_ACCESS_DENIED" in raw_err:
@@ -1168,7 +1958,7 @@ class FlowClient:
                     first = prof_id not in self._model_denied
                     self._model_denied[prof_id] = until
                     nick_metrics.record_completion(
-                        prof_id, success=False, latency_ms=duration_ms,
+                        prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms,
                         error="MODEL_ACCESS_DENIED",
                     )
                     logger.warning(
@@ -1200,7 +1990,7 @@ class FlowClient:
                             pass
 
                 elif raw_err:
-                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, error=raw_err[:200])
+                    nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms, error=raw_err[:200])
 
 
             has_alternative = index + 1 < len(candidates)
@@ -1212,8 +2002,13 @@ class FlowClient:
                 and has_alternative
             ):
                 if route["ws"] in self._extensions:
+                    # A nick carrying UNUSUAL strikes is likely session-flagged
+                    # — bench it progressively longer (60s→30min cap) instead of
+                    # letting it rejoin after a minute and eat the next job.
+                    strikes_n = self._unusual_strikes.get(route.get("profile_id") or "", 0)
+                    cool_s = min(60 * (2 ** (strikes_n - 1)), 1800) if strikes_n else 60
                     self._extensions[route["ws"]]["unavailable_until"] = (
-                        time.time() + 60
+                        time.time() + cool_s
                     )
                 logger.warning(
                     "Profile %s unavailable; retrying through another nick",
@@ -1317,6 +2112,18 @@ class FlowClient:
             if data.get("type") == "extension_ready":
                 session["flow_guard_version"] = data.get("flowGuardVersion")
                 asyncio.create_task(self._sync_tier())
+                # Warm-up gate: a freshly launched/reloaded Flow tab cannot
+                # serve jobs until it reports app_ready. Without this every
+                # restart produced a NO_AT_TOKEN storm because the router
+                # dispatched into cold tabs.
+                sid_w = session.get("profile_id")
+                if sid_w and sid_w not in self._minter_nicks():
+                    session["warming_until"] = time.time() + 120
+                    warm_task = session.get("warm_task")
+                    if warm_task is None or warm_task.done():
+                        session["warm_task"] = asyncio.create_task(
+                            self._warm_probe(sid_w, source_ws)
+                        )
             if not session.get("chat_session_id"):
                 pid = self._session_project(session)
                 if pid and self._UUID_RE.match(str(pid)):
@@ -1375,6 +2182,10 @@ class FlowClient:
         if session.get("chat_session_id"):
             return
         profile_id = session.get("profile_id")
+        # Mint-only nicks never serve r2v — a chat session on them just burns
+        # their RPC budget on pointless ListSessions/CreateSession retries.
+        if profile_id and profile_id in self._minter_nicks():
+            return
         project_id = self._session_project(session) or FLOW_PROJECT_ID
         if not project_id or not self._UUID_RE.match(str(project_id)):
             logger.info("chat session auto-bind deferred: no valid project_id yet for profile=%s", profile_id)
@@ -1425,6 +2236,7 @@ class FlowClient:
                 except Exception as exc:
                     result = {"error": str(exc)}
                 if isinstance(result, dict) and result.get("ok"):
+                    _ledger.record_event("BIND_OK", nick=profile_id)
                     return
                 last_error = (result or {}).get("error") if isinstance(result, dict) else result
                 transient = any(
@@ -1445,6 +2257,9 @@ class FlowClient:
                 "chat session auto-bind failed profile=%s: %s",
                 profile_id, last_error,
             )
+            _ledger.record_event("BIND_FAIL", nick=profile_id, detail={
+                "error": str(last_error)[:300],
+            })
 
     async def _sync_tier(self):
         """Detect current tier from credits API and update all active projects."""
@@ -1737,11 +2552,805 @@ class FlowClient:
         params: dict = {"rpcid": rpcid, "freq": freq}
         if captcha_action:
             params["captchaAction"] = captcha_action
+            token = await self._foreign_captcha_token(captcha_action)
+            if token:
+                params["captchaToken"] = token
         if match:
             params["match"] = match
         if path:
             params["path"] = path
         return await self._send("batch_rpc", params, timeout=timeout)
+
+    def _find_session_route(self, profile_id: str) -> dict | None:
+        """Route dict for a connected nick — including mint-only farm nicks,
+        which _profile_candidates filters out."""
+        now = time.time()
+        for ws, session in self._extensions.items():
+            if session.get("profile_id") != profile_id:
+                continue
+            return {
+                "ws": ws,
+                "profile_id": profile_id,
+                "project_id": self._session_project(session),
+                "pinned": True,
+                "available": session.get("unavailable_until", 0) <= now,
+                "in_flight": int(session.get("in_flight") or 0),
+                "dispatched_count": int(session.get("dispatched_count") or 0),
+                "cooldown_remaining": 0.0,
+                "recency": session.get("connected_at") or 0,
+            }
+        return None
+
+    def _minter_nicks(self) -> set[str]:
+        """Mint-only nick set: env var union the per-account mint_only flag."""
+        from agent.services.accounts import mint_only_nicks
+        return set(_config.CAPTCHA_MINTER_NICKS) | set(mint_only_nicks())
+
+    def _mint_event(self, event: str, minter: str | None = None,
+                    target: str | None = None, **extra) -> None:
+        """One mint-lifecycle event: update per-minter stats + JSONL audit."""
+        now = time.time()
+        if minter:
+            st = self._minter_stats.setdefault(minter, {
+                "mints_ok": 0, "mints_fail": 0, "token_pass": 0,
+                "token_fail": 0, "cooldowns": 0, "skipped_cooled": 0,
+                "skipped_rate": 0, "last_error": None,
+                "last_latency_ms": None, "last_mint_at": None,
+                "last_pass_at": None,
+            })
+            if event == "mint_ok":
+                st["mints_ok"] += 1
+                st["last_mint_at"] = now
+                st["last_latency_ms"] = extra.get("latency_ms")
+            elif event == "mint_fail":
+                st["mints_fail"] += 1
+                st["last_error"] = extra.get("reason")
+            elif event == "token_pass":
+                st["token_pass"] += 1
+                st["last_pass_at"] = now
+            elif event == "token_fail":
+                st["token_fail"] += 1
+                st["last_error"] = extra.get("reason")
+            elif event == "cooldown":
+                st["cooldowns"] += 1
+            elif event == "skipped_cooled":
+                st["skipped_cooled"] += 1
+            elif event == "skipped_rate":
+                st["skipped_rate"] += 1
+        try:
+            rec = {"ts": now, "event": event, "minter": minter,
+                   "target": target, **extra}
+            self._mint_audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._mint_audit_path.open("a") as fh:
+                fh.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            logger.debug("mint audit write failed", exc_info=True)
+        _ledger.record_event("MINT_" + event.upper(), nick=minter,
+                             detail={"target": target, **extra})
+
+    def _minter_rate(self, sid: str) -> int:
+        """Successful mints by this minter in the trailing 60 seconds."""
+        dq = self._minter_mint_ts.get(sid)
+        if not dq:
+            return 0
+        cutoff = time.time() - 60
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        return len(dq)
+
+    def minter_health(self) -> dict:
+        """Live minter view for GET /api/flow/minters."""
+        now = time.time()
+        out = {}
+        for sid in sorted(self._minter_nicks()):
+            connected = any(
+                s.get("profile_id") == sid for s in self._extensions.values())
+            cooling = self._minter_fail_until.get(sid, 0)
+            out[sid] = {
+                "connected": connected,
+                "page_dead": sid in self._minter_page_dead,
+                "page_dead_since": self._minter_page_dead.get(sid),
+                "cooling_until": cooling if cooling > now else None,
+                "mints_last_60s": self._minter_rate(sid),
+                **self._minter_stats.get(sid, {}),
+            }
+        return {"minters": out, "max_per_min": _config.CAPTCHA_MINTER_MAX_PER_MIN}
+
+    def _minter_route(self, exclude: str | None) -> tuple | None:
+        """Pick (route, skip_reasons) — the nick to mint a captcha token for
+        another nick's request.
+
+        With a minter pool set (env or mint_only accounts), only those nicks
+        mint; otherwise any connected sibling may. Least-flagged, least-busy,
+        then least-used first; minters on fail-cooldown or over the per-minute
+        cap are skipped (and counted).
+        """
+        now = time.time()
+        prefer = self._minter_nicks()
+        best: tuple | None = None
+        skipped: list[str] = []
+        cap = _config.CAPTCHA_MINTER_MAX_PER_MIN
+        for ws, session in self._extensions.items():
+            sid = session.get("profile_id")
+            if not sid or sid == exclude:
+                continue
+            if prefer and sid not in prefer:
+                continue
+            if sid in self._minter_page_dead:
+                skipped.append("page_dead")
+                self._mint_event("skipped_cooled", minter=sid, target=exclude)
+                continue
+            if self._minter_fail_until.get(sid, 0) > now:
+                skipped.append("cooled")
+                self._mint_event("skipped_cooled", minter=sid, target=exclude)
+                continue
+            if cap and self._minter_rate(sid) >= cap:
+                skipped.append("rate_limited")
+                self._mint_event("skipped_rate", minter=sid, target=exclude)
+                continue
+            route = {
+                "ws": ws,
+                "profile_id": sid,
+                "project_id": self._session_project(session),
+                "pinned": True,
+                "available": session.get("unavailable_until", 0) <= now,
+                "in_flight": int(session.get("in_flight") or 0),
+                "dispatched_count": int(session.get("dispatched_count") or 0),
+                "cooldown_remaining": 0.0,
+                "recency": session.get("connected_at") or 0,
+            }
+            key = (self._unusual_strikes.get(sid, 0), route["in_flight"],
+                   self._minter_use_count.get(sid, 0))
+            if best is None or key < best[0]:
+                best = (key, route)
+        return (best[1], skipped) if best else (None, skipped)
+
+    def _clone_depth(self, sid: str) -> int:
+        """Generations away from the original account. Manual clones carry no
+        clone_of but still count as one generation via the -dual suffix."""
+        from agent.services.accounts import get_account
+        depth, cur, seen = 0, sid, set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            row = get_account(cur) or {}
+            parent = row.get("clone_of")
+            if parent:
+                depth += 1
+                cur = parent
+            else:
+                if re.search(r"-dual", cur):
+                    depth += 1
+                break
+        return depth
+
+    def _schedule_terminal_clone(self, sid: str) -> None:
+        """Fire-and-forget clone of a terminal nick onto a fresh IP."""
+        if not _config.AUTO_CLONE_ON_TERMINAL or sid in self._clone_pending:
+            return
+        if self._clone_depth(sid) >= _config.AUTO_CLONE_MAX_DEPTH:
+            # Lineage already replaced itself enough times — a deeper clone
+            # would just burn another IP on an account-level flag.
+            _ledger.record_event("CLONE_FAIL", nick=sid,
+                                 detail={"reason": "depth_cap"})
+            logger.warning("Not cloning %s: lineage depth cap reached", sid)
+            return
+        # A signed-out session clones into another signed-out session — the
+        # dead cookies move with the profile. Only clone when the page isn't
+        # provably signed out (unusual_wall / dead tab still benefit).
+        ws = next((w for w, s in self._extensions.items()
+                   if s.get("profile_id") == sid), None)
+        if ws is not None and self._extensions[ws].get("page_state") == "signed_out":
+            _ledger.record_event("CLONE_FAIL", nick=sid,
+                                 detail={"reason": "signed_out_session"})
+            logger.warning(
+                "Not cloning %s: page is signed_out — cookies are dead "
+                "server-side, a clone inherits the corpse. Needs re-login.", sid)
+            return
+        self._clone_pending.add(sid)
+        try:
+            asyncio.get_running_loop().create_task(self._clone_terminal_nick(sid))
+        except RuntimeError:
+            self._clone_pending.discard(sid)
+
+    async def _clone_terminal_nick(self, sid: str) -> None:
+        """Clone a terminal nick: stop original → copy profile → fresh proxy
+        IP → new account row → launch → remap media/operation pins onto the
+        clone (same Google account, so pinned work still resolves).
+        """
+        try:
+            from agent.services.accounts import (
+                get_account, upsert_account, load_accounts)
+            from agent.services.chrome_nicks import (
+                stop_nick, launch_nick, chrome_data_dir)
+            from agent.services.proxy_pool import make_surfshark_url
+
+            acc = get_account(sid)
+            if not acc:
+                return
+
+            # Clone id: base-<dual|dual-N>, first free.
+            base = re.sub(r"-dual(?:-\d+)?$", "", sid)
+            existing = {a.get("id") for a in load_accounts()}
+            n = 1
+            while True:
+                clone_id = f"{base}-dual" if n == 1 else f"{base}-dual-{n}"
+                if clone_id not in existing and not chrome_data_dir(clone_id).exists():
+                    break
+                n += 1
+                if n > 20:
+                    logger.error("clone_terminal %s: no free clone id", sid)
+                    return
+
+            # Stop the original first so the profile copies cleanly and the
+            # flagged session stops touching Google.
+            try:
+                await stop_nick(sid)
+            except Exception as exc:
+                logger.warning("clone_terminal %s: stop failed (%s) — continuing", sid, exc)
+
+            src, dst = chrome_data_dir(sid), chrome_data_dir(clone_id)
+            if not src.exists():
+                _ledger.record_event("CLONE_FAIL", nick=sid,
+                                     detail={"stage": "copy", "error": "profile dir missing"})
+                return
+            tmp = dst.parent / (clone_id + ".copying")
+            try:
+                shutil.rmtree(tmp, ignore_errors=True)  # stale partial copy
+                # Exclude the baked extension copy — it carries the parent's
+                # profileId, so a cloned profile would connect AS the parent
+                # and create a duplicate WS session. launch_nick regenerates
+                # it with the clone's own id via sync_extension_copy.
+                await asyncio.to_thread(
+                    shutil.copytree, src, tmp,
+                    ignore=shutil.ignore_patterns("FlowKitExtension"))
+                # Sanity: a real profile has Preferences — a partial copy must
+                # never be renamed into place and launched.
+                if not (tmp / "Default" / "Preferences").exists() and not (tmp / "Preferences").exists():
+                    raise RuntimeError("copied profile lacks Preferences")
+                os.replace(tmp, dst)
+            except Exception as exc:
+                shutil.rmtree(tmp, ignore_errors=True)
+                _ledger.record_event("CLONE_FAIL", nick=sid,
+                                     detail={"stage": "copy", "error": str(exc)[:200]})
+                logger.warning("clone_terminal %s: profile copy failed: %s", sid, exc)
+                return
+
+            acc["enabled"] = False
+            acc["note"] = (acc.get("note") or "") + " [auto] session terminal — cloned to " + clone_id
+            upsert_account(acc)
+
+            country = random.choice(_config.AUTO_CLONE_COUNTRIES or ["us"])
+            row = {
+                "id": clone_id,
+                "label": f"{clone_id} (auto-clone of {sid})",
+                "project_id": acc.get("project_id"),
+                "proxy_url": make_surfshark_url(clone_id, country),
+                "note": "", "enabled": True,
+                "mint_only": bool(acc.get("mint_only")),
+                "browser": acc.get("browser") or "",
+                "clone_of": sid,
+                "clone_ts": int(time.time()),
+            }
+            upsert_account(row)
+
+            # Same Google account + same project → media/operation pins made
+            # on the dead session resolve on the clone.
+            for m, owner in list(self._media_profiles.items()):
+                if owner == sid:
+                    self._media_profiles[m] = clone_id
+            for o, owner in list(self._operation_profiles.items()):
+                if owner == sid:
+                    self._operation_profiles[o] = clone_id
+            # _operation_chat_sessions maps op→chat_session_id (a server-side
+            # StreamChat conversation on the same Google account) — leave it:
+            # the clone can keep the conversation. Remapping it to a nick id
+            # would corrupt the lookup.
+            try:
+                self._save_media_profiles()
+            except Exception:
+                pass
+
+            _ledger.record_event("CLONE_SPAWNED", nick=clone_id, detail={
+                "from": sid, "country": country,
+                "proxy": row["proxy_url"][:80],
+            })
+            logger.warning(
+                "Terminal nick %s → auto-cloned to %s on cr.%s; launching",
+                sid, clone_id, country)
+
+            res = await launch_nick(clone_id)
+            if res.get("ok"):
+                _ledger.record_event("CLONE_LAUNCHED", nick=clone_id)
+            else:
+                _ledger.record_event("CLONE_FAIL", nick=clone_id,
+                                     detail={"error": res.get("error")})
+                logger.warning("Clone %s launch failed: %s", clone_id, res.get("error"))
+        except Exception:
+            logger.exception("auto-clone of %s failed", sid)
+            _ledger.record_event("CLONE_FAIL", nick=sid, detail={"stage": "exception"})
+
+    async def _canary_probe(self, sid: str) -> None:
+        """One cheap RPC on a nick whose hold-out just elapsed.
+
+        Clean answer → clear strikes and re-admit. UNUSUAL_ACTIVITY → re-arm
+        the hold-out (the synthetic probe took the hit, not a paying request).
+        Deep flags graduate straight to terminal.
+        """
+        try:
+            ws = next((w for w, s in self._extensions.items()
+                       if s.get("profile_id") == sid), None)
+            session = self._extensions.get(ws) if ws else None
+            if ws is None or session is None:
+                # Offline nick — nothing to probe; release flags anyway since
+                # routing filters disconnected nicks regardless.
+                self._unusual_strikes[sid] = 0
+                self._flag_released.add(sid)
+                return
+            pid = self._session_project(session) or FLOW_PROJECT_ID
+            route = {"ws": ws, "profile_id": sid,
+                     "project_id": pid, "pinned": True}
+            flagged = False
+            try:
+                tok = _current_route.set(route)
+                try:
+                    await self._batch_payload(
+                        fb.RPC_LIST_SESSIONS, fb.list_sessions_request(str(pid)),
+                        timeout=30)
+                finally:
+                    _current_route.reset(tok)
+            except Exception as exc:
+                flagged = "UNUSUAL_ACTIVITY" in str(exc).upper()
+            if flagged:
+                # Re-arm the hold-out at the current escalation depth.
+                self._unusual_strikes[sid] = 2
+                self._unusual_strike_ts[sid] = time.time()
+                if self._flag_depth.get(sid, 0) >= 2 and sid not in self._session_terminal:
+                    self._session_terminal[sid] = time.time()
+                    _ledger.record_event("SESSION_TERMINAL", nick=sid, detail={
+                        "via": "canary", "flag_depth": self._flag_depth[sid],
+                    })
+                    self._schedule_terminal_clone(sid)
+                    logger.warning(
+                        "Canary on %s still flagged at flag_depth=%d — session terminal, "
+                        "leaving rotation until re-login", sid, self._flag_depth[sid])
+                else:
+                    _ledger.record_event("CANARY_FAIL", nick=sid, detail={
+                        "flag_depth": self._flag_depth.get(sid, 0),
+                    })
+                    logger.warning(
+                        "Canary on %s still flagged — hold-out re-armed", sid)
+            else:
+                self._unusual_strikes[sid] = 0
+                self._flag_released.add(sid)
+                if self._session_terminal.pop(sid, None) is not None:
+                    _ledger.record_event("TERMINAL_CLEARED", nick=sid,
+                                         detail={"via": "canary_ok"})
+                _ledger.record_event("CANARY_OK", nick=sid)
+                _ledger.record_event("HOLDOUT_EXIT", nick=sid)
+                logger.info("Canary on %s clean — nick re-admitted", sid)
+        except Exception:
+            logger.debug("canary probe failed for %s", sid, exc_info=True)
+            # Inconclusive probe — release; the real strike path re-catches
+            # genuine flags on the next request.
+            self._unusual_strikes[sid] = 0
+            self._flag_released.add(sid)
+        finally:
+            self._canary_pending.discard(sid)
+
+    async def _warm_probe(self, sid: str, ws) -> None:
+        """Poll a freshly connected Flow tab until it reports app_ready.
+
+        The router keeps the nick unavailable (warming_until) while this
+        runs, so real jobs never land on a cold tab. Releases early on
+        app_ready; on timeout releases anyway — the strike path still
+        catches a genuinely dead tab.
+        """
+        deadline = time.monotonic() + 120
+        try:
+            while time.monotonic() < deadline:
+                session = self._extensions.get(ws)
+                if session is None or session.get("profile_id") != sid:
+                    return
+                try:
+                    tok = _current_route.set(
+                        {"ws": ws, "profile_id": sid, "pinned": True})
+                    try:
+                        health = await self._send(
+                            "flow_tab_health", {}, timeout=8)
+                    finally:
+                        _current_route.reset(tok)
+                except Exception:
+                    health = {}
+                res = (health or {}).get("result") or {}
+                state = res.get("page_state")
+                if state == "app_ready" or (state is None and res.get("alive")):
+                    session["warming_until"] = 0
+                    _ledger.record_event("EXT_WARMED", nick=sid,
+                                         detail={"page_state": state})
+                    return
+                await asyncio.sleep(8)
+            if ws in self._extensions:
+                self._extensions[ws]["warming_until"] = 0
+        finally:
+            session = self._extensions.get(ws)
+            if session is not None:
+                session.pop("warm_task", None)
+
+    async def _resolve_dup_ws(self, incumbent_ws, new_ws, profile_id: str) -> None:
+        """Two sockets claim one profile — keep whichever actually answers.
+
+        A live incumbent means the newcomer is a zombie reconnecting after
+        a prior eviction (the extension reschedules a reconnect on every
+        close), so the newcomer gets closed with 4001 to break the loop.
+        A dead incumbent is the half-open socket a relaunched Chrome left
+        behind — evict it and the fresh conn keeps the profile.
+        """
+        try:
+            tok = _current_route.set(
+                {"ws": incumbent_ws, "profile_id": profile_id, "pinned": True})
+            try:
+                probe = await self._send("flow_tab_health", {}, timeout=5)
+            finally:
+                _current_route.reset(tok)
+        except Exception:
+            probe = {}
+        err = (probe or {}).get("error")
+        # Any answered response — even UNKNOWN_METHOD from an old extension —
+        # proves the incumbent socket is alive.
+        incumbent_alive = not err or str(err).startswith("UNKNOWN_METHOD")
+        loser, kept = (new_ws, "incumbent") if incumbent_alive \
+            else (incumbent_ws, "new")
+        if loser in self._extensions:
+            self.clear_extension(loser)
+            try:
+                await loser.close(code=4001)
+            except Exception:
+                pass
+        _ledger.record_event("WS_DUP_RESOLVED", nick=profile_id,
+                             detail={"kept": kept})
+        logger.warning("Duplicate WS for %s resolved — kept %s",
+                       profile_id, kept)
+
+    async def _minter_probe_loop(self) -> None:
+        """Periodic Flow-page liveness check for every connected minter.
+
+        The WS staying open does not prove the Flow tab is alive — a grey,
+        discarded, or 401'd page still mints "tokens" that are all rejected.
+        Probe via the extension's flow_tab_health; on dead, mark the minter
+        out of routing and ask its own extension to reload the tab.
+        """
+        await asyncio.sleep(30)
+        while True:
+            try:
+                await self._probe_minters()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("minter probe sweep failed", exc_info=True)
+            await asyncio.sleep(_config.CAPTCHA_MINTER_PROBE_SECS)
+
+    async def _probe_minters(self) -> None:
+        prefer = self._minter_nicks()
+        if not prefer:
+            return
+        now = time.time()
+        for ws, session in list(self._extensions.items()):
+            sid = session.get("profile_id")
+            if not sid or sid not in prefer:
+                continue
+            route = {"ws": ws, "profile_id": sid,
+                     "project_id": self._session_project(session),
+                     "pinned": True}
+            tok = _current_route.set(route)
+            res = await self._send("flow_tab_health", {}, timeout=15)
+            _current_route.reset(tok)
+            if res.get("error"):
+                # Extension predates flow_tab_health — can't probe, but that's
+                # not proof the page is dead; skip rather than eject it.
+                if "UNKNOWN_METHOD" in str(res["error"]):
+                    continue
+                res = {"alive": False, "reason": "PROBE_FAILED",
+                       "error": res["error"]}
+            else:
+                res = res.get("result") or {}
+            alive = bool(res.get("alive"))
+            if alive:
+                if sid in self._minter_page_dead:
+                    self._minter_page_dead.pop(sid, None)
+                    self._mint_event("page_recovered", minter=sid)
+                    logger.info("Minter %s Flow page recovered", sid)
+                continue
+            reason = res.get("reason") or "unknown"
+            if sid not in self._minter_page_dead:
+                self._minter_page_dead[sid] = now
+                self._mint_event("page_dead", minter=sid, reason=reason,
+                                 error=res.get("error"))
+                logger.warning("Minter %s Flow page dead (%s) — excluding from "
+                               "mint routing, reloading tab", sid, reason)
+            # Reload debounce: at most one reload per RELOAD_SECS per minter.
+            if now - self._minter_reload_at.get(sid, 0) < _config.CAPTCHA_MINTER_RELOAD_SECS:
+                continue
+            self._minter_reload_at[sid] = now
+            tok = _current_route.set(route)
+            rres = await self._send("reload_flow_tab", {}, timeout=30)
+            _current_route.reset(tok)
+            if rres.get("error") or rres.get("result", {}).get("ok") is False:
+                logger.warning("Minter %s tab reload failed: %s",
+                               sid, rres.get("error") or rres)
+            else:
+                logger.info("Minter %s tab reload dispatched", sid)
+
+    async def _mint_raw(self, action: str, exclude: str | None) -> tuple[str | None, str | None]:
+        """Mint one Enterprise token on a healthy sibling. (token, minter)."""
+        route, skipped = self._minter_route(exclude=exclude)
+        if not route:
+            reason = ("no_minter_connected" if not skipped
+                      else "all_minters_" + "_".join(sorted(set(skipped))))
+            self._mint_event("no_minter", target=exclude, reason=reason)
+            logger.warning("No minter available for %s: %s", exclude, reason)
+            return None, None
+        minter = route["profile_id"]
+        tok = _current_route.set(route)
+        started = time.time()
+        try:
+            res = await self._send("solve_captcha",
+                                   {"captchaAction": action}, timeout=30)
+        except Exception as exc:
+            # _send can raise (ws dropped mid-mint) — count it and let the
+            # caller fall back to in-page minting instead of failing the job.
+            self._mint_event("mint_fail", minter=minter, target=exclude,
+                             reason=f"exception:{type(exc).__name__}",
+                             action=action)
+            self._minter_fail_until[minter] = time.time() + 300
+            logger.warning("Foreign captcha mint raised on %s for %s: %s",
+                           minter, exclude, exc)
+            return None, None
+        finally:
+            _current_route.reset(tok)
+        latency_ms = (time.time() - started) * 1000
+        token = (res.get("result") or res).get("token")
+        if token:
+            self._minter_mint_ts.setdefault(minter, deque()).append(time.time())
+            self._minter_use_count[minter] = self._minter_use_count.get(minter, 0) + 1
+            self._mint_event("mint_ok", minter=minter, target=exclude,
+                             action=action, latency_ms=round(latency_ms, 1),
+                             token_len=len(token))
+            return token, minter
+        # Mint itself failing = page/env problem on the minter side.
+        reason = str((res.get("result") or res).get("error") or "no_token")
+        self._minter_fail_until[minter] = time.time() + 300
+        self._mint_event("mint_fail", minter=minter, target=exclude,
+                         reason=reason, action=action,
+                         latency_ms=round(latency_ms, 1))
+        self._mint_event("cooldown", minter=minter, target=exclude,
+                         cooldown_s=300, cause="mint_fail")
+        logger.warning("Foreign captcha mint failed on %s for %s: %s",
+                       minter, exclude, reason)
+        return None, None
+
+    async def _mint_on_sibling(self, action: str, target_prof: str | None) -> str | None:
+        """Mint an Enterprise token inside another nick's signed-in Flow tab."""
+        token, minter = await self._mint_raw(action, exclude=target_prof)
+        if token and target_prof:
+            self._active_minter[target_prof] = minter
+            logger.info("Foreign captcha minted on %s for %s action=%s",
+                        minter, target_prof, action)
+        return token
+
+    async def _token_pool_loop(self) -> None:
+        """Keep a few fresh foreign tokens warm per action.
+
+        A strike retry used to mint serially inside the retry path — the pool
+        holds ready tokens (per action, since reCAPTCHA validates it) so the
+        retry consumes one instantly. Entries expire at TOKEN_TTL_S.
+        """
+        await asyncio.sleep(20)
+        while True:
+            try:
+                if _config.CAPTCHA_FOREIGN_MINT != "off" and self._minter_nicks():
+                    await self._pool_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("token pool tick failed", exc_info=True)
+            await asyncio.sleep(_config.CAPTCHA_TOKEN_POOL_TICK_S)
+
+    async def _pool_tick(self) -> None:
+        now = time.time()
+        for action in (fb.CAPTCHA_IMAGE, fb.CAPTCHA_VIDEO, fb.CAPTCHA_CHAT):
+            dq = self._token_pool.setdefault(action, deque())
+            while dq and now - dq[0]["minted_at"] > _config.CAPTCHA_TOKEN_TTL_S:
+                dq.popleft()
+            while len(dq) < _config.CAPTCHA_TOKEN_POOL_SIZE:
+                if not await self._pool_mint(action, dq):
+                    break
+
+    async def _pool_mint(self, action: str, dq: deque) -> bool:
+        """Mint one token into the pool. Serialized so a tick burst and a
+        strike prefetch cannot pile onto the same minter."""
+        async with self._token_pool_lock:
+            if len(dq) >= _config.CAPTCHA_TOKEN_POOL_SIZE:
+                return True
+            token, minter = await self._mint_raw(action, exclude=None)
+            if not token:
+                return False
+            dq.append({"token": token, "minter": minter,
+                       "minted_at": time.time()})
+            return True
+
+    async def _pool_prefetch(self, action: str) -> None:
+        """Strike-time top-up: mint while the proxy rotates so the retry
+        finds a warm token instead of minting after the swap."""
+        try:
+            dq = self._token_pool.setdefault(action, deque())
+            if len(dq) >= _config.CAPTCHA_TOKEN_POOL_SIZE:
+                return
+            await self._pool_mint(action, dq)
+        except Exception:
+            logger.debug("pool prefetch failed for %s", action, exc_info=True)
+
+    def _pool_take(self, action: str, prof_id: str | None) -> str | None:
+        """Pop the freshest live pooled token for ``action``, or None."""
+        dq = self._token_pool.get(action)
+        if not dq:
+            return None
+        now = time.time()
+        while dq:
+            entry = dq.pop()
+            if now - entry["minted_at"] <= _config.CAPTCHA_TOKEN_TTL_S:
+                if prof_id:
+                    self._active_minter[prof_id] = entry["minter"]
+                self._mint_event("pool_hit", minter=entry["minter"],
+                                 target=prof_id, action=action,
+                                 age_s=round(now - entry["minted_at"], 1))
+                return entry["token"]
+        self._mint_event("pool_miss", target=prof_id, action=action)
+        return None
+
+    async def _rebind_media(self, media_id: str, owner: str,
+                            target: str, project_id: str) -> str | None:
+        """Move a ref image onto ``target``'s account: fetch the bytes through
+        the owner's still-connected tab, re-upload into the target's project.
+
+        A media id only exists inside the owning Google account's project, so
+        a ref created on a now-mint-only (or otherwise unroutable) nick is
+        invisible to the gen fleet — re-upload is the only way to rebind it.
+        """
+        src = self._find_session_route(owner)
+        dst = self._find_session_route(target)
+        if not src or not dst:
+            return None
+        tok = _current_route.set(src)
+        try:
+            urls = await self._batch_media_urls(media_id)
+        except Exception as exc:
+            logger.warning("rebind %s: url fetch on %s failed: %s",
+                           media_id[:8], owner, exc)
+            return None
+        finally:
+            _current_route.reset(tok)
+        if not urls.image:
+            return None
+        try:
+            blob, mime = await asyncio.to_thread(_fetch_url_bytes, urls.image, 60)
+        except Exception as exc:
+            logger.warning("rebind %s: download failed: %s", media_id[:8], exc)
+            return None
+        pid = dst.get("project_id") or self._batch_project_id(project_id)
+        b64 = base64.b64encode(blob).decode()
+        tok = _current_route.set(dst)
+        try:
+            payload = await self._batch_payload(
+                fb.RPC_UPLOAD_IMAGE,
+                fb.upload_request(b64, pid, mime, f"rebind-{media_id[:8]}"),
+                fb.CAPTCHA_IMAGE, timeout=120)
+        except Exception as exc:
+            logger.warning("rebind %s: upload on %s failed: %s",
+                           media_id[:8], target, exc)
+            return None
+        finally:
+            _current_route.reset(tok)
+        new_mid = fb.read_uploaded_media_id(payload)
+        if new_mid:
+            self._remember_media(new_mid, profile_id=target)
+            return new_mid
+        return None
+
+    async def _consolidate_media_ids(self, media_ids: list[str] | None,
+                                     project_id: str = "") -> list[str]:
+        """Rebind refs so every id belongs to the nick that will run the call.
+
+        Two poison shapes: refs spread across multiple owner accounts, and refs
+        owned by a nick that cannot serve work (mint_only farm, disabled, or
+        disconnected). Both strand the call with MEDIA_PROFILE_MISMATCH /
+        NO_FLOW_TAB — the media physically live in another account's project.
+        Fetch via the owner's tab and re-upload onto the target nick instead.
+        """
+        mids = [m for m in (media_ids or []) if m]
+        if not mids:
+            return list(media_ids or [])
+        owners = {m: self._media_profiles.get(m) for m in mids}
+        known = {o for o in owners.values() if o}
+        if not known:
+            return list(media_ids or [])
+
+        _, cands = self._profile_candidates(project_id=project_id)
+        routable = {str(c.get("profile_id")) for c in cands if c.get("profile_id")}
+
+        # Target: the pin when it is routable, else the majority routable
+        # owner (fewest re-uploads), else the first available candidate.
+        from collections import Counter
+        pin = self._resolve_pin(project_id=project_id)
+        target = None
+        if pin and pin in routable:
+            target = pin
+        else:
+            common = Counter(o for o in owners.values() if o in routable)
+            if common:
+                target = common.most_common(1)[0][0]
+            else:
+                for c in cands:
+                    if c.get("available") and c.get("profile_id"):
+                        target = c["profile_id"]
+                        break
+                if not target and cands:
+                    target = cands[0].get("profile_id")
+        if not target:
+            return list(media_ids or [])
+
+        out, rebound = [], 0
+        for m in mids:
+            owner = owners[m]
+            keep = (owner is None or owner == target
+                    or (owner in routable and len(known) == 1))
+            if keep:
+                out.append(m)
+                continue
+            new_mid = await self._rebind_media(m, owner, target, project_id)
+            out.append(new_mid or m)
+            if new_mid:
+                rebound += 1
+        if rebound:
+            logger.info(
+                "Rebound %d ref media onto %s (owners were: %s)",
+                rebound, target, sorted(known))
+        return out
+
+    async def _foreign_captcha_token(self, action: str) -> str | None:
+        """Token minted outside the requesting nick's own page.
+
+        Trusted-minter pool (CAPTCHA_FOREIGN_MINT): a token minted in a healthy
+        sibling's logged-in Flow tab — measured to rescue flagged nicks.
+        External solver (CAPTCHA_SOLVER_MODE) stays as a dormant second source.
+        ``fallback`` limits both to the auto-retry after UNUSUAL_ACTIVITY.
+        Any failure falls back to the in-page mint so nothing can stop
+        generation entirely.
+        """
+        prof_id = (_current_route.get() or {}).get("profile_id")
+        mode_f = _config.CAPTCHA_FOREIGN_MINT
+        mode_s = _config.CAPTCHA_SOLVER_MODE
+        allowed_f = mode_f == "always" or (
+            mode_f == "fallback" and prof_id in self._foreign_mint_pending)
+        allowed_s = bool(_config.CAPTCHA_SOLVER_API_KEY) and (
+            mode_s == "always" or
+            (mode_s == "fallback" and prof_id in self._solver_retry_pending))
+        self._foreign_mint_pending.discard(prof_id)
+        self._solver_retry_pending.discard(prof_id)
+        if allowed_f:
+            token = self._pool_take(action, prof_id)
+            if not token:
+                token = await self._mint_on_sibling(action, prof_id)
+            if token:
+                return token
+        if allowed_s:
+            try:
+                from agent.services.captcha_solver import solve_recaptcha_v3
+                token = await solve_recaptcha_v3(action)
+                logger.info("Solver captcha token minted for %s action=%s", prof_id, action)
+                return token
+            except Exception as exc:
+                logger.warning("Solver token failed for %s (%s); in-page mint fallback", prof_id, exc)
+        return None
 
     @traced("rpc.parse")
     async def _batch_payload(self, rpcid: str | None, freq: str,
@@ -1970,7 +3579,8 @@ class FlowClient:
                                aspect_ratio: str = "IMAGE_ASPECT_RATIO_PORTRAIT",
                                user_paygate_tier: str = "PAYGATE_TIER_TWO",
                                character_media_ids: list[str] = None,
-                               image_model: str = None) -> dict:
+                               image_model: str = None,
+                               profile_id: str | None = None) -> dict:
         """Generate image(s).
 
         ``character_media_ids`` are attached as reference images, which is what
@@ -1982,7 +3592,8 @@ class FlowClient:
             return await self._legacy_generate_images(
                 prompt, project_id, aspect_ratio, user_paygate_tier, character_media_ids)
 
-        refs = list(character_media_ids or [])
+        refs = await self._consolidate_media_ids(
+            list(character_media_ids or []), project_id)
 
         async def run(pid: str):
             freq = fb.image_request(
@@ -2000,7 +3611,8 @@ class FlowClient:
 
         try:
             return await self._run_on_profile(
-                run, project_id, media_ids=refs, allow_failover=True)
+                run, project_id, media_ids=refs, allow_failover=True,
+                profile_id=profile_id)
         except Exception as e:
             return _batch_error(e)
 
@@ -2094,6 +3706,8 @@ class FlowClient:
 
         gen_type = "start_end_frame_2_video" if end_image_media_id else "frame_2_video"
 
+        start = (await self._consolidate_media_ids([start], project_id))[0]
+
         async def run_i2v(pid: str):
             freq = fb.video_request(
                 prompt, pid, start, aspect=aspect_ratio,
@@ -2137,7 +3751,7 @@ class FlowClient:
         if not reference_media_ids:
             return {"error": "No reference media_ids for r2v"}
 
-        refs = list(reference_media_ids)
+        refs = await self._consolidate_media_ids(list(reference_media_ids), project_id)
 
         async def run(pid: str):
             # StreamChat has no model slot. Without this setting the
@@ -2890,9 +4504,19 @@ class FlowClient:
         """Fetch a media record, which is where a fresh signed url lives."""
         if not USE_BATCH_RPC:
             return await self._legacy_get_media(media_id)
+        dead_until = self._dead_media.get(media_id, 0)
+        if dead_until > time.time():
+            return {"status": 404, "error": f"No urls for media {media_id} (dead-cached)"}
         async def run(_pid: str):
             urls = await self._batch_media_urls(media_id)
             if not urls.video and not urls.image:
+                if media_id not in self._dead_media:
+                    _ledger.record_event("MEDIA_DEAD", detail={"media_id": media_id})
+                self._dead_media[media_id] = time.time() + 3600
+                if len(self._dead_media) > 4096:
+                    now = time.time()
+                    for k in [k for k, v in self._dead_media.items() if v <= now][:2048]:
+                        self._dead_media.pop(k, None)
                 return {"status": 404, "error": f"No urls for media {media_id}"}
             data: dict = {}
             if urls.video:
@@ -2913,6 +4537,10 @@ class FlowClient:
                             reference_media_id: str | None = None) -> dict:
         """Upload an image into the project so it can be used as a reference."""
         if reference_media_id:
+            # A reference owned by an unroutable nick (mint_only/disabled) can
+            # no longer bind this upload — rebind the reference itself first.
+            reference_media_id = (
+                await self._consolidate_media_ids([reference_media_id], project_id))[0]
             owner = self._media_profiles.get(reference_media_id)
             if not owner or not self._UUID_RE.fullmatch(reference_media_id):
                 return {"status": 400, "error": "REFERENCE_BINDING_UNKNOWN: upload the first reference again",
@@ -3297,12 +4925,81 @@ class FlowClient:
 
         return result
 
+    async def test_cross_captcha(self, mint_worker: str, use_worker: str,
+                                 foreign_token: str | None = None,
+                                 kind: str = "upload") -> dict:
+        """Mint a captcha token on ``mint_worker``, spend it on ``use_worker``.
+
+        Uses the upload RPC (maseQ): carries a captcha but costs no gen quota.
+        Pass mint_worker == use_worker for the domestic control. The answer
+        decides whether external minting can ever help: if a foreign token
+        fails where a domestic one passes, Enterprise tokens are
+        environment-bound and no solver/minter architecture can work.
+        """
+        from agent.services import flow_batch as fb
+        from agent.services.accounts import get_account
+
+        # 1x1 PNG — the upload carries a captcha but costs no generation quota.
+        TINY_PNG = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDw"
+            "AEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        acc = get_account(use_worker)
+        project_id = (acc or {}).get("project_id") or ""
+        if not project_id:
+            return {"ok": False, "stage": "setup",
+                    "error": f"{use_worker} has no project_id"}
+
+        mint_route = self._find_session_route(mint_worker)
+        _, use_cands = self._profile_candidates(profile_id=use_worker)
+        if not mint_route or not use_cands:
+            return {"ok": False, "stage": "setup",
+                    "error": "worker not connected"}
+
+        if foreign_token:
+            token = foreign_token
+        else:
+            tok = _current_route.set(mint_route)
+            try:
+                res = await self._send("solve_captcha",
+                                       {"captchaAction": fb.CAPTCHA_IMAGE}, timeout=30)
+            finally:
+                _current_route.reset(tok)
+            token = (res.get("result") or res).get("token")
+            if not token:
+                return {"ok": False, "stage": "mint", "mint_on": mint_worker,
+                        "error": (res.get("result") or res).get("error")}
+
+        if kind == "gen":
+            # ogiZ0b — real image generation, costs one image gen. This is the
+            # RPC that actually evaluates the captcha: upload (maseQ) accepts
+            # even garbage tokens, so only gen proves token validity.
+            freq = fb.image_request(
+                "a small grey square", project_id, count=1,
+                model=self._batch_image_model(None))
+            rpcid = fb.RPC_GEN_IMAGE
+        else:
+            freq = fb.upload_request(TINY_PNG, project_id, "image/png",
+                                     "cross-captcha-probe.png")
+            rpcid = fb.RPC_UPLOAD_IMAGE
+        tok = _current_route.set(use_cands[0])
+        try:
+            out = await self._send("batch_rpc", {
+                "rpcid": rpcid, "freq": freq,
+                "captchaAction": fb.CAPTCHA_IMAGE, "captchaToken": token,
+            }, timeout=180)
+        finally:
+            _current_route.reset(tok)
+        return {"ok": not out.get("error"), "mint_on": mint_worker,
+                "use_on": use_worker, "kind": kind, "result": out}
+
     async def test_recaptcha_token(self, worker_id: str = "nick-a", action: str = "FLOW_PROBE") -> dict:
         """Test minting 1 live reCAPTCHA Enterprise token through Chrome extension on worker_id."""
-        pin, candidates = self._profile_candidates(profile_id=worker_id)
-        if not candidates:
+        # _find_session_route reaches mint-only farm nicks too, which
+        # _profile_candidates filters out of work routing.
+        route = self._find_session_route(worker_id)
+        if not route:
             return {"ok": False, "error": f"Worker {worker_id} not connected"}
-        route = candidates[0]
         token_route = _current_route.set(route)
         try:
             res = await self._send("solve_captcha", {"captchaAction": action}, timeout=20)

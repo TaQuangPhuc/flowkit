@@ -1003,7 +1003,7 @@ def sanitize_kf_prompt(prompt: str, canonical_anchor: str = "", model_anchor: st
         return sanitize_safety_content(prompt)
     elif mode == "fashion":
         if model_anchor and "CREATOR REFERENCE LOCK" not in prompt and "MODEL REFERENCE LOCK" not in prompt:
-            prompt = f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {model_anchor}.. {prompt}"
+            prompt = f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {model_anchor}. Same exact person as the attached reference portrait — identical face and hairstyle. {prompt}"
         if canonical_anchor and "PRODUCT REFERENCE LOCK" not in prompt:
             prompt = f"PRODUCT REFERENCE LOCK — HIGHEST PRIORITY: {canonical_anchor}.. {prompt}"
         if "photorealistic" not in prompt.lower():
@@ -1013,7 +1013,7 @@ def sanitize_kf_prompt(prompt: str, canonical_anchor: str = "", model_anchor: st
     else:
         # UGC or Store Review mode
         if model_anchor and "CREATOR REFERENCE LOCK" not in prompt and "KOL REFERENCE LOCK" not in prompt:
-            prompt = f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {model_anchor}. {prompt}"
+            prompt = f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {model_anchor}. Same exact person as the attached reference portrait — identical face and hairstyle. {prompt}"
         # Triệt tiêu các lệnh dễ làm biến dạng má, xương hàm và nghiêng vẹo mặt
         prompt = re.sub(r"\bpress(?:es|ing)?\s+(?:the\s+)?(?:soft\s+)?fabric\s+against\s+(?:her\s+|his\s+)?cheek\b", "holding the cute product near chest level while looking straight at camera", prompt, flags=re.IGNORECASE)
         prompt = re.sub(r"\btilt(?:s|ing)?\s+(?:her\s+|his\s+)?head\b", "facing directly forward toward camera with a gentle warm smile", prompt, flags=re.IGNORECASE)
@@ -1251,9 +1251,8 @@ def batch_poll_videos_flowkit(
         
     return completed_clips
 
-def generate_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int, job_id: str = None, duration_s: int = 8) -> str:
-    """Fallback single-scene video generator (used for single scene regeneration)."""
-    op_name = submit_video_flowkit(keyframe_mid, motion_prompt, scene_idx, job_id=job_id, duration_s=duration_s)
+def poll_video_operation_flowkit(op_name: str, scene_idx: int, job_id: str = None) -> str:
+    """Poll an already-submitted Veo operation until it yields a fife url."""
     started = time.monotonic()
     poll_idx = 0
     while time.monotonic() - started < FLOWKIT_VIDEO_WAIT_SECONDS:
@@ -1278,6 +1277,12 @@ def generate_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int
                 raise
             continue
     raise TimeoutError(f"Veo video scene {scene_idx} timed out after {FLOWKIT_VIDEO_WAIT_SECONDS}s")
+
+
+def generate_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int, job_id: str = None, duration_s: int = 8) -> str:
+    """Fallback single-scene video generator (used for single scene regeneration)."""
+    op_name = submit_video_flowkit(keyframe_mid, motion_prompt, scene_idx, job_id=job_id, duration_s=duration_s)
+    return poll_video_operation_flowkit(op_name, scene_idx, job_id=job_id)
 
 GROK_VOICE_CONFIGS = {
     "female_north": {
@@ -1958,6 +1963,7 @@ Extract exact details and return a strict JSON object with:
                 update_job(job_id, status="ANALYZING", message="Giai đoạn 0: AI Vision (Google Gemini 3.8 Flash) đang quét sản phẩm & nhận diện chân dung Creator UGC...", step=1, total_steps=5)
                 vision_prompt = f"""
     Read and analyze the product image at {prod_file} and creator portrait image at {model_file}.
+    IDENTITY SOURCE RULE: the "model" and "canonical_model_anchor" fields MUST describe ONLY the person in the creator portrait image. The product image may contain a DIFFERENT person — never copy that person's hair, face, age or appearance into model fields. If the two people differ, the creator portrait always wins.
     You are an expert E-Commerce Creative Director & TikTok UGC Strategist.
     Extract exact details and return a strict JSON object with:
     {{
@@ -2032,6 +2038,7 @@ Extract exact details and return a strict JSON object with:
                 update_job(job_id, status="ANALYZING", message="Giai đoạn 0: AI Vision (Google Gemini 3.8 Flash) đang bóc tách thiết kế may mặc, chất liệu vải và phom dáng thời trang...", step=1, total_steps=5)
                 vision_prompt = f"""
     Read and analyze the fashion garment image at {prod_file} and model portrait image at {model_file}.
+    IDENTITY SOURCE RULE: the "model" and "canonical_model_anchor" fields MUST describe ONLY the person in the model portrait image. The garment image may contain a DIFFERENT person — never copy that person's hair, face, age or appearance into model fields. If the two people differ, the model portrait always wins.
     You are a High-Fashion Runway Creative Director & Haute Couture Stylist.
     Extract exact garment structure, silhouette, fabric, and model profile, returning a strict JSON object with:
     {{
@@ -2072,6 +2079,7 @@ Extract exact details and return a strict JSON object with:
                 update_job(job_id, status="ANALYZING", message="Giai đoạn 0: AI Vision (Google Gemini 3.8 Flash) đang quét sản phẩm và KOL Review Showroom...", step=1, total_steps=5)
                 vision_prompt = f"""
     Read and analyze the product image at {prod_file} and model portrait image at {model_file}.
+    IDENTITY SOURCE RULE: the "model" and "canonical_model_anchor" fields MUST describe ONLY the person in the model portrait image. The product image may contain a DIFFERENT person — never copy that person's hair, face, age or appearance into model fields. If the two people differ, the model portrait always wins.
     Extract exact details for a high-end Commercial Store Review:
     {{
       "product": {{
@@ -2716,6 +2724,10 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                     op_name = submit_video_flowkit(kf_mid, sc["video_motion_prompt"], i, job_id=job_id, duration_s=scene_duration)
                     with state_lock:
                         pending_ops[i] = op_name
+                        # Persist the op handle so a later crash/regen can
+                        # recover the submitted render instead of paying twice.
+                        scenes_data[i - 1]["operation_name"] = op_name
+                        scenes_data[i - 1]["operation_prompt"] = sc["video_motion_prompt"]
                         scenes_data[i - 1]["status"] = "RENDERING_VIDEO"
                         scenes_data[i - 1]["status_text"] = "Keyframe đã xong. Video đang chạy..."
                         update_job(job_id, status="RENDERING", message=f"Băng chuyền [Cảnh {i}/{num_scenes}]: Đã nạp Cảnh {i} vào cụm GPU Veo 3 ({scene_duration}s)...", step=4, scenes=scenes_data)
@@ -2735,8 +2747,13 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
             futures = [kf_executor.submit(_process_scene_keyframe, i, sc) for i, sc in enumerate(scenes_data, start=1)]
             concurrent.futures.wait(futures)
 
-        if kf_errors:
+        if kf_errors and not pending_ops:
             raise RuntimeError(f"Lỗi sinh Keyframe: {'; '.join(kf_errors)}")
+        if kf_errors:
+            # Some scenes failed keyframing but others already hold live Veo
+            # ops — poll those to completion instead of orphaning paid
+            # renders. Failed scenes stay FAILED for the rescue path below.
+            print(f"Job {job_id}: {len(kf_errors)} keyframe(s) failed ({'; '.join(kf_errors)}), but {len(pending_ops)} video op(s) already submitted — continuing to poll them.")
 
         # 3. Tất cả các cảnh đã được nạp vào Video Engine -> Bộ Giám Sát Tập Trung
         if video_engine.startswith("grok"):
@@ -2894,7 +2911,16 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                 scenes=scenes_data
             )
             # Auto-rescue: If exactly 1 scene failed/timed out, automatically attempt 1 background retry
-            failed_scene_ids = [sc.get("scene_id") for sc in scenes_data if sc.get("status") == "FAILED"]
+            def _needs_rescue(sc):
+                if sc.get("status") == "FAILED":
+                    return True
+                # Stuck RENDERING_VIDEO with no clip = a submitted op that lost
+                # its poller — regen can adopt the live op via operation_name.
+                if sc.get("status") == "RENDERING_VIDEO":
+                    cp = job_dir / f"clip_{sc.get('scene_id')}.mp4"
+                    return not (cp.exists() and cp.stat().st_size > 50000)
+                return False
+            failed_scene_ids = [sc.get("scene_id") for sc in scenes_data if _needs_rescue(sc)]
             if len(failed_scene_ids) == 1:
                 auto_sc_id = failed_scene_ids[0]
                 print(f"Job {job_id}: Automatically triggering background rescue for single failed scene {auto_sc_id}...")
@@ -3122,6 +3148,23 @@ def run_scene_regeneration_worker(
         # 1. Regenerate Keyframe if requested
         kf_path = job_dir / f"keyframe_{scene_id}.jpg"
         kf_mid = None
+        if not regen_keyframe:
+            # Re-use existing keyframe or re-upload if needed
+            kfs = job.get("keyframes", [])
+            for k in kfs:
+                if k.get("scene_id") == scene_id:
+                    kf_mid = k.get("media_id")
+                    break
+            if not kf_mid and kf_path.exists():
+                kf_mid = upload_to_flowkit(kf_path, job_id=job_id)
+            if not kf_mid:
+                # An i2v submit with start_image_media_id=None silently runs
+                # text-to-video — the face and product are no longer anchored.
+                # No keyframe exists to reuse, so one must be generated first.
+                print(f"Job {job_id}: Scene {scene_id} VIDEO_ONLY regen has no keyframe — upgrading to full regen.")
+                regen_keyframe = True
+                sc["status"] = "GENERATING_KEYFRAME"
+                sc["status_text"] = "Đang vẽ lại Keyframe..."
         if regen_keyframe:
             update_job(
                 job_id,
@@ -3149,15 +3192,6 @@ def run_scene_regeneration_worker(
             if not found_kf:
                 kfs.append({"scene_id": scene_id, "media_id": kf_mid, "url": f"/job/{job_id}/kf/{scene_id}"})
             update_job(job_id, keyframes=kfs)
-        else:
-            # Re-use existing keyframe or re-upload if needed
-            kfs = job.get("keyframes", [])
-            for k in kfs:
-                if k.get("scene_id") == scene_id:
-                    kf_mid = k.get("media_id")
-                    break
-            if not kf_mid and kf_path.exists():
-                kf_mid = upload_to_flowkit(kf_path, job_id=job_id)
 
         # 2. Render Video (Grok or Veo)
         video_engine = job.get("video_engine", "veo")
@@ -3200,9 +3234,37 @@ def run_scene_regeneration_worker(
                     "message": f"Veo 3.1 đang render lại Video Cảnh {scene_id} ({scene_duration}s)..."
                 }
             )
-            video_fife = generate_video_flowkit(kf_mid, sc["video_motion_prompt"], scene_id, job_id=job_id, duration_s=scene_duration)
-
-            urllib.request.urlretrieve(video_fife, str(clip_path))
+            # Orphan recovery: if the main pipeline died after submitting this
+            # scene's op (same prompt, no clip downloaded), adopt the live op
+            # instead of paying for a duplicate render.
+            recovered = False
+            existing_op = sc.get("operation_name")
+            same_prompt = bool(existing_op) and sc.get("operation_prompt") == sc.get("video_motion_prompt")
+            if existing_op and same_prompt and not clip_path.exists():
+                try:
+                    p_data = call_flowkit_api("/api/flow/check-status", {
+                        "operations": [{"operation": {"name": existing_op}}]
+                    }, timeout=40, job_id=job_id)
+                    curr = (p_data.get("operations") or (p_data.get("data") or {}).get("operations") or [{}])[0]
+                    st = str(curr.get("status") or "")
+                    fife = ((curr.get("operation") or {}).get("metadata") or {}).get("video", {}).get("fifeUrl")
+                    if "SUCCESSFUL" in st or fife:
+                        urllib.request.urlretrieve(fife, str(clip_path))
+                        recovered = True
+                        print(f"Job {job_id}: Scene {scene_id} recovered orphaned Veo op {existing_op[:12]} — render already done.")
+                    elif "FAIL" in st.upper():
+                        sc["operation_name"] = None  # dead op — resubmit below
+                    else:
+                        video_fife = poll_video_operation_flowkit(existing_op, scene_id, job_id=job_id)
+                        urllib.request.urlretrieve(video_fife, str(clip_path))
+                        recovered = True
+                        print(f"Job {job_id}: Scene {scene_id} adopted still-rendering Veo op {existing_op[:12]}.")
+                except Exception as oe:
+                    print(f"Job {job_id}: Scene {scene_id} orphan-op poll failed ({oe}); submitting fresh render.")
+            if not recovered:
+                video_fife = generate_video_flowkit(kf_mid, sc["video_motion_prompt"], scene_id, job_id=job_id, duration_s=scene_duration)
+                sc["operation_name"] = None
+                urllib.request.urlretrieve(video_fife, str(clip_path))
 
         # 3. Generate TTS Audio
         update_job(
@@ -7109,6 +7171,48 @@ HTML_UI = r"""<!DOCTYPE html>
 </html>
 """
 
+def orphan_op_sweeper():
+    """Reap scenes stuck RENDERING_VIDEO whose pipeline thread died.
+
+    A submitted Veo op outlives the thread that created it — once a job file
+    has been untouched beyond the poll budget, its poller is gone for good
+    and the scene would sit forever. The regen worker already knows how to
+    adopt a live op (operation_name) or resubmit cleanly, so each stale
+    scene is handed to it.
+    """
+    stale_after = FLOWKIT_VIDEO_WAIT_SECONDS + 120
+    while True:
+        time.sleep(120)
+        try:
+            cutoff = time.time() - stale_after
+            for jfile in WORK_DIR.glob("*/job.json"):
+                try:
+                    job = json.loads(jfile.read_text())
+                except Exception:
+                    continue
+                if job.get("updated_at", 0) >= cutoff:
+                    continue
+                if (job.get("regen_status") or {}).get("status") == "REGENERATING":
+                    continue
+                job_id = jfile.parent.name
+                for sc in job.get("scenes") or []:
+                    if sc.get("status") != "RENDERING_VIDEO":
+                        continue
+                    sid = sc.get("scene_id")
+                    cp = jfile.parent / f"clip_{sid}.mp4"
+                    if cp.exists() and cp.stat().st_size > 50000:
+                        continue
+                    print(f"[SWEEPER] Job {job_id}: scene {sid} stuck RENDERING_VIDEO >{int(stale_after)}s — dispatching regen (adopts op {str(sc.get('operation_name'))[:12]} if still live).")
+                    threading.Thread(
+                        target=run_scene_regeneration_worker,
+                        args=(job_id, sid, "", "", "", False),
+                        daemon=True,
+                    ).start()
+                    break  # one regen per job per sweep; REGENERATING flag serializes
+        except Exception as se:
+            print(f"[SWEEPER] error: {se}")
+
+
 if __name__ == "__main__":
     if WORK_DIR.exists():
         for p in WORK_DIR.iterdir():
@@ -7128,6 +7232,8 @@ if __name__ == "__main__":
 
     # Proxy Health Daemon is already managed by FlowKit API Service (port 8100).
     # We do not start a duplicate daemon here to avoid doubling network probes on the proxy pool.
+
+    threading.Thread(target=orphan_op_sweeper, daemon=True).start()
 
     server = HTTPServer(("0.0.0.0", 8089), AutoTvcHandler)
     print("Auto-TVC Studio running at http://0.0.0.0:8089")

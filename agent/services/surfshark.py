@@ -25,13 +25,20 @@ def owner_id(nick_id: str) -> str:
 
 
 def bind_nick_proxy(url: str, nick_id: str, *, session: str | None = None,
-                    prepare: bool = False) -> str:
+                    prepare: bool = False, owner_override: str | None = None) -> str:
     if not is_surfshark_url(url):
         return url
     parts = urlsplit(url)
     user, _, tail = unquote(parts.username or "").partition("__")
     params = dict(item.split(".", 1) for item in tail.split(";") if "." in item)
-    params["owner"] = owner_id(nick_id)
+    # The gateway leases an egress IP per owner, not per sessid. Preserve a
+    # stored owner only while it belongs to this nick (rotations append a
+    # suffix) so a copied URL cannot inherit a foreign lease.
+    own = owner_id(nick_id)
+    if owner_override:
+        params["owner"] = owner_override
+    elif not str(params.get("owner") or "").startswith(own):
+        params["owner"] = own
     params["sessid"] = session or params.get("sessid") or owner_id(nick_id)
     params["sessttl"] = params.pop("ttl", params.get("sessttl", "60"))
     params.pop("prepare", None)

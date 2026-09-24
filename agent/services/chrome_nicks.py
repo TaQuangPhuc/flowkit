@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -191,7 +192,13 @@ def seed_unpacked_extension(user_data_dir: Path | str, ext_dir: Path | str | Non
         if eid == ext_id or not isinstance(row, dict):
             continue
         path = str(row.get("path") or "")
-        if path == shared or path.rstrip("/").endswith("/flowkit/extension"):
+        # Drop the shared repo path AND foreign per-nick copies. A cloned
+        # profile inherits the parent's seeded entries, so without this its
+        # Chrome loads several FlowKit service workers at once — each claims
+        # a different profileId on the agent WS (the "ghost nick" bug).
+        if (path == shared
+                or path.rstrip("/").endswith("/flowkit/extension")
+                or path.rstrip("/").endswith("/FlowKitExtension")):
             settings.pop(eid, None)
     existing = settings.get(ext_id) if isinstance(settings.get(ext_id), dict) else {}
     if "declarativeNetRequest" not in (perms.get("api") or []):
@@ -236,7 +243,43 @@ def _drop_extension_sw_cache(user_data_dir: Path | str) -> None:
         shutil.rmtree(sw, ignore_errors=True)
 
 
-def _chrome_bin() -> str:
+# Alternate browser binaries selectable per nick via the account `browser`
+# field. Each entry: candidate paths plus extra CLI args that browser needs
+# (the unpacked Cốc Cốc build has no setuid sandbox, and on this Wayland-only
+# box it must be told to use ozone/wayland explicitly).
+_BROWSER_REGISTRY: dict[str, dict] = {
+    "coccoc": {
+        "bins": [
+            str(Path.home() / ".flowkit" / "coccoc-browser" / "browser"),
+            "/opt/coccoc/browser/browser",
+            "coccoc-browser",
+        ],
+        "extra_args": ["--no-sandbox", "--ozone-platform=wayland"],
+    },
+}
+
+
+def _chrome_bin(nick_id: str | None = None) -> str:
+    browser = ""
+    if nick_id:
+        try:
+            from agent.services.accounts import get_account
+            acc = get_account(nick_id)
+            browser = str((acc or {}).get("browser") or "").strip().lower()
+        except Exception:
+            browser = ""
+    if browser:
+        spec = _BROWSER_REGISTRY.get(browser)
+        if spec is None:
+            raise RuntimeError(f"unknown browser {browser!r} for nick {nick_id}")
+        for cand in spec["bins"]:
+            p = Path(cand)
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+            found = shutil.which(cand)
+            if found:
+                return found
+        raise RuntimeError(f"browser {browser!r} configured but no binary found")
     for name in (
         "google-chrome",
         "google-chrome-stable",
@@ -248,6 +291,19 @@ def _chrome_bin() -> str:
         if found:
             return found
     raise RuntimeError("no Chrome/Chromium binary on PATH")
+
+
+def _browser_extra_args(nick_id: str | None = None) -> list[str]:
+    if not nick_id:
+        return []
+    try:
+        from agent.services.accounts import get_account
+        acc = get_account(nick_id)
+        browser = str((acc or {}).get("browser") or "").strip().lower()
+    except Exception:
+        return []
+    spec = _BROWSER_REGISTRY.get(browser)
+    return list(spec["extra_args"]) if spec else []
 
 
 def chrome_data_dir(nick_id: str) -> Path:
@@ -281,13 +337,19 @@ def invalidate_chrome_ps() -> None:
     _PS_CACHE["ts"] = 0.0
 
 
+def _nick_dir_pattern(nick_id: str) -> "re.Pattern":
+    """Match this nick's data dir without prefix collisions — 'nick-a' must
+    not match 'nick-a-dual'. Next char may be end/space/slash, not name chars."""
+    return re.compile(re.escape(str(chrome_data_dir(nick_id))) + r"(?![\w-])")
+
+
 def find_running_chrome_pid(nick_id: str) -> Optional[int]:
     """Find OS PID of an already running Chrome browser for this nick."""
-    data = str(chrome_data_dir(nick_id))
+    pat = _nick_dir_pattern(nick_id)
     try:
         for line in _chrome_ps():
             # Main browser process matches user-data-dir and is not a child worker/renderer
-            if data in line and "--type=" not in line:
+            if pat.search(line) and "--type=" not in line:
                 parts = line.strip().split()
                 if parts and parts[0].isdigit():
                     return int(parts[0])
@@ -310,11 +372,10 @@ def chrome_running(nick_id: str) -> bool:
 
 
 def running_chrome_proxy_port(nick_id: str) -> Optional[int]:
-    import re
-    data = str(chrome_data_dir(nick_id))
+    pat = _nick_dir_pattern(nick_id)
     try:
         for line in _chrome_ps():
-            if data in line and "--proxy-server=http://127.0.0.1:" in line:
+            if pat.search(line) and "--proxy-server=http://127.0.0.1:" in line:
                 m = re.search(r"--proxy-server=http://127\.0\.0\.1:(\d+)", line)
                 if m:
                     return int(m.group(1))
@@ -415,7 +476,7 @@ def _launch_args(
     data.mkdir(parents=True, exist_ok=True)
     extension = extension or str(extension_dir().resolve())
     args = [
-        _chrome_bin(),
+        _chrome_bin(nick_id),
         f"--user-data-dir={data}",
         "--no-first-run",
         "--no-default-browser-check",
@@ -428,6 +489,12 @@ def _launch_args(
         f"--load-extension={extension}",
         "https://flow.google.com/",
     ]
+    # Wayland-only session: Chrome auto-detects X11 via a stale/dead DISPLAY
+    # and dies with "Missing X server or $DISPLAY". Force ozone/wayland when
+    # the wayland socket exists (harmless for Cốc Cốc which sets it anyway).
+    if os.path.exists(f"/run/user/{os.getuid()}/wayland-0") and "--ozone-platform=wayland" not in args:
+        args.insert(1, "--ozone-platform=wayland")
+    args[1:1] = _browser_extra_args(nick_id)
     if proxy_server:
         extra = [f"--proxy-server={proxy_server}"]
         # Do NOT add <-loopback>. Chrome already bypasses 127.0.0.1, so the
@@ -500,12 +567,17 @@ async def launch_nick(nick_id: str) -> dict:
         extension=str(ext_copy),
     )
     env = os.environ.copy()
-    if not env.get("DISPLAY"):
-        env["DISPLAY"] = ":0"
-    if not env.get("WAYLAND_DISPLAY") and os.path.exists(f"/run/user/{os.getuid()}/wayland-0"):
+    wayland_socket = f"/run/user/{os.getuid()}/wayland-0"
+    if os.path.exists(wayland_socket):
         env["WAYLAND_DISPLAY"] = "wayland-0"
-    if not env.get("XDG_RUNTIME_DIR"):
         env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+        # A bogus DISPLAY makes Chrome pick X11 and die on a Wayland-only box.
+        env.pop("DISPLAY", None)
+    else:
+        if not env.get("DISPLAY"):
+            env["DISPLAY"] = ":0"
+        if not env.get("XDG_RUNTIME_DIR"):
+            env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
     err_path = chrome_data_dir(nick_id) / "chrome.stderr.log"
     err_f = open(err_path, "ab")
     try:
@@ -553,12 +625,12 @@ def _pid_is_live(pid: int) -> bool:
 
 def get_all_chrome_pids_for_nick(nick_id: str) -> list[int]:
     """Find ALL Chrome process PIDs (main, renderers, utility, crashpad) for this nick."""
-    data = str(chrome_data_dir(nick_id))
+    pat = _nick_dir_pattern(nick_id)
     pids = []
     try:
         # Kill paths must see the live process list, never a 2s-old snapshot.
         for line in _chrome_ps(force=True):
-            if data in line:
+            if pat.search(line):
                 parts = line.strip().split()
                 if parts and parts[0].isdigit():
                     pids.append(int(parts[0]))

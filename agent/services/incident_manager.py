@@ -145,10 +145,16 @@ class IncidentManager:
             "created_at": now
         }
 
-        logger.warning(
-            "[INCIDENT][%s][%s] %s (job: %s, action: %s)",
-            severity, module, message, job_id or "-", action_taken or "none"
-        )
+        if existing:
+            logger.info(
+                "[INCIDENT][%s][%s] %s (job: %s, action: %s, retry #%d)",
+                severity, module, message, job_id or "-", action_taken or "none", new_retries
+            )
+        else:
+            logger.warning(
+                "[INCIDENT][%s][%s] %s (job: %s, action: %s)",
+                severity, module, message, job_id or "-", action_taken or "none"
+            )
         self._broadcast_event("incident_recorded", inc_data)
         return inc_data
 

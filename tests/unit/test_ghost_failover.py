@@ -617,14 +617,16 @@ class TestWorkerUnusualCircuitBreaker:
                               "['PUBLIC_ERROR_UNUSUAL_ACTIVITY']]]]")}
         return await c._run_on_profile(builder, PA)
 
-    async def test_first_flag_parks_300s_second_escalates(self, mock_flow_client, monkeypatch):
+    async def test_flags_count_strikes_without_parking(self, mock_flow_client, monkeypatch):
+        """UNUSUAL_ACTIVITY rotates the proxy and counts strikes, but the nick
+        stays routable — rotation retries until a request lands."""
         from unittest.mock import MagicMock
         c = mock_flow_client
         ws = attach_worker(c, "nick-a", PA)
-        monkeypatch.setattr("agent.services.proxy_pool.rotate_nick_proxy",
-                            AsyncMock(return_value={"ok": True, "proxy": "http://x:1",
-                                                    "egress_ip": "9.9.9.9",
-                                                    "flow_tab_reloaded": True}))
+        rotate = AsyncMock(return_value={"ok": True, "proxy": "http://x:1",
+                                         "egress_ip": "9.9.9.9",
+                                         "flow_tab_reloaded": True})
+        monkeypatch.setattr("agent.services.proxy_pool.rotate_nick_proxy", rotate)
         audit = MagicMock()
         audit.record_request_dispatched.return_value = {}
         monkeypatch.setattr("agent.services.unusual_audit.get_unusual_audit",
@@ -635,15 +637,14 @@ class TestWorkerUnusualCircuitBreaker:
 
         await self._flag(c, monkeypatch)
         assert c._unusual_strikes["nick-a"] == 1
-        first_until = c._extensions[ws]["unavailable_until"]
-        assert 250 < first_until - time.time() <= 300
+        assert c._extensions[ws].get("unavailable_until", 0) <= time.time()
         incidents.record_incident.assert_not_called()
 
         await self._flag(c, monkeypatch)
         assert c._unusual_strikes["nick-a"] == 2
-        assert c._extensions[ws]["unavailable_until"] - time.time() > 1500
-        incidents.record_incident.assert_called_once()
-        assert incidents.record_incident.call_args.kwargs["error_code"] == "ACCOUNT_SESSION_FLAGGED"
+        assert c._extensions[ws].get("unavailable_until", 0) <= time.time()
+        incidents.record_incident.assert_not_called()
+        assert rotate.await_count == 2
 
     async def test_success_resets_strikes(self, mock_flow_client, monkeypatch):
         from unittest.mock import MagicMock

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -14,7 +15,7 @@ from agent.config import BASE_DIR
 from agent.services.accounts import get_account, upsert_account
 from agent.services.chrome_nicks import get_bridge
 from agent.services.proxy_url import parse_proxy_url
-from agent.services.surfshark import bind_nick_proxy, is_surfshark_url, probe_egress
+from agent.services.surfshark import bind_nick_proxy, is_surfshark_url, owner_id, probe_egress
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,7 @@ async def rotate_nick_proxy(
     preflight: bool = True,
     accounts_path: Path | None = None,
     target_proxy: str | None = None,
+    wait_s: float = 0,
 ) -> dict:
     # Watchdog uses its own event loop; browser sockets and bridges belong to
     # the API loop. Move the whole mutation there before taking a nick lock.
@@ -194,13 +196,29 @@ async def rotate_nick_proxy(
     loop = get_flow_client()._event_loop
     if loop and loop.is_running() and loop is not asyncio.get_running_loop():
         task = asyncio.run_coroutine_threadsafe(
-            rotate_nick_proxy(nick_id, path, preflight, accounts_path, target_proxy), loop)
+            rotate_nick_proxy(nick_id, path, preflight, accounts_path, target_proxy, wait_s), loop)
         return await asyncio.wrap_future(task)
     # Watchdog and API run on different threads/event loops. Never use a
     # process-global asyncio.Lock here; a concurrent rotation fails promptly.
     with _ROTATION_GUARD:
         lock = _ROTATION_LOCKS.setdefault(nick_id, threading.Lock())
     if not lock.acquire(blocking=False):
+        # Piggyback: another rotation is already installing a fresh IP on this
+        # nick — wait for it and reuse the result instead of failing the
+        # request (which used to surface as ROTATION_IN_PROGRESS) or rotating
+        # twice back-to-back.
+        if wait_s > 0:
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                if lock.acquire(blocking=False):
+                    lock.release()
+                    acc = get_account(nick_id, path=accounts_path)
+                    return {
+                        "ok": True, "nick_id": nick_id, "piggybacked": True,
+                        "proxy": (acc or {}).get("proxy_url"),
+                        "egress_ip": (acc or {}).get("last_egress_ip"),
+                    }
         return {"ok": False, "error": "ROTATION_IN_PROGRESS", "nick_id": nick_id}
     try:
         return await _rotate_nick_proxy(nick_id, path, preflight, accounts_path, target_proxy)
@@ -226,21 +244,44 @@ async def _rotate_nick_proxy(
     if is_surfshark_url(current_url) and target_proxy and not is_surfshark_url(target_proxy):
         return {"ok": False, "error": "EXCLUSIVE_EGRESS_REQUIRED: target must use the nick IP allocator"}
     if is_surfshark_url(next_url or current_url):
-        from agent.services.proxy_checker import check_single_proxy
-        session = uuid.uuid4().hex
-        next_url = bind_nick_proxy(next_url or current_url, nick_id, session=session)
-        prepared = bind_nick_proxy(next_url, nick_id, prepare=True)
-        try:
-            # Preparing reserves a unique candidate without moving the live
-            # nick. IP verification is mandatory even if preflight=False.
-            candidate_ip = await asyncio.to_thread(probe_egress, prepared)
-            check = await asyncio.to_thread(check_single_proxy, prepared, timeout=8)
-            if check.get("status") != "CLEAN" or not check.get("labs_accessible"):
-                return {"ok": False, "error": "PROXY_PREFLIGHT_FAILED", "status": check.get("status")}
-            egress_ip = candidate_ip
-        except Exception as exc:
-            logger.warning("Unique IP rotation unavailable for %s: %s", nick_id, type(exc).__name__)
-            return {"ok": False, "error": "NO_VERIFIED_DISTINCT_EGRESS", "nick_id": nick_id}
+        from agent.services.proxy_checker import check_single_proxy, is_ip_burned
+        base_url = next_url or current_url
+        last_status = None
+        saw_draw_exception = False
+        # Draw up to 3 fresh sessions: skip egress IPs that already took a
+        # UNUSUAL_ACTIVITY strike, and redraw when a candidate fails preflight
+        # instead of failing the whole rotation on one bad draw.
+        for _draw in range(3):
+            # Fresh owner per draw: the gateway leases egress IPs per owner,
+            # so rotating only sessid redraws the SAME burned IP every time.
+            owner_override = f"{owner_id(nick_id)}r{uuid.uuid4().hex[:8]}"
+            candidate_url = bind_nick_proxy(
+                base_url, nick_id, session=uuid.uuid4().hex,
+                owner_override=owner_override)
+            prepared = bind_nick_proxy(candidate_url, nick_id, prepare=True,
+                                       owner_override=owner_override)
+            try:
+                # Preparing reserves a unique candidate without moving the live
+                # nick. IP verification is mandatory even if preflight=False.
+                candidate_ip = await asyncio.to_thread(probe_egress, prepared)
+                if is_ip_burned(candidate_ip):
+                    logger.warning("Redraw for %s: candidate egress %s is burned; drawing new session", nick_id, candidate_ip)
+                    continue
+                check = await asyncio.to_thread(check_single_proxy, prepared, timeout=8)
+                last_status = check.get("status")
+                if check.get("status") != "CLEAN" or not check.get("labs_accessible"):
+                    logger.warning("Pre-flight rejected new session for %s: %s; drawing another", nick_id, check.get("status"))
+                    continue
+                next_url = candidate_url
+                egress_ip = candidate_ip
+                break
+            except Exception as exc:
+                saw_draw_exception = True
+                logger.warning("Unique IP draw failed for %s: %s", nick_id, type(exc).__name__)
+        if egress_ip is None:
+            if saw_draw_exception and last_status is None:
+                return {"ok": False, "error": "NO_VERIFIED_DISTINCT_EGRESS", "nick_id": nick_id}
+            return {"ok": False, "error": "PROXY_PREFLIGHT_FAILED", "status": last_status}
 
     if not next_url:
         pool = load_proxy_pool(path)
@@ -305,6 +346,8 @@ async def _rotate_nick_proxy(
 
 async def _apply_nick_proxy(account, nick_id, next_url, accounts_path, egress_ip):
     account["proxy_url"] = next_url
+    if egress_ip:
+        account["last_egress_ip"] = egress_ip
     upsert_account(account, path=accounts_path)
 
     parsed = parse_proxy_url(next_url)

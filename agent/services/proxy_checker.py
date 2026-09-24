@@ -5,6 +5,7 @@ and Google Labs availability BEFORE assigning the proxy to any Chrome worker.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import threading
@@ -280,6 +281,71 @@ def get_lifecycle_summary() -> dict:
             "quarantined_count": len(quarantined),
             "quarantined_proxies": quarantined,
         }
+
+
+# ─── Burned egress-IP registry ───────────────────────────────────────────────
+# Quarantine tracks proxy *URLs*, but a Surfshark sessid draw can land on an IP
+# that already took a UNUSUAL_ACTIVITY strike under a different sessid. Remember
+# flagged egress IPs so rotation can redraw instead of paying another strike.
+
+BURNED_IPS_FILE = Path(__file__).resolve().parent.parent / "proxy_burned_ips.json"
+BURNED_IP_TTL_S = 12 * 3600
+# DEAD_PROXY_SUBNET is the largest strike bucket (~25%): residential providers
+# serve IPs in /24 blocks, and Google flags whole subnets — a fresh sessid
+# landing in a burned /24 is burned too even if that exact IP is unseen.
+BURNED_SUBNET_MIN = 2
+
+
+def _ip_subnet24(ip: str) -> str | None:
+    try:
+        addr = ipaddress.ip_address(ip)
+        if addr.version != 4:
+            return None
+        return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+    except ValueError:
+        return None
+
+
+def _load_burned_ips() -> dict:
+    try:
+        data = json.loads(BURNED_IPS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    now = time.time()
+    return {ip: meta for ip, meta in data.items() if now - meta.get("burned_at", 0) < BURNED_IP_TTL_S}
+
+
+def mark_ip_burned(ip: str, nick_id: str = "", reason: str = "PUBLIC_ERROR_UNUSUAL_ACTIVITY") -> None:
+    if not ip:
+        return
+    burned = _load_burned_ips()
+    burned[ip] = {
+        "burned_at": time.time(),
+        "nick_id": nick_id,
+        "reason": reason,
+        "subnet": _ip_subnet24(ip),
+    }
+    try:
+        BURNED_IPS_FILE.write_text(json.dumps(burned, indent=1), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to save burned IP state: %s", exc)
+    logger.warning("🔥 [BURNED IP] Egress %s marked burned (nick=%s)", ip, nick_id)
+
+
+def is_ip_burned(ip: str) -> bool:
+    if not ip:
+        return False
+    burned = _load_burned_ips()
+    if ip in burned:
+        return True
+    subnet = _ip_subnet24(ip)
+    if not subnet:
+        return False
+    same_subnet = sum(
+        1 for bip, meta in burned.items()
+        if (meta.get("subnet") or _ip_subnet24(bip)) == subnet
+    )
+    return same_subnet >= BURNED_SUBNET_MIN
 
 
 def run_revival_cycle(probe_interval: int = 300) -> dict:

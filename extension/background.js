@@ -587,6 +587,9 @@ function connectToAgent() {
         const result = await flowGate.resume(msg.params?.leaseId, async () =>
           msg.params?.reload ? reloadFlowTab() : { ok: true });
         sendToAgent({ id: msg.id, result });
+      } else if (msg.method === 'flow_tab_health') {
+        const result = await flowTabHealth();
+        sendToAgent({ id: msg.id, result });
       } else if (msg.method === 'reload_flow_tab') {
         await handleReloadFlowTab(msg);
       } else if (msg.method === 'focus_flow_tab') {
@@ -623,9 +626,12 @@ function connectToAgent() {
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     setState('off');
     chrome.alarms.clear('token-refresh');
+    // 4001 = server closed this socket as a duplicate session for the same
+    // profile. Reconnecting would just evict the survivor — stay dead.
+    if (event && event.code === 4001) return;
     if (!manualDisconnect) scheduleReconnect();
   };
 
@@ -879,6 +885,42 @@ async function handleSolveCaptcha(msg) {
   sendToAgent({ id, result });
 }
 
+// Lightweight probe: is the Flow page actually alive (content bridge answers
+// and holds a documentId)? A grey/hung tab keeps the WS alive but cannot mint
+// or submit — this is the signal the minter watchdog needs.
+async function flowTabHealth() {
+  try {
+    const tabs = await chrome.tabs.query({ url: flowUrls });
+    const live = tabs.filter(t => !t.discarded && t.url &&
+      !t.url.startsWith('chrome-error://') && !t.url.includes('chromewebdata'));
+    if (!live.length) return { alive: false, reason: 'NO_FLOW_TAB' };
+    for (const t of live) {
+      try {
+        const page = await chrome.tabs.sendMessage(t.id,
+          { type: 'FLOW_PAGE_STATUS', requestId: `hl-${Date.now()}` });
+        if (page && page.documentId) {
+          return {
+            alive: true, tab_id: t.id, url: t.url,
+            page_state: page.page_state || null,
+            title: page.title || null,
+            app_ready: page.ready === true,
+          };
+        }
+        return {
+          alive: false, reason: 'NO_DOCUMENT_ID', url: t.url,
+          page_state: page?.page_state || null,
+          title: page?.title || null,
+        };
+      } catch (e) {
+        return { alive: false, reason: 'PAGE_UNRESPONSIVE', error: String(e?.message || e), url: t.url };
+      }
+    }
+    return { alive: false, reason: 'NO_FLOW_TAB' };
+  } catch (e) {
+    return { alive: false, reason: 'PROBE_ERROR', error: String(e?.message || e) };
+  }
+}
+
 async function handleReloadFlowTab(msg) {
   const { id } = msg;
   try {
@@ -985,7 +1027,14 @@ async function runBatchRpc(cmd) {
 
   let freq = cmd.freq;
   let documentId = null;
-  if (cmd.captchaAction) {
+  if (cmd.captchaToken) {
+    // Solver-minted token: no in-page mint, but the anti-replay gate still
+    // needs this page's documentId — read it via the status bridge.
+    const page = await chrome.tabs.sendMessage(tab.id, { type: 'FLOW_PAGE_STATUS', requestId: `st-${cmd.id}` });
+    if (!page?.documentId) return { error: 'FLOW_DOCUMENT_NOT_SUBMITTED' };
+    documentId = page.documentId;
+    freq = freq.split(CAPTCHA_SLOT).join(cmd.captchaToken);
+  } else if (cmd.captchaAction) {
     const solved = await solveCaptcha(cmd.id, cmd.captchaAction, tab.id);
     if (!solved?.token) return { error: `CAPTCHA_FAILED: ${solved?.error || 'no token'}` };
     if (!solved.documentId) return { error: 'FLOW_DOCUMENT_NOT_SUBMITTED' };
@@ -1040,7 +1089,7 @@ async function runBatchRpc(cmd) {
 
 async function handleBatchRpc(msg) {
   const { id, params } = msg;
-  const { rpcid, freq, captchaAction, match, path } = params || {};
+  const { rpcid, freq, captchaAction, captchaToken, match, path } = params || {};
   if (!rpcid || !freq) {
     sendToAgent({ id, status: 400, error: 'INVALID_BATCH_RPC' });
     return;
@@ -1061,7 +1110,7 @@ async function handleBatchRpc(msg) {
   }
 
   try {
-    const out = await runBatchRpc({ id, rpcid, freq, captchaAction, match, path, expiresAt: msg.expiresAt });
+    const out = await runBatchRpc({ id, rpcid, freq, captchaAction, captchaToken, match, path, expiresAt: msg.expiresAt });
     if (out.error) {
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = out.error; }
       if (visible) updateRequestLog(id, { status: 'failed', error: out.error });
