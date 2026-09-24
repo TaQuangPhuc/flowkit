@@ -256,6 +256,36 @@ _BROWSER_REGISTRY: dict[str, dict] = {
         ],
         "extra_args": ["--no-sandbox", "--ozone-platform=wayland"],
     },
+    # Chromium variants — same extension, different UA-brand/device profile.
+    # Sessions logged in on these register as different devices to Google
+    # (distinct from the Chrome-clone pattern), so a fresh login here is a
+    # genuinely new session, not a copied one. Note: cookie encryption is
+    # per-vendor — a Chrome profile moved to Edge reads as signed-out; these
+    # entries are for fresh logins, not profile migration.
+    "edge": {
+        "bins": [
+            "microsoft-edge-stable",
+            "microsoft-edge",
+            "/opt/microsoft/msedge/msedge",
+        ],
+        "extra_args": [],
+    },
+    "brave": {
+        "bins": [
+            "brave-browser",
+            "brave",
+            "/opt/brave.com/brave/brave",
+        ],
+        "extra_args": [],
+    },
+    "vivaldi": {
+        "bins": [
+            "vivaldi-stable",
+            "vivaldi",
+            "/opt/vivaldi/vivaldi",
+        ],
+        "extra_args": [],
+    },
 }
 
 
