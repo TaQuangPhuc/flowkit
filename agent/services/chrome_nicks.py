@@ -367,10 +367,35 @@ def invalidate_chrome_ps() -> None:
     _PS_CACHE["ts"] = 0.0
 
 
+def _is_gologin(account: Optional[dict]) -> bool:
+    return str((account or {}).get("browser") or "").strip().lower() == "gologin"
+
+
 def _nick_dir_pattern(nick_id: str) -> "re.Pattern":
     """Match this nick's data dir without prefix collisions — 'nick-a' must
     not match 'nick-a-dual'. Next char may be end/space/slash, not name chars."""
+    try:
+        if _is_gologin(get_account(nick_id)):
+            from agent.services.gologin_service import gologin_ps_marker
+            return re.compile(re.escape(gologin_ps_marker(nick_id)) + r"(?![\w-])")
+    except Exception:
+        pass
     return re.compile(re.escape(str(chrome_data_dir(nick_id))) + r"(?![\w-])")
+
+
+def _nick_lock_dir(nick_id: str) -> Path:
+    """Profile dir holding the singleton lock — the gologin profile dir for
+    orbita nicks, the Chrome user-data-dir otherwise."""
+    try:
+        acc = get_account(nick_id)
+        if _is_gologin(acc):
+            from agent.services.gologin_service import nick_profile_id, profile_dir
+            pid = nick_profile_id(acc or {})
+            if pid:
+                return profile_dir(pid)
+    except Exception:
+        pass
+    return chrome_data_dir(nick_id)
 
 
 def find_running_chrome_pid(nick_id: str) -> Optional[int]:
@@ -541,7 +566,7 @@ async def launch_nick(nick_id: str) -> dict:
         raise KeyError(nick_id)
     if chrome_running(nick_id):
         existing_pid = _procs[nick_id].pid if nick_id in _procs else find_running_chrome_pid(nick_id)
-        if account.get("proxy_url"):
+        if account.get("proxy_url") and not _is_gologin(account):
             try:
                 parsed = parse_proxy_url(account["proxy_url"])
                 if parsed.has_auth:
@@ -555,6 +580,10 @@ async def launch_nick(nick_id: str) -> dict:
             "pid": existing_pid,
             "data_dir": str(chrome_data_dir(nick_id)),
         }
+
+    if _is_gologin(account):
+        from agent.services import gologin_service
+        return await gologin_service.launch(nick_id, account)
 
     proxy_server = None
     proxy_display = ""
@@ -700,7 +729,7 @@ def cleanup_orphaned_chrome(nick_id: str, force: bool = False) -> int:
     """Detect and clean up orphaned or stuck Chrome processes for this nick."""
     pids = get_all_chrome_pids_for_nick(nick_id)
     if not pids:
-        drop_stale_chrome_lock(chrome_data_dir(nick_id), force=force)
+        drop_stale_chrome_lock(_nick_lock_dir(nick_id), force=force)
         return 0
 
     killed = 0
@@ -720,7 +749,7 @@ def cleanup_orphaned_chrome(nick_id: str, force: bool = False) -> int:
                 pass
 
     _procs.pop(nick_id, None)
-    drop_stale_chrome_lock(chrome_data_dir(nick_id), force=True)
+    drop_stale_chrome_lock(_nick_lock_dir(nick_id), force=True)
     logger.info("Cleaned up %d orphaned Chrome processes for nick=%s", killed, nick_id)
     return killed
 
@@ -754,7 +783,7 @@ async def stop_nick(nick_id: str) -> bool:
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
 
-    drop_stale_chrome_lock(chrome_data_dir(nick_id), force=True)
+    drop_stale_chrome_lock(_nick_lock_dir(nick_id), force=True)
     await stop_bridge(nick_id)
     invalidate_chrome_ps()
     return stopped
@@ -771,7 +800,8 @@ async def ensure_nick_active(nick_id: str) -> dict:
         raise KeyError(nick_id)
 
     # 1. Restore/ensure bridge first so Chrome never encounters ERR_PROXY_CONNECTION_FAILED
-    if account.get("proxy_url"):
+    #    (gologin nicks carry their proxy on the orbita profile — no bridge)
+    if account.get("proxy_url") and not _is_gologin(account):
         try:
             parsed = parse_proxy_url(account["proxy_url"])
             if parsed.has_auth:
@@ -793,7 +823,7 @@ async def ensure_nick_active(nick_id: str) -> dict:
         }
 
     # 3. Clean any orphaned lockfiles and launch Chrome
-    drop_stale_chrome_lock(chrome_data_dir(nick_id), force=True)
+    drop_stale_chrome_lock(_nick_lock_dir(nick_id), force=True)
     return await launch_nick(nick_id)
 
 
