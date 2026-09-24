@@ -52,7 +52,7 @@ def _normalize(row: dict, *, require_id: bool = True) -> dict:
     if proxy:
         parse_proxy_url(proxy)
         proxy = bind_nick_proxy(proxy, nick_id)
-    return {
+    normalized = {
         "id": nick_id,
         "label": str(row.get("label") or nick_id).strip() or nick_id,
         "project_id": project,
@@ -66,6 +66,12 @@ def _normalize(row: dict, *, require_id: bool = True) -> dict:
         # Empty = default Google Chrome.
         "browser": str(row.get("browser") or "").strip(),
     }
+    # Preserve extension fields (clone_of, clone_ts, ...) — a fixed whitelist
+    # silently stripped lineage and made the clone depth cap read clone_of
+    # as None forever.
+    for key, value in row.items():
+        normalized.setdefault(key, value)
+    return normalized
 
 
 @_locked

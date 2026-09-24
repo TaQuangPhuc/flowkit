@@ -2945,7 +2945,7 @@ class FlowClient:
         app_ready; on timeout releases anyway — the strike path still
         catches a genuinely dead tab.
         """
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + 1800
         try:
             while time.monotonic() < deadline:
                 session = self._extensions.get(ws)
@@ -2965,10 +2965,20 @@ class FlowClient:
                 state = res.get("page_state")
                 if state == "app_ready" or (state is None and res.get("alive")):
                     session["warming_until"] = 0
+                    session.pop("signed_out", None)
                     _ledger.record_event("EXT_WARMED", nick=sid,
                                          detail={"page_state": state})
                     return
-                await asyncio.sleep(8)
+                if state == "signed_out" and not session.get("signed_out"):
+                    session["signed_out"] = True
+                    _ledger.record_event("SIGNED_OUT", nick=sid,
+                                         detail={"via": "warm_probe"})
+                # Anything that isn't app_ready — signed_out, unusual_wall,
+                # loading, dead tab — keeps the gate closed while we probe.
+                # A tab that can't serve work shouldn't take requests just
+                # because the initial warm window elapsed.
+                session["warming_until"] = time.time() + 45
+                await asyncio.sleep(15)
             if ws in self._extensions:
                 self._extensions[ws]["warming_until"] = 0
         finally:
