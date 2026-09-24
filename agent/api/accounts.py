@@ -358,8 +358,26 @@ async def diagnose_fleet(hours: float = 24.0):
     from agent.services.request_ledger import recent_events
     global_events = [e for e in recent_events(hours=hours, limit=300)
                      if not e.get("nick")]
+    # Routability roll-up: who can serve now, who can't, and why — so
+    # "how much of the fleet is actually working" is one read, not N.
+    gate_counts: dict[str, int] = {}
+    blocked: dict[str, str] = {}
+    serving: list[str] = []
+    for r in reports:
+        st = r.get("state") or {}
+        g = st.get("gate")
+        if g is None:
+            continue
+        gate_counts[g] = gate_counts.get(g, 0) + 1
+        if st.get("routable"):
+            serving.append(r.get("nick"))
+        else:
+            blocked[r.get("nick")] = g
     return {
         "hours": hours,
+        "serving": serving,
+        "blocked": blocked,
+        "gate_counts": gate_counts,
         "nicks": reports,
         "global_events": global_events,
     }

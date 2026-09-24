@@ -743,10 +743,10 @@ class FlowClient:
         now = time.time()
         from agent.services.accounts import get_account
         acc = get_account(nick) or {}
-        session = next(
-            (s for s in self._extensions.values()
+        ws, session = next(
+            ((w, s) for w, s in self._extensions.items()
              if s.get("profile_id") == nick),
-            None,
+            (None, None),
         )
 
         # ---- live state -------------------------------------------------
@@ -769,6 +769,8 @@ class FlowClient:
         }
         parked_until = float((session or {}).get("unavailable_until") or 0)
         state["parked_for_s"] = round(max(0.0, parked_until - now), 1)
+        warm_until = float((session or {}).get("warming_until") or 0)
+        state["warming_for_s"] = round(max(0.0, warm_until - now), 1)
 
         # hold-out check mirrors _profile_candidates
         decay = _UNUSUAL_FLAG_DECAY_S << min(self._flag_depth.get(nick, 0), 4)
@@ -813,6 +815,43 @@ class FlowClient:
             except Exception:
                 pass
 
+        # ---- routability verdict -----------------------------------------
+        # The one-word reason this nick is not serving right now, plus the
+        # remedy — same priority order the router applies.
+        pstate_now = state.get("page_state")
+        gate, remedy = "none", "serving"
+        if not acc:
+            gate, remedy = "no_account", "re-add account row (pins here get dropped)"
+        elif not state["enabled"]:
+            gate, remedy = "disabled", "re-login + re-enable"
+        elif state["mint_only"]:
+            gate, remedy = "mint_only", "gen jobs never route here by design"
+        elif not state["connected"]:
+            gate, remedy = "not_connected", "launch Chrome / check WS"
+        elif state["session_terminal"]:
+            gate, remedy = "terminal", "re-login or clone if lineage allows"
+        elif state["canary_pending"]:
+            gate, remedy = "canary", "wait for probe result"
+        elif state["holdout"]:
+            gate, remedy = "holdout", f"lifts in ~{int(state.get('holdout_lifts_in_s') or 0)}s; canary decides"
+        elif pstate_now == "signed_out":
+            gate, remedy = "signed_out", "re-login — a clone inherits dead cookies"
+        elif pstate_now == "unusual_wall":
+            gate, remedy = "unusual_wall", "rotate IP / clone if depth allows"
+        elif pstate_now in ("error_page", "unknown"):
+            gate, remedy = "error_page", "auto-reload runs (≤3 tries)"
+        elif quar:
+            gate, remedy = "proxy_quarantine", "wait for cooldown or rotate"
+        elif state["warming_for_s"] > 0:
+            gate, remedy = "warming", "warm probe running; auto-releases on app_ready"
+        elif state["parked_for_s"] > 0:
+            gate, remedy = "parked", f"lifts in {int(state['parked_for_s'])}s"
+        elif self._model_denied.get(nick, 0) > now:
+            gate, remedy = "model_denied_video", "video jobs blocked; images/polls still route"
+        state["gate"] = gate
+        state["remedy"] = remedy
+        state["routable"] = gate == "none"
+
         # ---- ledger pull -------------------------------------------------
         outcomes = _ledger.recent_outcomes(nick=nick, hours=hours, limit=500)
         events = _ledger.recent_events(hours=hours, nick=nick, limit=100)
@@ -829,6 +868,8 @@ class FlowClient:
 
         # ---- findings ----------------------------------------------------
         findings: list[str] = []
+        if gate != "none":
+            findings.append(f"⛔ GATE: {gate} — {remedy}")
         if not acc:
             findings.append("Không có account row — pin/request vào nick này sẽ được drop (ghost pin)")
         elif not state["enabled"]:
