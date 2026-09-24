@@ -161,7 +161,8 @@ def record_outcome(nick: str | None, ok: bool, latency_ms: int = 0,
 # identical rows per hour drown the signal. Cap them at one row per
 # kind+nick per 60s; rare kinds always write.
 _NOISY_KINDS = {"ROUTE_EMPTY", "ROUTE_ALL_PARKED", "BIND_FAIL", "NO_AT_TOKEN",
-                "WS_DUP_RESOLVED", "EXT_CONNECT", "EXT_DISCONNECT"}
+                "WS_DUP_RESOLVED", "EXT_CONNECT", "EXT_DISCONNECT",
+                "PINNED_WALLED", "PINNED_PARKED"}
 _NOISY_WINDOW_S = 60.0
 _last_noisy: dict[tuple, float] = {}
 _NOISY_MAX_KEYS = 5000

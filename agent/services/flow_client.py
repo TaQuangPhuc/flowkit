@@ -1154,6 +1154,61 @@ class FlowClient:
                 pid = ""
             return await builder(pid)
 
+        # A pinned call has exactly one legal target — and dispatching into a
+        # warming/parked/walled tab only spends a poll and logs another
+        # NO_AT_TOKEN (yousef-dual dripped 1-2/min for 4h this way). Walled
+        # states fail fast with a retryable 503; transient gates get the same
+        # in-band hold as the unpinned parked path.
+        if pin and candidates and not candidates[0].get("available"):
+            sess = self._extensions.get(candidates[0]["ws"]) or {}
+            state = sess.get("page_state")
+            if (state in ("signed_out", "unusual_wall")
+                    or pin in self._session_terminal or sess.get("signed_out")):
+                _ledger.record_event("PINNED_WALLED", nick=pin, detail={
+                    "page_state": state,
+                    "media": bool(media_ids),
+                    "operation": bool(operation_id),
+                })
+                return {
+                    "status": 503, "retryable": True,
+                    "error_code": "pinned_worker_walled",
+                    "retry_after_s": 300,
+                    "error": (
+                        f"PINNED_WORKER_WALLED: profile {pin} is "
+                        f"{state or 'terminal'} — pinned work waits for repair"
+                    ),
+                }
+            lift = max(float(sess.get("warming_until") or 0),
+                       float(sess.get("unavailable_until") or 0))
+            wait_s = lift - time.time()
+            if wait_s > 0:
+                deadline = time.time() + min(wait_s, _config.PARKED_WAIT_S) + 1.5
+                while time.time() < deadline:
+                    await asyncio.sleep(min(2.0, deadline - time.time()))
+                    _, candidates = self._profile_candidates(
+                        project_id=requested_project,
+                        profile_id=profile_id,
+                        media_ids=media_ids,
+                        operation_id=operation_id,
+                        video_submission=video_submission,
+                    )
+                    if candidates and candidates[0].get("available"):
+                        break
+            if not (candidates and candidates[0].get("available")):
+                _ledger.record_event("PINNED_PARKED", nick=pin, detail={
+                    "waited_s": round(time.time() - (lift - wait_s)),
+                    "page_state": state,
+                })
+                return {
+                    "status": 503, "retryable": True,
+                    "error_code": "pinned_worker_unavailable",
+                    "retry_after_s": 60,
+                    "error": (
+                        f"PINNED_WORKER_UNAVAILABLE: profile {pin} still gated "
+                        "after the wait window — retry shortly"
+                    ),
+                }
+
         # Every unpinned candidate parked means each nick just failed auth or
         # sits on a quarantined proxy. If the soonest park lifts within
         # PARKED_WAIT_S, hold the request in-band and re-check — a slow
