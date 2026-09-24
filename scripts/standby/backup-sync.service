@@ -1,0 +1,10 @@
+[Unit]
+Description=Pull FlowKit state from the main PC (standby sync)
+
+[Service]
+Type=oneshot
+Environment=MAIN_HOST=flowkit-main
+Environment=MAIN_HOME=/home/pc
+ExecStart=%h/flowkit/scripts/standby/backup-sync.sh
+Nice=19
+IOSchedulingClass=idle

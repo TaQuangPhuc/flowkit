@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic FlowKit standby sync from main PC
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

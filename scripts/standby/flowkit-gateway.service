@@ -1,0 +1,16 @@
+[Unit]
+Description=Surfshark OVPN Proxy Gateway for FlowKit (standby, no netns)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/flowkit/gateway
+EnvironmentFile=%h/flowkit/gateway/config.env
+ExecStart=%h/flowkit/gateway/gateway
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
