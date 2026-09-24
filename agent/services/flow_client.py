@@ -168,6 +168,9 @@ class FlowClient:
         self._session_terminal: dict[str, float] = {}
         # Auto-clone dedupe: one clone attempt per terminal nick per boot.
         self._clone_pending: set[str] = set()
+        # nick → monotonic time a warm probe last saw app_ready. Distinguishes
+        # a session Google revoked mid-watch from a clone that was born dead.
+        self._ready_seen: dict[str, float] = {}
         # Canary probe: when a hold-out window elapses we fire one cheap RPC
         # before re-admitting real traffic, so a still-flagged session eats a
         # synthetic request instead of a paying one.
@@ -2802,6 +2805,12 @@ class FlowClient:
             if not acc:
                 return None
 
+            # Parent's live page state at spawn time — if the clone is born
+            # dead later, this tells whether we copied a corpse.
+            parent_state = next(
+                (s.get("page_state") for s in self._extensions.values()
+                 if s.get("profile_id") == sid), None)
+
             # Clone id: base-<dual|dual-N>, first free.
             base = re.sub(r"-dual(?:-\d+)?$", "", sid)
             existing = {a.get("id") for a in load_accounts()}
@@ -2889,6 +2898,8 @@ class FlowClient:
 
             _ledger.record_event("CLONE_SPAWNED", nick=clone_id, detail={
                 "from": sid, "country": country,
+                "parent_state": parent_state,
+                "mode": "terminal" if source_retires else "capacity",
                 "proxy": row["proxy_url"][:80],
             })
             logger.warning(
@@ -3011,13 +3022,16 @@ class FlowClient:
                 if state == "app_ready" or (state is None and res.get("alive")):
                     session["warming_until"] = 0
                     session.pop("signed_out", None)
+                    self._ready_seen[sid] = time.time()
                     _ledger.record_event("EXT_WARMED", nick=sid,
                                          detail={"page_state": state})
                     return
                 if state == "signed_out" and not session.get("signed_out"):
                     session["signed_out"] = True
-                    _ledger.record_event("SIGNED_OUT", nick=sid,
-                                         detail={"via": "warm_probe"})
+                    _ledger.record_event("SIGNED_OUT", nick=sid, detail={
+                        "via": "warm_probe",
+                        "cause": self._signed_out_cause(sid),
+                    })
                 # Anything that isn't app_ready — signed_out, unusual_wall,
                 # loading, dead tab — keeps the gate closed while we probe.
                 # A tab that can't serve work shouldn't take requests just
@@ -3030,6 +3044,45 @@ class FlowClient:
             session = self._extensions.get(ws)
             if session is not None:
                 session.pop("warm_task", None)
+
+    def _signed_out_cause(self, sid: str) -> dict:
+        """Classify WHY a nick is signed_out, from evidence the kernel has.
+
+        revoked_while_watching — warm probe saw app_ready on this boot, then
+            the page flipped signed_out: Google killed the live session
+            (concurrent-instance invalidation or forced expiry).
+        revoked_after_idle — never ready on this boot, but the ledger shows
+            successful work: session died while the nick was parked/offline.
+        born_dead — never ready, never worked: the profile was cloned from
+            (or restored into) an already-dead session.
+        """
+        ready_at = self._ready_seen.get(sid)
+        last_ok = None
+        try:
+            oks = [o["ts"] for o in _ledger.recent_outcomes(
+                nick=sid, hours=72, limit=300) if o["ok"]]
+            last_ok = max(oks) if oks else None
+        except Exception:
+            pass
+        base = re.sub(r"-dual(?:-\d+)?$", "", sid)
+        siblings = sorted({
+            s.get("profile_id") for s in self._extensions.values()
+            if s.get("profile_id") and s["profile_id"] != sid
+            and re.sub(r"-dual(?:-\d+)?$", "", s["profile_id"]) == base
+        } - {None})
+        if ready_at:
+            kind = "revoked_while_watching"
+        elif last_ok:
+            kind = "revoked_after_idle"
+        else:
+            kind = "born_dead"
+        now = time.time()
+        return {
+            "kind": kind,
+            "ready_ago_s": int(now - ready_at) if ready_at else None,
+            "last_ok_ago_s": int(now - last_ok) if last_ok else None,
+            "siblings_alive": siblings,
+        }
 
     async def _resolve_dup_ws(self, incumbent_ws, new_ws, profile_id: str) -> None:
         """Two sockets claim one profile — keep whichever actually answers.
