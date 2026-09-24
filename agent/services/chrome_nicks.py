@@ -372,15 +372,18 @@ def _is_gologin(account: Optional[dict]) -> bool:
 
 
 def _nick_dir_pattern(nick_id: str) -> "re.Pattern":
-    """Match this nick's data dir without prefix collisions — 'nick-a' must
-    not match 'nick-a-dual'. Next char may be end/space/slash, not name chars."""
+    """Match this nick's browser processes without prefix collisions —
+    'nick-a' must not match 'nick-a-dual'. Gologin nicks match BOTH the
+    --gologin-profile marker and the legacy chrome dir, so a browser flip
+    doesn't orphan the previous Chrome."""
+    pats = [re.escape(str(chrome_data_dir(nick_id)))]
     try:
         if _is_gologin(get_account(nick_id)):
             from agent.services.gologin_service import gologin_ps_marker
-            return re.compile(re.escape(gologin_ps_marker(nick_id)) + r"(?![\w-])")
+            pats.append(re.escape(gologin_ps_marker(nick_id)))
     except Exception:
         pass
-    return re.compile(re.escape(str(chrome_data_dir(nick_id))) + r"(?![\w-])")
+    return re.compile(r"(?:" + "|".join(pats) + r")(?![\w-])")
 
 
 def _nick_lock_dir(nick_id: str) -> Path:
