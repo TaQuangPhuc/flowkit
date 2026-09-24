@@ -321,6 +321,24 @@ async def diagnose_nick_endpoint(nick_id: str, hours: float = 24.0):
     return await get_flow_client().diagnose_nick(nick_id, hours=hours)
 
 
+@router.post("/{nick_id}/clone")
+async def clone_nick_endpoint(nick_id: str):
+    """Capacity clone: copy this nick's live session onto a fresh proxy IP.
+
+    The source is stopped briefly for a consistent profile copy, then
+    relaunched — both instances end up serving the same Google account.
+    Refuses signed-out sessions (a clone inherits dead cookies) and the
+    lineage depth cap.
+    """
+    if get_account(nick_id) is None:
+        raise HTTPException(404, f"unknown account {nick_id}")
+    res = await get_flow_client().clone_nick(nick_id)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "clone failed"))
+    _reload_router()
+    return res
+
+
 @router.get("/diagnose")
 async def diagnose_fleet(hours: float = 24.0):
     """Fleet-level 'why': per-nick findings for every known nick."""

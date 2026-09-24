@@ -2753,9 +2753,43 @@ class FlowClient:
             self._clone_pending.discard(sid)
 
     async def _clone_terminal_nick(self, sid: str) -> None:
-        """Clone a terminal nick: stop original → copy profile → fresh proxy
-        IP → new account row → launch → remap media/operation pins onto the
-        clone (same Google account, so pinned work still resolves).
+        """Terminal clone wrapper — the source retires (disabled + pins
+        remapped onto the clone)."""
+        try:
+            await self._clone_nick(sid, source_retires=True)
+        finally:
+            self._clone_pending.discard(sid)
+
+    async def clone_nick(self, sid: str) -> dict:
+        """Operator-triggered capacity clone. The source keeps its pins and
+        comes back up after the profile copy — both instances serve the same
+        Google account on different IPs."""
+        if sid in self._clone_pending:
+            return {"ok": False, "error": "clone already in progress"}
+        if self._clone_depth(sid) >= _config.AUTO_CLONE_MAX_DEPTH:
+            return {"ok": False, "error": "lineage depth cap reached"}
+        ws = next((w for w, s in self._extensions.items()
+                   if s.get("profile_id") == sid), None)
+        if ws is not None and self._extensions[ws].get("page_state") == "signed_out":
+            return {"ok": False,
+                    "error": "signed_out session — a clone inherits dead cookies"}
+        self._clone_pending.add(sid)
+        try:
+            clone_id = await self._clone_nick(sid, source_retires=False)
+        finally:
+            self._clone_pending.discard(sid)
+        if not clone_id:
+            return {"ok": False, "error": "clone failed — see ledger CLONE_FAIL"}
+        return {"ok": True, "clone_id": clone_id}
+
+    async def _clone_nick(self, sid: str, *, source_retires: bool) -> str | None:
+        """Clone sid's profile onto a fresh proxy IP.
+
+        The source Chrome is always stopped first — a live profile cannot be
+        copied consistently. source_retires=True (terminal path): the source
+        account is disabled and its media/operation pins move to the clone.
+        False (capacity path): pins stay and the source is relaunched.
+        Returns the clone id, or None on failure.
         """
         try:
             from agent.services.accounts import (
@@ -2766,7 +2800,7 @@ class FlowClient:
 
             acc = get_account(sid)
             if not acc:
-                return
+                return None
 
             # Clone id: base-<dual|dual-N>, first free.
             base = re.sub(r"-dual(?:-\d+)?$", "", sid)
@@ -2779,7 +2813,7 @@ class FlowClient:
                 n += 1
                 if n > 20:
                     logger.error("clone_terminal %s: no free clone id", sid)
-                    return
+                    return None
 
             # Stop the original first so the profile copies cleanly and the
             # flagged session stops touching Google.
@@ -2792,7 +2826,7 @@ class FlowClient:
             if not src.exists():
                 _ledger.record_event("CLONE_FAIL", nick=sid,
                                      detail={"stage": "copy", "error": "profile dir missing"})
-                return
+                return None
             tmp = dst.parent / (clone_id + ".copying")
             try:
                 shutil.rmtree(tmp, ignore_errors=True)  # stale partial copy
@@ -2813,16 +2847,17 @@ class FlowClient:
                 _ledger.record_event("CLONE_FAIL", nick=sid,
                                      detail={"stage": "copy", "error": str(exc)[:200]})
                 logger.warning("clone_terminal %s: profile copy failed: %s", sid, exc)
-                return
+                return None
 
-            acc["enabled"] = False
-            acc["note"] = (acc.get("note") or "") + " [auto] session terminal — cloned to " + clone_id
-            upsert_account(acc)
+            if source_retires:
+                acc["enabled"] = False
+                acc["note"] = (acc.get("note") or "") + " [auto] session terminal — cloned to " + clone_id
+                upsert_account(acc)
 
             country = random.choice(_config.AUTO_CLONE_COUNTRIES or ["us"])
             row = {
                 "id": clone_id,
-                "label": f"{clone_id} (auto-clone of {sid})",
+                "label": f"{clone_id} ({'auto-' if source_retires else ''}clone of {sid})",
                 "project_id": acc.get("project_id"),
                 "proxy_url": make_surfshark_url(clone_id, country),
                 "note": "", "enabled": True,
@@ -2834,13 +2869,15 @@ class FlowClient:
             upsert_account(row)
 
             # Same Google account + same project → media/operation pins made
-            # on the dead session resolve on the clone.
-            for m, owner in list(self._media_profiles.items()):
-                if owner == sid:
-                    self._media_profiles[m] = clone_id
-            for o, owner in list(self._operation_profiles.items()):
-                if owner == sid:
-                    self._operation_profiles[o] = clone_id
+            # on the dead session resolve on the clone. A capacity clone keeps
+            # the pins on the still-live source instead.
+            if source_retires:
+                for m, owner in list(self._media_profiles.items()):
+                    if owner == sid:
+                        self._media_profiles[m] = clone_id
+                for o, owner in list(self._operation_profiles.items()):
+                    if owner == sid:
+                        self._operation_profiles[o] = clone_id
             # _operation_chat_sessions maps op→chat_session_id (a server-side
             # StreamChat conversation on the same Google account) — leave it:
             # the clone can keep the conversation. Remapping it to a nick id
@@ -2865,9 +2902,17 @@ class FlowClient:
                 _ledger.record_event("CLONE_FAIL", nick=clone_id,
                                      detail={"error": res.get("error")})
                 logger.warning("Clone %s launch failed: %s", clone_id, res.get("error"))
+            if not source_retires:
+                # Capacity clone — bring the source back up so it keeps working.
+                try:
+                    await launch_nick(sid)
+                except Exception as exc:
+                    logger.warning("relaunch of source %s failed: %s", sid, exc)
+            return clone_id
         except Exception:
             logger.exception("auto-clone of %s failed", sid)
             _ledger.record_event("CLONE_FAIL", nick=sid, detail={"stage": "exception"})
+            return None
 
     async def _canary_probe(self, sid: str) -> None:
         """One cheap RPC on a nick whose hold-out just elapsed.
