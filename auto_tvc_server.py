@@ -384,6 +384,7 @@ VOICE_PROFILES = {
         "badge": "👩 Nữ Miền Bắc (Thanh lịch)",
         "tone_desc": "Giọng nữ miền Bắc chuẩn phát thanh, thanh lịch, nhẹ nhàng, tự nhiên (dùng từ: 'nhé', 'ạ', 'mọi người ơi', 'chị em ơi', 'cực kỳ').",
         "veo_prompt": VOICE_BIBLE["female_north"]["lock_prompt"],
+        "say_clause": "a warm, clear Northern Vietnamese female voice",
         "voice_bible": VOICE_BIBLE["female_north"],
         "edge_voice": "vi-VN-HoaiMyNeural",
         "rate": "+0%"
@@ -394,6 +395,7 @@ VOICE_PROFILES = {
         "badge": "👩 Nữ Miền Nam (Ngọt ngào)",
         "tone_desc": "Giọng nữ miền Nam ngọt ngào, gần gũi, duyên dáng, thân thiện chuẩn reviewer TikTok (dùng từ: 'nè', 'nghen', 'thiệt sự luôn á', 'cả nhà ơi', 'mọi người ơi').",
         "veo_prompt": VOICE_BIBLE["female_south"]["lock_prompt"],
+        "say_clause": "a sweet, melodious Southern Vietnamese female voice (giọng nữ miền Nam)",
         "voice_bible": VOICE_BIBLE["female_south"],
         "edge_voice": "vi-VN-HoaiMyNeural",
         "rate": "+5%"
@@ -404,6 +406,7 @@ VOICE_PROFILES = {
         "badge": "👨 Nam Miền Bắc (Trầm ấm)",
         "tone_desc": "Giọng nam miền Bắc trầm ấm, uy tín, chững chạc, dứt khoát (dùng từ: 'nhé', 'anh em ơi', 'các bác ơi', 'chuẩn xác', 'cực kỳ').",
         "veo_prompt": VOICE_BIBLE["male_north"]["lock_prompt"],
+        "say_clause": "a deep, warm Northern Vietnamese male voice",
         "voice_bible": VOICE_BIBLE["male_north"],
         "edge_voice": "vi-VN-NamMinhNeural",
         "rate": "+0%"
@@ -414,6 +417,7 @@ VOICE_PROFILES = {
         "badge": "👨 Nam Miền Nam (Hào sảng)",
         "tone_desc": "Giọng nam miền Nam hào sảng, phóng khoáng, thân thiện, năng động chuẩn reviewer (dùng từ: 'nè', 'anh em ơi', 'cả nhà ơi', 'thiệt tình', 'siêu êm').",
         "veo_prompt": VOICE_BIBLE["male_south"]["lock_prompt"],
+        "say_clause": "a warm, dynamic Southern Vietnamese male voice (giọng nam miền Nam)",
         "voice_bible": VOICE_BIBLE["male_south"],
         "edge_voice": "vi-VN-NamMinhNeural",
         "rate": "+5%"
@@ -732,6 +736,21 @@ def determine_product_persona(
             guidance_lines.append("SẢN PHẨM ĐA DỤNG / TIỆN ÍCH CHUNG: Người nói là Nữ Miền Nam.")
             guidance_lines.append("KHÔNG DÙNG 'mấy bà ơi' để tránh thu hẹp tệp khách hàng đại chúng.")
             guidance_lines.append("MỞ ĐẦU PHÙ HỢP: 'Mọi người ơi', 'Cả nhà ơi', 'Các bạn ơi'.")
+
+    # Dialect orthography: Veo speaks the text literally — the script itself must carry the accent.
+    if is_southern:
+        guidance_lines.append(
+            "PHƯƠNG NGỮ BẮT BUỘC — MIỀN NAM: Viết TOÀN BỘ audio_dialogue bằng văn nói miền Nam tự nhiên. "
+            "Dùng 'nha'/'nè'/'nghen' thay 'nhé', 'thiệt' thay 'thật', 'hông' thay 'không' (thân mật), "
+            "'dạ/dzạ', 'gòi' thay 'rồi' khi tự nhiên, 'vậy đó', 'trời ơi', 'á', 'luôn á'. "
+            "TUYỆT ĐỐI KHÔNG viết câu chuẩn trung tính kiểu Bắc: 'nhé', 'rất là', 'vậy nhé', 'đấy', 'nhỉ'."
+        )
+    elif is_northern:
+        guidance_lines.append(
+            "PHƯƠNG NGỮ BẮT BUỘC — MIỀN BẮC: Viết TOÀN BỘ audio_dialogue bằng văn nói miền Bắc tự nhiên: "
+            "'nhé', 'ạ', 'vậy', 'đấy', 'rất là', 'thật sự'. TUYỆT ĐỐI KHÔNG dùng văn miền Nam: "
+            "'nha', 'nè', 'nghen', 'thiệt', 'hông', 'gòi', 'á'."
+        )
 
     return {
         "target_persona": target_persona,
@@ -2208,7 +2227,7 @@ Extract exact details and return a strict JSON object with:
                     "audio_dialogue": f"Lời thoại tiếng Việt tự nhiên cho Phân Cảnh {i+1} ({word_count_rule}).",
                     "visual_plan": f"Mô tả bối cảnh đập hộp hé lộ và chi tiết sản phẩm cho Phân Cảnh {i+1}...",
                     "image_generation_prompt": f"PRODUCT REFERENCE LOCK — HIGHEST PRIORITY: {canonical_anchor}. [Action, unboxing reveal, macro camera angle for Scene {i+1}]. Purely product showcase on luxury display pedestal or aesthetic box, completely empty of people, NO human, NO human face, NO hands, NO arms. Photorealistic 8k vertical 9:16.",
-                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC. [Smooth cinematic camera push-in, macro pan or gentle orbit for Scene {i+1}]. Purely product showcase, NO human, NO hands, NO people visible in frame. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['veo_prompt']}"
+                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC. [Smooth cinematic camera push-in, macro pan or gentle orbit for Scene {i+1}]. Purely product showcase, NO human, NO hands, NO people visible in frame. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['say_clause']}. {voice_info['veo_prompt']}"
                 } for i in range(num_scenes)
             ]
         elif flow_mode == "demo":
@@ -2219,7 +2238,7 @@ Extract exact details and return a strict JSON object with:
                     "audio_dialogue": f"Lời thoại tiếng Việt tự nhiên cho Phân Cảnh {i+1} ({word_count_rule}).",
                     "visual_plan": f"Mô tả bối cảnh và thao tác demo chi tiết cho Phân Cảnh {i+1}...",
                     "image_generation_prompt": f"PRODUCT REFERENCE LOCK — HIGHEST PRIORITY: {canonical_anchor}. [Action demonstrating product use with 2 neat hands on {profile_data.get('suggested_demo_environment', 'clean aesthetic tabletop')} for Scene {i+1}]. Exactly 2 natural human hands, 5 fingers each, interacting gently without covering the product label. Photorealistic 8k vertical 9:16.",
-                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC. Hands must stay stable with MINIMAL slow movement. [Clear product demonstration action for Scene {i+1}]. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['veo_prompt']}"
+                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC. Hands must stay stable with MINIMAL slow movement. [Clear product demonstration action for Scene {i+1}]. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['say_clause']}. {voice_info['veo_prompt']}"
                 } for i in range(num_scenes)
             ]
         elif flow_mode == "pov":
@@ -2230,7 +2249,7 @@ Extract exact details and return a strict JSON object with:
                     "audio_dialogue": f"Lời thoại tiếng Việt tự nhiên cho Phân Cảnh {i+1} ({word_count_rule}).",
                     "visual_plan": f"Mô tả bối cảnh và hành động chi tiết cho Phân Cảnh {i+1}...",
                     "image_generation_prompt": f"PRODUCT REFERENCE LOCK — HIGHEST PRIORITY: {canonical_anchor}. [Action and camera angle for Scene {i+1}]. Photorealistic 8k vertical 9:16.",
-                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY: [Subtle movement for Scene {i+1}]. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['veo_prompt']}"
+                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY: [Subtle movement for Scene {i+1}]. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['say_clause']}. {voice_info['veo_prompt']}"
                 } for i in range(num_scenes)
             ]
         elif flow_mode == "fashion":
@@ -2246,7 +2265,7 @@ Extract exact details and return a strict JSON object with:
                     "audio_dialogue": f"Lời thoại tiếng Việt tự nhiên cho Phân Cảnh {i+1} ({word_count_rule}).",
                     "visual_plan": f"Mô tả góc chụp thời trang và cử chỉ người mẫu cho Phân Cảnh {i+1}...",
                     "image_generation_prompt": f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {canonical_model_anchor}.. PRODUCT REFERENCE LOCK: {canonical_anchor}.. {fashion_poses_en[i % len(fashion_poses_en)]}. Soft luxury studio lighting, pure elegant setting, natural fabric folds, clean composition, no watermark, no text. Photorealistic 8k vertical 9:16.",
-                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC. Model maintains elegant poised posture with subtle head movement, gently turning or posing naturally to show off the outfit fit. Direct camera eye contact. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['veo_prompt']}"
+                    "video_motion_prompt": f"PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC. Model maintains elegant poised posture with subtle head movement, gently turning or posing naturally to show off the outfit fit. Direct camera eye contact. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['say_clause']}. {voice_info['veo_prompt']}"
                 } for i in range(num_scenes)
             ]
         else:
@@ -2257,7 +2276,7 @@ Extract exact details and return a strict JSON object with:
                     "audio_dialogue": f"Lời thoại tiếng Việt tự nhiên cho Phân Cảnh {i+1} ({word_count_rule}).",
                     "visual_plan": f"Mô tả bối cảnh và hành động chi tiết cho Phân Cảnh {i+1}...",
                     "image_generation_prompt": f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {canonical_model_anchor}. PRODUCT REFERENCE LOCK: {canonical_anchor}. [Action and angle for Scene {i+1}]. Direct camera eye contact, upright frontal posture, identical face and identical clothing across all scenes. Photorealistic 8k vertical 9:16.",
-                    "video_motion_prompt": f"CREATOR LOCK — HIGHEST PRIORITY: [Creator movement and product interaction for Scene {i+1}]. Direct camera eye contact, upright head posture, subtle facial movements only. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['veo_prompt']}"
+                    "video_motion_prompt": f"CREATOR LOCK — HIGHEST PRIORITY: [Creator movement and product interaction for Scene {i+1}]. Direct camera eye contact, upright head posture, subtle facial movements only. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['say_clause']}. {voice_info['veo_prompt']}"
                 } for i in range(num_scenes)
             ]
         skeleton_json = json.dumps(skeleton_items, indent=2, ensure_ascii=False)
@@ -2281,6 +2300,7 @@ CRITICAL UNBOXING PRODUCTION RULES:
    - SCENE 1 (THE REVEAL): Premium packaging/gift box elegantly opening or sliding open to reveal the pristine product inside on a luxury pedestal with dramatic spotlight reveal.
    - SCENE 2 (MACRO CRAFTSMANSHIP): Extreme close-up / macro shot highlighting the premium material texture, stitching, fine details, logo, craftsmanship, or modular transformation.
    - SCENE 3 (HERO SHOWCASE & CTA): Hero slow cinematic orbit or low-angle presentation of the complete product with glowing boutique studio backdrop, leaving maximum desire to own.
+   - SCENE CONTINUITY LOCK (LIỀN MẠCH — BẮT BUỘC): All {num_scenes} scenes happen in ONE continuous moment on the SAME studio stage ({profile_data.get('suggested_studio_stage', 'minimalist aesthetic display pedestal')}), SAME lighting, SAME packaging arrangement. Every scene's "visual_plan" and "image_generation_prompt" MUST reuse that exact environment verbatim — NEVER invent a new backdrop, room, or lighting in later scenes. Scene N+1 opens from the exact state where Scene N ended (product position, box lid state, camera direction). Only camera framing evolves (push-in → macro → orbit); the physical world stays identical — the viewer must feel ONE unbroken unboxing, not 3 separate shots.
 7. CAMERA MOVEMENT: Smooth cinematic camera work — slow push-in, subtle pedestal up, macro slide, slow orbit. Always keep movement gentle and steady (KEEP PRODUCT ALMOST STATIC).
 8. TOTAL SCENES: EXACTLY {num_scenes} SCENES.
 9. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
@@ -2309,6 +2329,7 @@ CRITICAL POV PRODUCTION RULES:
 3. PROMPTS MUST BE 100% IN ENGLISH: "image_generation_prompt" and "video_motion_prompt" MUST be written in concise English only!
 4. ZERO ON-SCREEN TEXT OR GRAPHICS: TUYỆT ĐỐI KHÔNG CÓ CHỮ TRÊN MÀN HÌNH (NO on-screen text, NO subtitles, NO captions, NO typography, NO watermark, NO logo overlay). NEVER use hyphenated slogans like '2-in-1' or '3-in-1' in prompts; use 'dual-design' or 'multifunctional' instead.
 5. STORYTELLING PACING: For multi-item or transformable products, SCENE 1 MUST focus on unboxing/opening ONLY ONE ITEM with 2 hands (e.g. opening the first pouch to reveal character 1, while the second item rests closed on the side). DO NOT attempt to open 2 separate items at once with 2 hands! SCENE 2 focuses on opening the second item and gentle tactile squeezing. SCENE 3 presents both opened items side by side.
+   - SCENE CONTINUITY LOCK (LIỀN MẠCH — BẮT BUỘC): All {num_scenes} scenes happen in ONE continuous moment on the SAME tabletop ({profile_data.get('suggested_tabletop', 'clean aesthetic wooden tabletop')}), SAME top-down POV angle, SAME lighting, SAME hands. Every scene's "visual_plan" and "image_generation_prompt" MUST reuse that exact environment verbatim — NEVER change the table, background, or hand appearance between scenes. Scene N+1 opens from the exact state where Scene N ended (item positions carry over). Only the action progresses; the physical world stays identical — the viewer must feel ONE unbroken POV take, not 3 separate clips.
 6. STRICT UPRIGHT POSTURE: All characters and pouches must be strictly upright (heads at the top, ears pointing upwards, face looking forward right-side up). NEVER upside down, never inverted, never tumbling head-first!
 7. HAND ANATOMY: Exactly 2 natural human hands in frame, 5 fingers each. NO third hand, NO extra floating limbs.
 8. TOTAL SCENES: EXACTLY {num_scenes} SCENES.
@@ -2342,6 +2363,7 @@ CRITICAL PRODUCT DEMO PRODUCTION RULES:
    - SCENE 1 (HOOK & NỖI ĐAU): Nêu bật vấn đề nan giải hoặc thói quen sai lầm khiến người xem khó chịu (ví dụ da khô, đồ đạc bừa bộn, vết bẩn cứng đầu), ngay lập tức đưa ra sản phẩm như vị cứu tinh.
    - SCENE 2 (THAO TÁC SỬ DỤNG TRỰC QUAN): 2 bàn tay hướng dẫn thao tác chi tiết từng bước (thoa đều, ấn nút, xịt dưỡng, xoay nắp, cắt gọt...), cảm nhận chất liệu/kết cấu biến đổi.
    - SCENE 3 (KẾT QUẢ THỰC TẾ & KÊU GỌI CTA): Chứng minh kết quả mỹ mãn (bề mặt căng bóng, sáng bóng, tiện lợi vượt trội) + kêu gọi bấm vào giỏ hàng góc trái màn hình để nhận ưu đãi độc quyền.
+   - SCENE CONTINUITY LOCK (LIỀN MẠCH — BẮT BUỘC): All {num_scenes} scenes happen in ONE continuous moment at the SAME setting ({profile_data.get('suggested_demo_environment', 'clean aesthetic countertop')}), SAME lighting, SAME pair of hands, SAME product position. Every scene's "visual_plan" and "image_generation_prompt" MUST reuse that exact environment verbatim — NEVER teleport to a new room, surface, or lighting in later scenes. Scene N+1 opens from the exact state where Scene N ended (product and hands carry over). Only the demonstration action progresses; the physical world stays identical — the viewer must feel ONE unbroken demo, not 3 separate clips.
 6. KEEP PRODUCT ALMOST STATIC: In video motion, avoid violent shaking, flipping or tossing. Movement must be steady, slow, and focused on the hands interacting with the product.
 7. TOTAL SCENES: EXACTLY {num_scenes} SCENES.
 8. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
@@ -2376,11 +2398,12 @@ CRITICAL UGC PRODUCTION RULES:
 10. TONE & VOCABULARY: Đời thường, gần gũi, khuyên dùng thật lòng, tâm sự chân thật (ví dụ: 'Mình dùng được 2 tuần nay rồi...', '{example_opener} chân ái đây rồi...', 'Nói thật lúc đầu mình cũng đắn đo nhưng cầm lên tay là mê thực sự...', 'Đáng đồng tiền bát gạo luôn nha').
 11. {persona_prompt_block}
 12. CAMERA & ENVIRONMENT: Frontal camera / selfie close-up angle, creator sitting in personal room/desk, holding product naturally, genuine smiles, natural lighting.
-13. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
+13. SCENE CONTINUITY LOCK (LIỀN MẠCH — BẮT BUỘC): All {num_scenes} scenes happen in ONE continuous take in the SAME room ({profile_data.get('suggested_background', 'cozy personal bedroom with desk setup')}), SAME creator position, SAME outfit, SAME lighting, SAME framing. Every scene's "visual_plan" and "image_generation_prompt" MUST reuse that exact environment verbatim — NEVER move the creator to a new location, change the background, or re-pose them between scenes. Scene N+1 opens from the exact state where Scene N ended (product in hand, posture, camera distance carry over). Only dialogue and small gestures progress; the physical world stays identical — the viewer must feel ONE unbroken talking take, not 3 separate shots.
+14. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
     - Preserve the creator's exact outfit and appearance ({canonical_model_anchor}) with 100% consistency across all scenes.
     - NEVER use ambiguous tactile actions in prompts or dialogue (NO 'unzipping slit', NO 'smooth zipper', NO 'pulling out of slit', NO 'khóa kéo mở bung', NO 'rubbing', NO 'stroking').
     - For product interaction: keep gestures natural, gentle, and commercial: 'holding product comfortably near chest level', 'pointing gently at feature', 'gently opening the presentation pouch to reveal the cute character'.
-14. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
+15. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
 {skeleton_json}
@@ -2404,6 +2427,7 @@ CRITICAL FASHION LOOKBOOK PRODUCTION RULES:
    - Scene 1: Toàn thân, nhìn thẳng / catwalk tự nhiên (Trình diễn tổng thể outfit, form dáng chuẩn).
    - Scene 2: Cận cảnh chi tiết chất liệu vải / đường may / cổ áo / tay áo (Tôn vinh chất lượng may mặc, độ rủ của vải).
    - Scene 3: Xoay người thanh lịch 360 độ hoặc góc nghiêng ba phần tư (Khoe trọn vẻ đẹp sau lưng và chuyển động bồng bềnh).
+   - SCENE CONTINUITY LOCK (LIỀN MẠCH — BẮT BUỘC): All {num_scenes} scenes happen in ONE continuous fashion take in the SAME studio ({profile_data.get('suggested_background', 'pure white studio with soft professional lighting')}), SAME model, SAME outfit, SAME lighting. Every scene's "visual_plan" and "image_generation_prompt" MUST reuse that exact environment verbatim — NEVER change the backdrop, set, or lighting between scenes. Only camera framing and the model's pose progress; the physical world stays identical — the viewer must feel ONE unbroken runway take, not 3 separate shots.
 4. ZERO ON-SCREEN TEXT OR GRAPHICS: TUYỆT ĐỐI KHÔNG CÓ CHỮ TRÊN MÀN HÌNH (NO on-screen text, NO subtitles, NO captions, NO typography, NO watermark, NO banners).
 5. PROMPTS MUST BE 100% IN ENGLISH: "image_generation_prompt" and "video_motion_prompt" MUST be written in concise English only!
 6. TOTAL SCENES: EXACTLY {num_scenes} SCENES.
@@ -2416,7 +2440,7 @@ CRITICAL FASHION LOOKBOOK PRODUCTION RULES:
     - Must start with: `PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT ALMOST STATIC.`
     - Model motion: Elegant Turnaround / Boutique Walk / Catwalk poise / gentle fabric rustle.
     - Camera: Cinematic Push-in, Head-to-Toe Scan, Slow Orbit, or Gimbal Track.
-    - End with: `Say: \"[exact audio_dialogue]\" in {voice_info['veo_prompt']}`.
+    - End with: `Say: \"[exact audio_dialogue]\" in {voice_info['say_clause']}. {voice_info['veo_prompt']}`.
 13. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
@@ -2443,11 +2467,12 @@ CRITICAL STORE REVIEW PRODUCTION RULES:
 10. TONE & VOCABULARY: Uy tín, chuyên gia, sang trọng, đánh giá phân tích chất lượng cao cấp, phong thái tự tin.
 11. {persona_prompt_block}
 12. CAMERA & ENVIRONMENT: Eye-level medium / medium close-up, modern commercial showroom with luxury display shelves, professional lighting.
-13. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
+13. SCENE CONTINUITY LOCK (LIỀN MẠCH — BẮT BUỘC): All {num_scenes} scenes happen in ONE continuous take in the SAME showroom ({profile_data.get('suggested_background', 'modern commercial showroom with luxury display shelves')}), SAME KOL position, SAME outfit, SAME lighting, SAME framing. Every scene's "visual_plan" and "image_generation_prompt" MUST reuse that exact environment verbatim — NEVER move to a new location or re-pose between scenes. Scene N+1 opens from the exact state where Scene N ended. Only dialogue and small gestures progress; the physical world stays identical — the viewer must feel ONE unbroken take, not 3 separate shots.
+14. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
     - Preserve the KOL's exact outfit and appearance ({canonical_model_anchor}) with 100% consistency across all scenes.
     - NEVER use ambiguous tactile actions in prompts or dialogue (NO 'unzipping slit', NO 'smooth zipper', NO 'pulling out of slit', NO 'khóa kéo mở bung', NO 'rubbing', NO 'stroking').
     - Maintain dignified, high-end showroom presentation standard with 100% family-friendly actions and dialogue.
-14. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
+15. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
 {skeleton_json}
@@ -2562,7 +2587,7 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                     sc["video_motion_prompt"] = sync_dialogue_to_motion_prompt(
                         sc["video_motion_prompt"],
                         sc["audio_dialogue"],
-                        voice_info.get("veo_prompt", "")
+                        voice_info.get("say_clause", "")
                     )
             update_job(job_id, scenes=scenes_data)
 
@@ -2921,14 +2946,15 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                     return not (cp.exists() and cp.stat().st_size > 50000)
                 return False
             failed_scene_ids = [sc.get("scene_id") for sc in scenes_data if _needs_rescue(sc)]
-            if len(failed_scene_ids) == 1:
-                auto_sc_id = failed_scene_ids[0]
-                print(f"Job {job_id}: Automatically triggering background rescue for single failed scene {auto_sc_id}...")
-                threading.Thread(
-                    target=run_scene_regeneration_worker,
-                    args=(job_id, auto_sc_id, "", "", "", False),
-                    daemon=True
-                ).start()
+            if failed_scene_ids:
+                def _rescue_all(fids):
+                    for fid in fids:
+                        try:
+                            run_scene_regeneration_worker(job_id, fid, "", "", "", False)
+                        except Exception as rescue_err:
+                            print(f"Job {job_id}: auto-rescue scene {fid} failed: {rescue_err}")
+                print(f"Job {job_id}: Automatically triggering background rescue for {len(failed_scene_ids)} failed scene(s): {failed_scene_ids}...")
+                threading.Thread(target=_rescue_all, args=(failed_scene_ids,), daemon=True).start()
         else:
             if final_mp4.exists():
                 try:
@@ -3094,7 +3120,7 @@ def run_scene_regeneration_worker(
 
         # Ensure lip-sync match between video motion prompt and audio dialogue
         if sc.get("audio_dialogue") and sc.get("video_motion_prompt"):
-            v_prompt = voice_info.get("veo_prompt", "")
+            v_prompt = voice_info.get("say_clause", "")
             sc["video_motion_prompt"] = sync_dialogue_to_motion_prompt(
                 sc["video_motion_prompt"],
                 sc["audio_dialogue"],
@@ -4115,7 +4141,7 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
                 sc["video_motion_prompt"] = sync_dialogue_to_motion_prompt(
                     sc["video_motion_prompt"],
                     sc["audio_dialogue"],
-                    v_info.get("veo_prompt", "")
+                    v_info.get("say_clause", "")
                 )
 
             update_job(job_id, scenes=scenes)
@@ -4366,7 +4392,7 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             fixed_dialogue = fix_res.get("fixed_dialogue", dialogue)
             voice_key = job.get("voice", "female_north")
             v_info = VOICE_PROFILES.get(voice_key, VOICE_PROFILES["female_north"])
-            fixed_motion = sync_dialogue_to_motion_prompt(fixed_motion, fixed_dialogue, v_info.get("veo_prompt", ""))
+            fixed_motion = sync_dialogue_to_motion_prompt(fixed_motion, fixed_dialogue, v_info.get("say_clause", ""))
             explanation = fix_res.get("explanation", "AI đã tối ưu hóa prompt an toàn thành công.")
 
             # Update scene

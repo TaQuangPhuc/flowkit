@@ -510,6 +510,12 @@ class CentralWatchdog:
                         rec.redacted, PROXY_ERROR_DECAY_S,
                     )
                 if rec.consecutive_errors >= 3:
+                    if rec.last_error_reason == "PUBLIC_ERROR_UNUSUAL_ACTIVITY":
+                        # Account/session flag, not proxy evidence — quarantining
+                        # a shared endpoint here takes every nick on it down
+                        # (the incident that emptied the routable pool). The
+                        # strike handler already parked the guilty nick.
+                        continue
                     failed += 1
                     # Quarantine proxy with 15m cooldown (900s)
                     try:

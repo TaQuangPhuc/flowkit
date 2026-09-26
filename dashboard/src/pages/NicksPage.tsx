@@ -70,6 +70,7 @@ interface Nick {
   has_proxy: boolean
   note: string
   enabled: boolean
+  mint_only?: boolean
   browser?: string
   chrome_running: boolean
   pid: number | null
@@ -160,6 +161,36 @@ interface AuthReport {
   netlog_available: boolean
   counts: { total: number; needs_attention: number; signed_out: number; blocked: number; disabled: number }
   nicks: NickAuth[]
+}
+
+interface LineageMember {
+  id: string
+  role: 'root' | 'clone'
+  mint_only: boolean
+  enabled: boolean
+  connected: boolean
+  page_state: string | null
+  gate: string
+  routable: boolean
+  session: 'alive' | 'dead' | 'offline'
+}
+
+interface LineageAccount {
+  id: string
+  kind: 'gen' | 'mint' | 'gen+mint'
+  state: 'ok' | 'needs_relogin' | 'unknown' | 'mint_ok' | 'mint_dead'
+  alive: number
+  dead: number
+  offline: number
+  serving: string[]
+  keep_member: string | null
+  action: string | null
+  members: LineageMember[]
+}
+
+interface LineageReport {
+  accounts: LineageAccount[]
+  summary: { total: number; covered: number; needs_relogin: number; mint_accounts: number }
 }
 
 const VERDICT_STYLE: Record<AuthVerdict, string> = {
@@ -260,6 +291,7 @@ export default function NicksPage() {
   const [copiedProxy, setCopiedProxy] = useState<string | null>(null)
   const [auth, setAuth] = useState<AuthReport | null>(null)
   const [showAllAuth, setShowAllAuth] = useState(false)
+  const [lineage, setLineage] = useState<LineageReport | null>(null)
   // Saving is tracked apart from `busy`: a save no longer holds the page.
   const [saving, setSaving] = useState<string | null>(null)
 
@@ -283,9 +315,15 @@ export default function NicksPage() {
       .catch(() => {})
   }, [])
 
+  const loadLineage = useCallback(() => {
+    return fetchAPI<LineageReport>('/api/accounts/lineage')
+      .then(res => setLineage(res))
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     let cancelled = false
-    Promise.all([load(), loadHealth(), loadAuth()]).finally(() => {
+    Promise.all([load(), loadHealth(), loadAuth(), loadLineage()]).finally(() => {
       if (!cancelled) setLoading(false)
     })
     const id = setInterval(() => {
@@ -296,7 +334,10 @@ export default function NicksPage() {
     }, 4000)
     // The auth verdict reads a log tail; every 12s is plenty for a 60m window.
     const authId = setInterval(() => {
-      if (!cancelled) loadAuth()
+      if (!cancelled) {
+        loadAuth()
+        loadLineage()
+      }
     }, 12000)
     return () => {
       cancelled = true
@@ -304,6 +345,18 @@ export default function NicksPage() {
       clearInterval(authId)
     }
   }, [load, loadHealth, loadAuth])
+
+  // Sort so the grid reads top-down: live gen → resting gen → mint →
+  // offline-but-enabled → disabled. Dead/disabled sink instead of
+  // interleaving with the nicks actually serving traffic.
+  const tierOf = (n: Nick) =>
+    n.enabled
+      ? n.mint_only ? 2
+        : n.connected ? (n.worker?.available ? 0 : 1)
+        : 3
+      : 4
+  const sortedNicks = [...nicks].sort((a, b) =>
+    tierOf(a) - tierOf(b) || (a.label || a.id).localeCompare(b.label || b.id))
 
   const clusterConcurrency = nicks.reduce((acc, n) => acc + (n.metrics?.current_concurrency || 0), 0)
   const clusterPeakConcurrency = Math.max(0, ...nicks.map(n => n.metrics?.peak_concurrency || 0))
@@ -635,6 +688,10 @@ export default function NicksPage() {
         onReenable={reenable}
       />
 
+      {/* Lineage watch — account-level truth: gốc chết nhưng clone sống = OK;
+          cả cụm chết = relogin 1, xóa phần còn lại */}
+      <LineagePanel report={lineage} onRefresh={loadLineage} />
+
       {/* Proxy Health Monitor Widget */}
       <Card className="py-3 px-4 border border-[var(--border)]">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -865,7 +922,7 @@ export default function NicksPage() {
         <div className="text-xs" style={{ color: 'var(--muted)' }}>{t('nicks.empty')}</div>
       ) : (
         <div className="grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))' }}>
-          {nicks.map(nick => (
+          {sortedNicks.map(nick => (
             <NickCard
               key={nick.id}
               nick={nick}
@@ -1051,6 +1108,78 @@ export default function NicksPage() {
         </div>
       )}
     </div>
+  )
+}
+
+const LIN_STATE_STYLE: Record<LineageAccount['state'], { cls: string; label: string }> = {
+  ok: { cls: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20', label: 'OK' },
+  needs_relogin: { cls: 'bg-rose-500/10 text-rose-400 border-rose-500/30', label: 'RELOGIN' },
+  unknown: { cls: 'bg-amber-500/10 text-amber-300 border-amber-500/30', label: 'CHƯA RÕ' },
+  mint_ok: { cls: 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20', label: 'MINT' },
+  mint_dead: { cls: 'bg-rose-500/10 text-rose-400 border-rose-500/30', label: 'MINT CHẾT' },
+}
+
+function memberChipCls(m: LineageMember): string {
+  if (m.mint_only) {
+    return m.session === 'alive'
+      ? 'text-cyan-300 border-cyan-500/30 bg-cyan-500/5'
+      : 'text-rose-400 border-rose-500/30 bg-rose-500/5'
+  }
+  if (m.session === 'dead') return 'text-rose-400 border-rose-500/30 bg-rose-500/5 line-through'
+  if (m.session === 'offline') return 'text-[var(--muted)] border-[var(--border)] bg-white/5'
+  if (m.routable) return 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10 font-semibold'
+  return 'text-amber-300 border-amber-500/30 bg-amber-500/5'
+}
+
+function LineagePanel({ report, onRefresh }: { report: LineageReport | null; onRefresh: () => void }) {
+  if (!report) return null
+  const needs = report.summary.needs_relogin
+  return (
+    <Card className="py-3 px-4 border border-[var(--border)]">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Activity className={`w-4 h-4 shrink-0 ${needs ? 'text-rose-400' : 'text-emerald-400'}`} />
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--text)' }}>
+              Theo dõi theo account
+            </div>
+            <div className="text-[11px]" style={{ color: 'var(--muted)' }}>
+              {report.summary.covered}/{report.summary.total} account còn session sống · {report.summary.mint_accounts} mint · chip xanh = đang nhận request
+            </div>
+          </div>
+        </div>
+        <ActionBtn onClick={onRefresh} tone="default">
+          <RefreshCw className="w-3 h-3 inline mr-1" />
+          Làm mới
+        </ActionBtn>
+      </div>
+      <div className="mt-3 flex flex-col gap-2">
+        {report.accounts.map(acc => {
+          const st = LIN_STATE_STYLE[acc.state]
+          return (
+            <div key={acc.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-mono border-t border-[var(--border)]/50 pt-2 first:border-0 first:pt-0">
+              <span className="min-w-[220px] truncate font-semibold" style={{ color: 'var(--text)' }} title={acc.id}>
+                {acc.id.replace(/@gmail\.com1?$/, '')}
+              </span>
+              <span className={`px-1.5 py-0.5 rounded border ${st.cls}`}>{st.label}</span>
+              <span className="text-[var(--muted)]">{acc.alive} sống{acc.dead ? ` · ${acc.dead} chết` : ''}{acc.offline ? ` · ${acc.offline} offline` : ''}</span>
+              <span className="flex flex-wrap gap-1">
+                {acc.members.map(m => (
+                  <span
+                    key={m.id}
+                    title={`${m.id} — ${m.gate}${m.page_state ? ` (${m.page_state})` : ''}`}
+                    className={`px-1.5 py-0.5 rounded border ${memberChipCls(m)}`}
+                  >
+                    {m.role === 'root' ? 'gốc' : m.id.slice(acc.id.length) || m.id}
+                  </span>
+                ))}
+              </span>
+              {acc.action && <span className="w-full text-rose-400/90">→ {acc.action}</span>}
+            </div>
+          )
+        })}
+      </div>
+    </Card>
   )
 }
 

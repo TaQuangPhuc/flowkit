@@ -390,7 +390,11 @@ class UnusualAuditManager:
         if proxy_url:
             with self._lock:
                 proxy_record = self._get_or_create_proxy_record(proxy_url)
-                proxy_record.record_error("PUBLIC_ERROR_UNUSUAL_ACTIVITY")
+                # PUBLIC_ERROR_UNUSUAL_ACTIVITY is an ACCOUNT/session flag, not
+                # proxy evidence — counting it on the proxy let 3 strikes on one
+                # nick quarantine a shared endpoint and take the fleet down.
+                proxy_record.total_requests += 1
+                proxy_record.last_used_at = time.time()
                 self._save_proxy_state_to_disk()
 
         parsed_proxy = parse_proxy_url(proxy_url) if proxy_url else None

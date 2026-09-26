@@ -88,6 +88,7 @@ def sync_extension_copy(
 
     shutil.copytree(src, dst, ignore=ignore)
     _strip_dnr_from_copy(dst)
+    _patch_manifest_for_browser(dst, profile_id)
     if profile_id:
         (dst / "profile.json").write_text(
             json.dumps({"profileId": profile_id}) + "\n", encoding="utf-8",
@@ -105,6 +106,39 @@ def sync_extension_copy(
                 bg.write_text(updated, encoding="utf-8")
     _bump_copy_version(dst)
     return dst.resolve()
+
+
+def _patch_manifest_for_browser(dst: Path, profile_id: str | None) -> None:
+    """Norton Neo crashes ~20-50s after injected.js wraps window.fetch /
+    XMLHttpRequest on flow.google.com — its anti-fingerprint patching
+    collides with ours. The wraps only OBSERVE traffic (chat-session sniff,
+    legacy TRPC urls); the batch RPC path uses its own XHR, so for Neo we
+    strip them and also move the content script to document_idle for a
+    safety margin. Other browsers keep the full injected.js."""
+    try:
+        acc = get_account(profile_id) if profile_id else None
+    except Exception:
+        acc = None
+    if str((acc or {}).get("browser") or "").strip().lower() != "neo":
+        return
+    manifest_path = dst / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        changed = False
+        for cs in manifest.get("content_scripts") or []:
+            if cs.get("run_at") != "document_idle":
+                cs["run_at"] = "document_idle"
+                changed = True
+        if changed:
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    inj = dst / "injected.js"
+    if inj.exists():
+        text = inj.read_text(encoding="utf-8")
+        start = text.find("const _originalFetch")
+        end = text.find("window.__flowRunBatch")
+        if start != -1 and end > start:
+            inj.write_text(text[:start] + text[end:], encoding="utf-8")
 
 
 def _bump_copy_version(dst: Path) -> None:
@@ -285,6 +319,18 @@ _BROWSER_REGISTRY: dict[str, dict] = {
             "/opt/vivaldi/vivaldi",
         ],
         "extra_args": [],
+    },
+    # Norton Neo — Chromium-based privacy browser; unpacked .deb lives under
+    # ~/.flowkit/neo-browser (no setuid sandbox → --no-sandbox, ozone/wayland
+    # on this box like coccoc).
+    "neo": {
+        "bins": [
+            str(Path.home() / ".flowkit" / "neo-browser" / "opt" / "neo" / "neo" / "neo-browser"),
+            str(Path.home() / ".flowkit" / "neo-browser" / "opt" / "neo" / "neo" / "chrome"),
+            "neo-browser-stable",
+        ],
+        # Neo GPU process crashes on wayland+vulkan — force software raster.
+        "extra_args": ["--no-sandbox", "--ozone-platform=wayland", "--disable-gpu"],
     },
 }
 
@@ -553,6 +599,16 @@ def _launch_args(
     if os.path.exists(f"/run/user/{os.getuid()}/wayland-0") and "--ozone-platform=wayland" not in args:
         args.insert(1, "--ozone-platform=wayland")
     args[1:1] = _browser_extra_args(nick_id)
+    try:
+        from agent.services.accounts import get_account
+        _acc = get_account(nick_id) or {}
+    except Exception:
+        _acc = {}
+    if _acc.get("cdp_debug"):
+        # Port 0: Chrome picks a free port and writes it to DevToolsActivePort
+        # in the user-data dir — no per-nick port bookkeeping needed.
+        args.insert(1, "--remote-debugging-port=0")
+        args.insert(2, "--remote-debugging-address=127.0.0.1")
     if proxy_server:
         extra = [f"--proxy-server={proxy_server}"]
         # Do NOT add <-loopback>. Chrome already bypasses 127.0.0.1, so the

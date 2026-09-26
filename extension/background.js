@@ -885,6 +885,21 @@ async function handleSolveCaptcha(msg) {
   sendToAgent({ id, result });
 }
 
+// A grey tab can answer FLOW_PAGE_STATUS while its transport is dead — every
+// in-page fetch then fails ("grecaptcha not available"). Probe the proxy path
+// directly so the agent benches the nick before it eats jobs.
+async function netAliveProbe() {
+  try {
+    await fetch('https://www.google.com/generate_204', {
+      cache: 'no-store', mode: 'no-cors', credentials: 'omit',
+      signal: AbortSignal.timeout(8000),
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
 // Lightweight probe: is the Flow page actually alive (content bridge answers
 // and holds a documentId)? A grey/hung tab keeps the WS alive but cannot mint
 // or submit — this is the signal the minter watchdog needs.
@@ -899,11 +914,13 @@ async function flowTabHealth() {
         const page = await chrome.tabs.sendMessage(t.id,
           { type: 'FLOW_PAGE_STATUS', requestId: `hl-${Date.now()}` });
         if (page && page.documentId) {
+          const net = await netAliveProbe();
           return {
             alive: true, tab_id: t.id, url: t.url,
             page_state: page.page_state || null,
             title: page.title || null,
             app_ready: page.ready === true,
+            net_ok: net.ok, net_error: net.error || null,
           };
         }
         return {

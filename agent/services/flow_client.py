@@ -108,6 +108,10 @@ class FlowClient:
         # were seen re-polling the same dead id 35+ times; answer from cache
         # for DEAD_MEDIA_TTL_S instead.
         self._dead_media: dict[str, float] = {}
+        # Media ids that returned urls at least once. A known-good id that
+        # suddenly answers "No urls" is usually a transient upstream eviction
+        # — verify once more before dead-caching, and for a shorter TTL.
+        self._media_url_seen: dict[str, float] = {}
         # r2v StreamChat: the submit uuid is often a chat-message id, not the
         # listing key. Poll then asks GetSession (GN0Bre) on this conversation.
         self._operation_chat_sessions: dict[str, str] = {}
@@ -129,6 +133,10 @@ class FlowClient:
         self._retrying_profiles: set[str] = set()
         self._solver_retry_pending: set[str] = set()
         self._foreign_mint_pending: set[str] = set()
+        # nick -> "self" | minter nick: diagnostic token-source pin (in-memory).
+        self._mint_override: dict[str, str] = {}
+        # Nicks held out of unpinned routing for experiments (in-memory).
+        self._reserved_nicks: set[str] = set()
         # Trusted-minter bookkeeping: minter nick -> unix ts until which its
         # tokens are distrusted, and target nick -> minter that supplied the
         # in-flight token (for pass/fail attribution).
@@ -161,6 +169,16 @@ class FlowClient:
         self._replay_in_progress: set[str] = set()
         self._unusual_strikes: dict[str, int] = {}
         self._unusual_strike_ts: dict[str, float] = {}
+        # Consecutive FLOW_BUSY/NOT_SUBMITTED rejections per nick — a jammed
+        # tab stays jammed, so each repeat benches it longer (30s→15min cap).
+        self._busy_rejects: dict[str, int] = {}
+        # Consecutive CAPTCHA_FAILED per nick — the tab answers RPCs but its
+        # network path can't fetch/mint reCAPTCHA ("grey" tab). No Google
+        # strike: bench + reload escalate per streak instead.
+        self._captcha_fails: dict[str, int] = {}
+        # Nicks whose Flow page was found dead by the idle health sweep —
+        # transition set so TAB_DEAD/TAB_RECOVERED only log once per episode.
+        self._probe_page_dead: set[str] = set()
         # Terminal flag: strikes kept landing after hold-out releases and
         # proxy rotations — the flag follows the Google session, so rotating
         # again only burns clean IPs. Terminal nicks leave routing entirely
@@ -183,6 +201,11 @@ class FlowClient:
         # Deep flags (hundreds of strikes) don't clear in one 12min window.
         self._flag_depth: dict[str, int] = {}
         self._flag_released: set[str] = set()
+        # Short per-nick backoff after a strike: UNUSUAL is a probabilistic
+        # per-request rejection, so a flagged nick keeps contributing after a
+        # brief cool instead of sitting out a 12-192min hold-out.
+        self._unusual_cool_until: dict[str, float] = {}
+        self._unusual_streak_start: dict[str, float] = {}
         # Strike counts live in memory only, so after a restart nothing knows a
         # nick still carries an open ACCOUNT_SESSION_FLAGGED row. Seeded once
         # from the ledger, lazily, so a success can still close it.
@@ -521,6 +544,10 @@ class FlowClient:
             sid = session.get("profile_id")
             if sid and sid in mint_only:
                 continue
+            # Reserved (experiment) nick: only work pinned to it by name.
+            if sid and sid in self._reserved_nicks and (
+                    not pin or str(pin).strip().lower() != str(sid).strip().lower()):
+                continue
             if pin and ws is not pin:
                 if not sid or str(sid).strip().lower() != str(pin).strip().lower():
                     continue
@@ -564,14 +591,12 @@ class FlowClient:
                 continue
 
             self._flagged_from_ledger()
-            if sid and self._unusual_strikes.get(sid, 0) >= 2:
-                last_ts = self._unusual_strike_ts.get(sid, 0)
-                decay = _UNUSUAL_FLAG_DECAY_S << min(self._flag_depth.get(sid, 0), 4)
-                if now - last_ts <= decay:
+            if sid and self._unusual_strikes.get(sid, 0) >= 1:
+                # Short cool instead of the old 12-192min hold-out: UNUSUAL is
+                # a probabilistic per-request rejection, so the nick returns
+                # to rotation quickly but only through a clean canary.
+                if now < self._unusual_cool_until.get(sid, 0):
                     continue
-                # Hold-out elapsed — canary first: fire one cheap ListSessions
-                # and only re-admit the nick if Google answers clean. A still
-                # -flagged session burns the synthetic probe, not a real job.
                 if sid in self._canary_pending:
                     continue
                 self._canary_pending.add(sid)
@@ -581,6 +606,8 @@ class FlowClient:
                     # No loop (sync caller) — fall back to immediate release.
                     self._canary_pending.discard(sid)
                     self._unusual_strikes[sid] = 0
+                    self._unusual_cool_until.pop(sid, None)
+                    self._unusual_streak_start.pop(sid, None)
                     self._flag_released.add(sid)
                 continue
 
@@ -737,19 +764,10 @@ class FlowClient:
         now = time.time()
         return sorted(nick for nick, until in self._model_denied.items() if until > now)
 
-    async def diagnose_nick(self, nick: str, hours: float = 24.0) -> dict:
-        """Correlated 'why' report for one nick: live state + persistent
-        outcomes + lifecycle events, reduced to human-readable findings."""
-        now = time.time()
-        from agent.services.accounts import get_account
-        acc = get_account(nick) or {}
-        ws, session = next(
-            ((w, s) for w, s in self._extensions.items()
-             if s.get("profile_id") == nick),
-            (None, None),
-        )
-
-        # ---- live state -------------------------------------------------
+    def _cached_state(self, nick: str, acc: dict, session: dict | None, now: float) -> dict:
+        """Live state for one nick from cached session fields — no WS probe,
+        no ledger pull. Gate assignment happens in _nick_gate after a caller
+        optionally refreshes page_state."""
         state: dict = {
             "account_row": bool(acc),
             "enabled": bool(acc.get("enabled", True)),
@@ -772,15 +790,14 @@ class FlowClient:
         warm_until = float((session or {}).get("warming_until") or 0)
         state["warming_for_s"] = round(max(0.0, warm_until - now), 1)
 
-        # hold-out check mirrors _profile_candidates
-        decay = _UNUSUAL_FLAG_DECAY_S << min(self._flag_depth.get(nick, 0), 4)
-        last_strike = self._unusual_strike_ts.get(nick, 0)
+        # cool check mirrors _profile_candidates: strikes sit out only until
+        # the short backoff expires, then a canary decides re-admission.
+        cool_until = self._unusual_cool_until.get(nick, 0)
         state["holdout"] = bool(
-            state["unusual_strikes"] >= 2 and last_strike
-            and now - last_strike <= decay
+            state["unusual_strikes"] >= 1 and now < cool_until
         )
         if state["holdout"]:
-            state["holdout_lifts_in_s"] = round(decay - (now - last_strike), 1)
+            state["holdout_lifts_in_s"] = round(cool_until - now, 1)
 
         quar = None
         if acc.get("proxy_url"):
@@ -790,35 +807,13 @@ class FlowClient:
             except Exception:
                 quar = None
         state["proxy_quarantined"] = quar
+        return state
 
-        # Live page introspection — what the Flow tab is actually showing
-        # right now (unusual_wall / signed_out / app_ready / ...). Turns
-        # NO_AT_TOKEN from a symptom into a named cause.
-        if session is not None:
-            try:
-                route = {"ws": ws, "profile_id": nick, "pinned": True}
-                tok_probe = _current_route.set(route)
-                try:
-                    health = await self._send("flow_tab_health", {}, timeout=10)
-                finally:
-                    _current_route.reset(tok_probe)
-                hr = health.get("result") or {}
-                if hr.get("page_state"):
-                    state["page_state"] = hr["page_state"]
-                    session["page_state"] = hr["page_state"]
-                if hr.get("title"):
-                    state["page_title"] = hr["title"]
-                    session["page_title"] = hr["title"]
-                state["tab_alive"] = hr.get("alive")
-                if hr.get("url"):
-                    state["tab_url"] = hr["url"][:160]
-            except Exception:
-                pass
-
-        # ---- routability verdict -----------------------------------------
-        # The one-word reason this nick is not serving right now, plus the
-        # remedy — same priority order the router applies.
+    def _nick_gate(self, nick: str, acc: dict, state: dict, now: float) -> dict:
+        """The one-word reason this nick is not serving right now, plus the
+        remedy — same priority order the router applies."""
         pstate_now = state.get("page_state")
+        quar = state.get("proxy_quarantined")
         gate, remedy = "none", "serving"
         if not acc:
             gate, remedy = "no_account", "re-add account row (pins here get dropped)"
@@ -851,6 +846,64 @@ class FlowClient:
         state["gate"] = gate
         state["remedy"] = remedy
         state["routable"] = gate == "none"
+        return state
+
+    def live_state(self, nick: str) -> dict:
+        """Fast state+gate for one nick from cached fields — the fleet-wide
+        lineage view calls this per nick, so it must not WS-probe."""
+        now = time.time()
+        from agent.services.accounts import get_account
+        acc = get_account(nick) or {}
+        session = next(
+            (s for s in self._extensions.values()
+             if s.get("profile_id") == nick),
+            None,
+        )
+        state = self._cached_state(nick, acc, session, now)
+        return self._nick_gate(nick, acc, state, now)
+
+    async def diagnose_nick(self, nick: str, hours: float = 24.0) -> dict:
+        """Correlated 'why' report for one nick: live state + persistent
+        outcomes + lifecycle events, reduced to human-readable findings."""
+        now = time.time()
+        from agent.services.accounts import get_account
+        acc = get_account(nick) or {}
+        ws, session = next(
+            ((w, s) for w, s in self._extensions.items()
+             if s.get("profile_id") == nick),
+            (None, None),
+        )
+
+        # ---- live state -------------------------------------------------
+        state = self._cached_state(nick, acc, session, now)
+
+        # Live page introspection — what the Flow tab is actually showing
+        # right now (unusual_wall / signed_out / app_ready / ...). Turns
+        # NO_AT_TOKEN from a symptom into a named cause.
+        if session is not None:
+            try:
+                route = {"ws": ws, "profile_id": nick, "pinned": True}
+                tok_probe = _current_route.set(route)
+                try:
+                    health = await self._send("flow_tab_health", {}, timeout=10)
+                finally:
+                    _current_route.reset(tok_probe)
+                hr = health.get("result") or {}
+                if hr.get("page_state"):
+                    state["page_state"] = hr["page_state"]
+                    session["page_state"] = hr["page_state"]
+                if hr.get("title"):
+                    state["page_title"] = hr["title"]
+                    session["page_title"] = hr["title"]
+                state["tab_alive"] = hr.get("alive")
+                if hr.get("url"):
+                    state["tab_url"] = hr["url"][:160]
+            except Exception:
+                pass
+
+        # ---- routability verdict -----------------------------------------
+        self._nick_gate(nick, acc, state, now)
+        gate, remedy = state["gate"], state["remedy"]
 
         # ---- ledger pull -------------------------------------------------
         outcomes = _ledger.recent_outcomes(nick=nick, hours=hours, limit=500)
@@ -910,7 +963,7 @@ class FlowClient:
             findings.append("Flow page vẫn đang load — NO_AT_TOKEN chỉ là chưa boot xong")
         if state["parked_for_s"] > 0:
             findings.append(f"Đang park auth {int(state['parked_for_s'])}s — session Google có vấn đề")
-        if quar:
+        if state.get("proxy_quarantined"):
             findings.append("Proxy đang quarantine — request bị chặn cho tới khi hết cooldown")
         tab_dead = sum(1 for e in events if e["kind"] == "TAB_DEAD")
         if tab_dead:
@@ -1102,6 +1155,8 @@ class FlowClient:
         # captcha, re-logged in) — keeping it parked would waste that work.
         had_unusual = self._unusual_strikes.pop(profile_id, 0)
         self._unusual_strike_ts.pop(profile_id, None)
+        self._unusual_cool_until.pop(profile_id, None)
+        self._unusual_streak_start.pop(profile_id, None)
         was_terminal = self._session_terminal.pop(profile_id, None) is not None
         if was_terminal:
             _ledger.record_event("TERMINAL_CLEARED", nick=profile_id,
@@ -1432,6 +1487,9 @@ class FlowClient:
                         "no_at_token", "no_flow_tab", "no_flow_key", "no_flow_project",
                         "extension not connected", "public_error_", "low_priority_only",
                         "ask_for_permission", "unsupported_on_batch_api",
+                        # CAPTCHA mint/fetch happens before submit — nothing
+                        # ever reached Flow, so retrying elsewhere is safe.
+                        "captcha_failed",
                         "_not_submitted", "status=401", "status 401", "status: 401",
                         "http 401", "401 unauthorized", "unauthorized",
                         "envelope in response", "flow_page_not_ready",
@@ -1628,6 +1686,7 @@ class FlowClient:
                     not isinstance(last.get("status"), int) or last["status"] < 400
                 ):
                     nick_metrics.record_completion(prof_id, success=True, latency_ms=duration_ms, queue_ms=queue_ms)
+                    self._busy_rejects.pop(prof_id, None)
                     # Foreign-mint attribution: which farm nick supplied the
                     # token that just passed.
                     minter = self._active_minter.pop(prof_id, None)
@@ -1640,6 +1699,8 @@ class FlowClient:
                     # has an ACCOUNT_SESSION_FLAGGED incident to close, so a plain
                     # success does not write to the ledger.
                     had_strikes = self._unusual_strikes.pop(prof_id, None)
+                    self._unusual_cool_until.pop(prof_id, None)
+                    self._unusual_streak_start.pop(prof_id, None)
                     # Ledger lookup first: `or` would short-circuit past it and
                     # leave the lazy set unseeded.
                     flagged = self._flagged_from_ledger()
@@ -1669,6 +1730,7 @@ class FlowClient:
                             pass
                     self._auth_strikes.pop(prof_id, None)
                     self._auth_strike_ts.pop(prof_id, None)
+                    self._captcha_fails.pop(prof_id, None)
                     from agent.services.accounts import get_account
                     acc = get_account(prof_id)
                     p_url = acc.get("proxy_url", "") if acc else ""
@@ -1763,10 +1825,15 @@ class FlowClient:
                         # so another rotate only burns a clean IP and deepens
                         # the flag. Stop rotating; failover + leave routing.
                         strikes_next = self._unusual_strikes.get(prof_id, 0) + 1
+                        if strikes_next == 1:
+                            self._unusual_streak_start[prof_id] = now
                         terminal = (
                             prof_id in self._session_terminal
-                            or self._flag_depth.get(prof_id, 0) >= 2
-                            or strikes_next >= 5
+                            or (
+                                strikes_next >= _config.UNUSUAL_TERMINAL_STRIKES
+                                and now - self._unusual_streak_start.get(prof_id, now)
+                                    >= _config.UNUSUAL_TERMINAL_WINDOW_S
+                            )
                         )
                         if terminal:
                             if prof_id not in self._session_terminal:
@@ -1798,6 +1865,34 @@ class FlowClient:
                                 "UNUSUAL_ACTIVITY on %s is session-flagged (strike #%d) — "
                                 "skipping rotate, failing over",
                                 prof_id, self._unusual_strikes.get(prof_id, 0) + 1,
+                            )
+                            raise _SessionFlagged()
+                        if not _config.UNUSUAL_ROTATE_ON_STRIKE:
+                            # Short exponential cool instead of the old
+                            # flag-decay park: UNUSUAL rejects per request, so
+                            # the nick rests briefly then re-admits via canary.
+                            # depth shifts the cool up for repeat offenders.
+                            cool_s = min(
+                                _config.UNUSUAL_COOL_BASE_S << min(
+                                    strikes_next - 1 + self._flag_depth.get(prof_id, 0), 6),
+                                _config.UNUSUAL_COOL_CAP_S)
+                            self._unusual_cool_until[prof_id] = now + cool_s
+                            if session is not None:
+                                session["unavailable_until"] = max(
+                                    session.get("unavailable_until", 0),
+                                    now + cool_s)
+                            rotation_info["skipped"] = "park_no_rotate"
+                            last["retryable"] = True
+                            last["message"] = (
+                                f"UNUSUAL_ACTIVITY: flag theo account — nghỉ "
+                                f"{int(cool_s)}s rồi thử lại, failover sang nick "
+                                "khác (không rotate proxy: đổi IP giữa "
+                                "session làm Google revoke)."
+                            )
+                            logger.warning(
+                                "UNUSUAL_ACTIVITY on %s → cool %.0fs + failover "
+                                "(no rotate/quarantine — flag is account-bound)",
+                                prof_id, cool_s,
                             )
                             raise _SessionFlagged()
                         try:
@@ -1993,11 +2088,20 @@ class FlowClient:
                         )
                         logger.warning(
                             "UNUSUAL_ACTIVITY on %s right after release — flag depth %d, "
-                            "next hold-out %ds",
+                            "next cool %ds",
                             prof_id, self._flag_depth[prof_id],
-                            _UNUSUAL_FLAG_DECAY_S << self._flag_depth[prof_id],
+                            min(_config.UNUSUAL_COOL_BASE_S << min(
+                                self._flag_depth[prof_id], 6),
+                                _config.UNUSUAL_COOL_CAP_S),
                         )
                     self._unusual_strikes[prof_id] = self._unusual_strikes.get(prof_id, 0) + 1
+                    if self._unusual_strikes[prof_id] == 1:
+                        self._unusual_streak_start[prof_id] = now
+                    self._unusual_cool_until[prof_id] = now + min(
+                        _config.UNUSUAL_COOL_BASE_S << min(
+                            self._unusual_strikes[prof_id] - 1
+                            + self._flag_depth.get(prof_id, 0), 6),
+                        _config.UNUSUAL_COOL_CAP_S)
                     _ledger.record_event("STRIKE_UNUSUAL", nick=prof_id, detail={
                         "strikes": self._unusual_strikes[prof_id],
                         "rpc_id": rpc_id,
@@ -2091,6 +2195,49 @@ class FlowClient:
                         except Exception:
                             pass
 
+                elif "CAPTCHA_FAILED" in raw_err:
+                    # The tab answered the RPC but its network path cannot
+                    # fetch/mint reCAPTCHA — a "grey" tab: renderer alive,
+                    # transport dead. Not a Google flag (no strike, no proxy
+                    # quarantine). Bench progressively + reload the tab, and
+                    # let _should_failover hand the job to a healthy nick.
+                    streak = self._captcha_fails.get(prof_id, 0) + 1
+                    self._captcha_fails[prof_id] = streak
+                    cool_s = min(60 * (2 ** (streak - 1)), 900)
+                    if session is not None:
+                        session["unavailable_until"] = max(
+                            session.get("unavailable_until", 0),
+                            time.time() + cool_s)
+                    last["retryable"] = True
+                    last["message"] = (
+                        "CAPTCHA_FAILED: tab không mint/fetch được reCAPTCHA "
+                        f"(grey tab) — benched {cool_s}s + reload tab; "
+                        "failover sang nick khác."
+                    )
+                    _ledger.record_event("CAPTCHA_BENCH", nick=prof_id, detail={
+                        "streak": streak, "park_s": cool_s,
+                        "error": raw_err[:160],
+                    })
+                    nick_metrics.record_completion(
+                        prof_id, success=False, latency_ms=duration_ms,
+                        queue_ms=queue_ms, error="CAPTCHA_FAILED")
+                    logger.warning(
+                        "CAPTCHA_FAILED on %s (streak %d) — bench %ds + tab reload, "
+                        "failing over", prof_id, streak, cool_s)
+                    # Reload debounced like the idle probe — at most one
+                    # reload per CAPTCHA_MINTER_RELOAD_SECS per nick.
+                    now_r = time.time()
+                    if now_r - self._minter_reload_at.get(prof_id, 0) >= _config.CAPTCHA_MINTER_RELOAD_SECS:
+                        self._minter_reload_at[prof_id] = now_r
+                        try:
+                            tok_rel = _current_route.set(route)
+                            try:
+                                await self._send("reload_flow_tab", {}, timeout=30)
+                            finally:
+                                _current_route.reset(tok_rel)
+                        except Exception:
+                            pass
+
                 elif raw_err:
                     nick_metrics.record_completion(prof_id, success=False, latency_ms=duration_ms, queue_ms=queue_ms, error=raw_err[:200])
 
@@ -2104,11 +2251,26 @@ class FlowClient:
                 and has_alternative
             ):
                 if route["ws"] in self._extensions:
-                    # A nick carrying UNUSUAL strikes is likely session-flagged
-                    # — bench it progressively longer (60s→30min cap) instead of
-                    # letting it rejoin after a minute and eat the next job.
-                    strikes_n = self._unusual_strikes.get(route.get("profile_id") or "", 0)
-                    cool_s = min(60 * (2 ** (strikes_n - 1)), 1800) if strikes_n else 60
+                    prof = route.get("profile_id") or ""
+                    raw_l = str(last.get("error") or last.get("data") or "").lower()
+                    if "not_submitted" in raw_l or "flow_busy" in raw_l:
+                        # Busy rejections: a jammed tab stays jammed — bench
+                        # escalates per consecutive rejection (30s→15min cap)
+                        # so a grey tab stops absorbing dispatches entirely.
+                        busy_n = self._busy_rejects.get(prof, 0) + 1
+                        self._busy_rejects[prof] = busy_n
+                        cool_s = min(30 * (2 ** (busy_n - 1)), 900)
+                        _ledger.record_event("BUSY_PARK", nick=prof, detail={
+                            "consecutive_busy": busy_n,
+                            "park_s": cool_s,
+                            "error": raw_l[:160],
+                        })
+                    else:
+                        # A nick carrying UNUSUAL strikes is likely session-flagged
+                        # — bench it progressively longer (60s→30min cap) instead of
+                        # letting it rejoin after a minute and eat the next job.
+                        strikes_n = self._unusual_strikes.get(prof, 0)
+                        cool_s = min(60 * (2 ** (strikes_n - 1)), 1800) if strikes_n else 60
                     self._extensions[route["ws"]]["unavailable_until"] = (
                         time.time() + cool_s
                     )
@@ -2146,6 +2308,15 @@ class FlowClient:
             # This account cannot render video at all; another nick can.
             "public_error_model_access_denied",
             "public_error_unusual_activity",
+            # Tab rejected the submit before anything reached Flow — its
+            # internal queue is jammed or it is a grey/stuck tab. Nothing was
+            # sent upstream, so another nick can safely take this request.
+            "flow_busy_not_submitted",
+            "flow_deadline_not_submitted",
+            # The tab never reached Google (pre-submit captcha failure) —
+            # another nick can take this request without duplicating work.
+            "captcha_failed",
+            "not_submitted",
             "failed: [13]",
             "failed: [14]",
             "status=401",
@@ -3039,6 +3210,8 @@ class FlowClient:
                 # Offline nick — nothing to probe; release flags anyway since
                 # routing filters disconnected nicks regardless.
                 self._unusual_strikes[sid] = 0
+                self._unusual_cool_until.pop(sid, None)
+                self._unusual_streak_start.pop(sid, None)
                 self._flag_released.add(sid)
                 return
             pid = self._session_project(session) or FLOW_PROJECT_ID
@@ -3056,26 +3229,26 @@ class FlowClient:
             except Exception as exc:
                 flagged = "UNUSUAL_ACTIVITY" in str(exc).upper()
             if flagged:
-                # Re-arm the hold-out at the current escalation depth.
+                # Re-arm the cool at the next escalation depth — repeated
+                # failed probes stretch the rest toward the cap instead of
+                # hot-looping a hard-flagged session every ~90s.
+                self._flag_depth[sid] = min(self._flag_depth.get(sid, 0) + 1, 4)
                 self._unusual_strikes[sid] = 2
                 self._unusual_strike_ts[sid] = time.time()
-                if self._flag_depth.get(sid, 0) >= 2 and sid not in self._session_terminal:
-                    self._session_terminal[sid] = time.time()
-                    _ledger.record_event("SESSION_TERMINAL", nick=sid, detail={
-                        "via": "canary", "flag_depth": self._flag_depth[sid],
-                    })
-                    self._schedule_terminal_clone(sid)
-                    logger.warning(
-                        "Canary on %s still flagged at flag_depth=%d — session terminal, "
-                        "leaving rotation until re-login", sid, self._flag_depth[sid])
-                else:
-                    _ledger.record_event("CANARY_FAIL", nick=sid, detail={
-                        "flag_depth": self._flag_depth.get(sid, 0),
-                    })
-                    logger.warning(
-                        "Canary on %s still flagged — hold-out re-armed", sid)
+                self._unusual_cool_until[sid] = time.time() + min(
+                    _config.UNUSUAL_COOL_BASE_S << min(
+                        self._flag_depth.get(sid, 0), 6),
+                    _config.UNUSUAL_COOL_CAP_S)
+                _ledger.record_event("CANARY_FAIL", nick=sid, detail={
+                    "flag_depth": self._flag_depth.get(sid, 0),
+                })
+                logger.warning(
+                    "Canary on %s still flagged — cool re-armed "
+                    "(flag_depth=%d)", sid, self._flag_depth.get(sid, 0))
             else:
                 self._unusual_strikes[sid] = 0
+                self._unusual_cool_until.pop(sid, None)
+                self._unusual_streak_start.pop(sid, None)
                 self._flag_released.add(sid)
                 if self._session_terminal.pop(sid, None) is not None:
                     _ledger.record_event("TERMINAL_CLEARED", nick=sid,
@@ -3088,6 +3261,8 @@ class FlowClient:
             # Inconclusive probe — release; the real strike path re-catches
             # genuine flags on the next request.
             self._unusual_strikes[sid] = 0
+            self._unusual_cool_until.pop(sid, None)
+            self._unusual_streak_start.pop(sid, None)
             self._flag_released.add(sid)
         finally:
             self._canary_pending.discard(sid)
@@ -3296,13 +3471,15 @@ class FlowClient:
 
     async def _probe_minters(self) -> None:
         prefer = self._minter_nicks()
-        if not prefer:
-            return
         now = time.time()
         for ws, session in list(self._extensions.items()):
             sid = session.get("profile_id")
-            if not sid or sid not in prefer:
+            if not sid:
                 continue
+            # Idle non-minter nicks used to be invisible to this watchdog —
+            # a grey/hung renderer only surfaced when a request landed on it
+            # (or someone hit F5). Probe every connected nick; minters get
+            # mint-routing exclusion on top of the shared reload path.
             route = {"ws": ws, "profile_id": sid,
                      "project_id": self._session_project(session),
                      "pinned": True}
@@ -3319,20 +3496,45 @@ class FlowClient:
             else:
                 res = res.get("result") or {}
             alive = bool(res.get("alive"))
+            if alive and res.get("net_ok") is False:
+                # Renderer answers but its transport is dead ("grey" tab) —
+                # in-page captcha fetches fail while WS stays connected, so
+                # the nick otherwise keeps absorbing dispatches. Same dead
+                # path: bench + reload.
+                alive = False
+                res = {"alive": False, "reason": "NET_DEAD",
+                       "error": res.get("net_error")}
             if alive:
                 if sid in self._minter_page_dead:
                     self._minter_page_dead.pop(sid, None)
                     self._mint_event("page_recovered", minter=sid)
                     logger.info("Minter %s Flow page recovered", sid)
+                if sid in self._probe_page_dead:
+                    self._probe_page_dead.discard(sid)
+                    _ledger.record_event("TAB_RECOVERED", nick=sid,
+                                         detail={"via": "idle_probe"})
                 continue
             reason = res.get("reason") or "unknown"
-            if sid not in self._minter_page_dead:
-                self._minter_page_dead[sid] = now
-                self._mint_event("page_dead", minter=sid, reason=reason,
-                                 error=res.get("error"))
-                logger.warning("Minter %s Flow page dead (%s) — excluding from "
-                               "mint routing, reloading tab", sid, reason)
-            # Reload debounce: at most one reload per RELOAD_SECS per minter.
+            if sid in prefer:
+                if sid not in self._minter_page_dead:
+                    self._minter_page_dead[sid] = now
+                    self._mint_event("page_dead", minter=sid, reason=reason,
+                                     error=res.get("error"))
+                    logger.warning("Minter %s Flow page dead (%s) — excluding from "
+                                   "mint routing, reloading tab", sid, reason)
+            else:
+                if sid not in self._probe_page_dead:
+                    self._probe_page_dead.add(sid)
+                    _ledger.record_event("TAB_DEAD", nick=sid, detail={
+                        "reason": reason, "via": "idle_probe",
+                        "error": res.get("error"),
+                    })
+                    logger.warning("Nick %s Flow page dead (%s) — benching + "
+                                   "reloading tab", sid, reason)
+                # Keep it out of routing while the renderer is unresponsive.
+                session["unavailable_until"] = max(
+                    session.get("unavailable_until", 0), now + 45)
+            # Reload debounce: at most one reload per RELOAD_SECS per nick.
             if now - self._minter_reload_at.get(sid, 0) < _config.CAPTCHA_MINTER_RELOAD_SECS:
                 continue
             self._minter_reload_at[sid] = now
@@ -3340,14 +3542,17 @@ class FlowClient:
             rres = await self._send("reload_flow_tab", {}, timeout=30)
             _current_route.reset(tok)
             if rres.get("error") or rres.get("result", {}).get("ok") is False:
-                logger.warning("Minter %s tab reload failed: %s",
+                logger.warning("Nick %s tab reload failed: %s",
                                sid, rres.get("error") or rres)
             else:
-                logger.info("Minter %s tab reload dispatched", sid)
+                logger.info("Nick %s tab reload dispatched", sid)
 
-    async def _mint_raw(self, action: str, exclude: str | None) -> tuple[str | None, str | None]:
+    async def _mint_raw(self, action: str, exclude: str | None,
+                        route: dict | None = None) -> tuple[str | None, str | None]:
         """Mint one Enterprise token on a healthy sibling. (token, minter)."""
-        route, skipped = self._minter_route(exclude=exclude)
+        skipped = None
+        if route is None:
+            route, skipped = self._minter_route(exclude=exclude)
         if not route:
             reason = ("no_minter_connected" if not skipped
                       else "all_minters_" + "_".join(sorted(set(skipped))))
@@ -3592,6 +3797,29 @@ class FlowClient:
         generation entirely.
         """
         prof_id = (_current_route.get() or {}).get("profile_id")
+        override = self._mint_override.get(prof_id) if prof_id else None
+        if override:
+            # Diagnostic pin: "self" = in-page mint only; otherwise mint on
+            # the named nick's tab. Bypasses pool + fallback so an experiment
+            # measures one token source at a time.
+            self._foreign_mint_pending.discard(prof_id)
+            if override == "self":
+                return None
+            if override == "solver":
+                try:
+                    from agent.services.captcha_solver import solve_recaptcha_v3
+                    token = await solve_recaptcha_v3(action)
+                    if token:
+                        self._active_minter[prof_id] = "solver"
+                    return token
+                except Exception as exc:
+                    logger.warning("Solver override failed for %s (%s); in-page mint fallback", prof_id, exc)
+                    return None
+            route = self._find_session_route(override)
+            token, minter = await self._mint_raw(action, exclude=prof_id, route=route)
+            if token:
+                self._active_minter[prof_id] = minter
+            return token
         mode_f = _config.CAPTCHA_FOREIGN_MINT
         mode_s = _config.CAPTCHA_SOLVER_MODE
         allowed_f = mode_f == "always" or (
@@ -4775,14 +5003,30 @@ class FlowClient:
         async def run(_pid: str):
             urls = await self._batch_media_urls(media_id)
             if not urls.video and not urls.image:
+                # A media that served urls before is likely a transient
+                # upstream eviction, not a dead record — re-fetch once before
+                # dead-caching, and cache the miss for 5min so it can heal.
+                known_good = (
+                    media_id in self._media_url_seen
+                    or media_id in self._media_profiles
+                )
+                if known_good:
+                    await asyncio.sleep(2.0)
+                    urls = await self._batch_media_urls(media_id)
+            if not urls.video and not urls.image:
                 if media_id not in self._dead_media:
                     _ledger.record_event("MEDIA_DEAD", detail={"media_id": media_id})
-                self._dead_media[media_id] = time.time() + 3600
+                ttl_s = 300 if media_id in self._media_url_seen or media_id in self._media_profiles else 3600
+                self._dead_media[media_id] = time.time() + ttl_s
                 if len(self._dead_media) > 4096:
                     now = time.time()
                     for k in [k for k, v in self._dead_media.items() if v <= now][:2048]:
                         self._dead_media.pop(k, None)
                 return {"status": 404, "error": f"No urls for media {media_id}"}
+            self._media_url_seen[media_id] = time.time()
+            if len(self._media_url_seen) > 8192:
+                for k in list(self._media_url_seen.keys())[:2048]:
+                    self._media_url_seen.pop(k, None)
             data: dict = {}
             if urls.video:
                 data["video"] = {"fifeUrl": urls.video}
@@ -5240,7 +5484,8 @@ class FlowClient:
             # RPC that actually evaluates the captcha: upload (maseQ) accepts
             # even garbage tokens, so only gen proves token validity.
             freq = fb.image_request(
-                "a small grey square", project_id, count=1,
+                "a ceramic mug on a wooden table by a sunlit window, photorealistic",
+                project_id, count=1,
                 model=self._batch_image_model(None))
             rpcid = fb.RPC_GEN_IMAGE
         else:

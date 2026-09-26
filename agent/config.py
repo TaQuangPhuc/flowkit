@@ -34,6 +34,7 @@ CAPTCHA_SOLVER_PROVIDER = os.environ.get("CAPTCHA_SOLVER_PROVIDER", "anticaptcha
 CAPTCHA_SOLVER_BASE = os.environ.get("CAPTCHA_SOLVER_BASE", "https://anticaptcha.top")
 CAPTCHA_SOLVER_MODE = os.environ.get("CAPTCHA_SOLVER_MODE", "off")
 CAPTCHA_SOLVER_TIMEOUT_S = float(os.environ.get("CAPTCHA_SOLVER_TIMEOUT_S", "45"))
+CAPTCHA_SOLVER_MIN_SCORE = float(os.environ.get("CAPTCHA_SOLVER_MIN_SCORE", "0.9"))
 
 # Trusted-minter pool: a token minted inside one nick's logged-in Flow page is
 # accepted on another nick's generate call — measured 2026-09-22, including a
@@ -116,6 +117,24 @@ PER_WORKER_VIDEO_COOLDOWN = PER_WORKER_VIDEO_COOLDOWN_MAX
 # UNUSUAL_ACTIVITY audit shows the rate-burst signature is gap<1.2s or
 # >=3 req/10s — non-video RPCs were previously dispatched back-to-back.
 PER_WORKER_RPC_MIN_GAP_S = float(os.environ.get("PER_WORKER_RPC_MIN_GAP_S", "1.5"))
+
+# UNUSUAL_ACTIVITY strike response. Field evidence: the flag follows the
+# Google account/session — a fresh login on a clean residential IP still
+# strikes on the first request, and UI-native submits strike too. Rotating
+# the egress mid-session risks an impossible-travel revoke, and quarantining
+# a shared endpoint burns it for every sibling nick on it. Default now: park
+# the nick and fail over. "1" restores rotate-on-strike for a/b checks.
+UNUSUAL_ROTATE_ON_STRIKE = os.environ.get("UNUSUAL_ROTATE_ON_STRIKE", "0") == "1"
+# UNUSUAL_ACTIVITY is a per-request probabilistic rejection, not an account
+# ban — flagged sessions still pass a share of calls (measured ~50% on Cốc
+# Cốc nicks; flow-fixer: fan-position collapse + sticky-but-finite gate).
+# Response is a short exponential cool per nick instead of the old
+# 720s<<depth park: each strike backs the nick off briefly, a clean canary
+# re-admits it, and only a sustained zero-pass streak graduates to terminal.
+UNUSUAL_COOL_BASE_S = float(os.environ.get("UNUSUAL_COOL_BASE_S", "45"))
+UNUSUAL_COOL_CAP_S = float(os.environ.get("UNUSUAL_COOL_CAP_S", "900"))
+UNUSUAL_TERMINAL_STRIKES = int(os.environ.get("UNUSUAL_TERMINAL_STRIKES", "12"))
+UNUSUAL_TERMINAL_WINDOW_S = float(os.environ.get("UNUSUAL_TERMINAL_WINDOW_S", "900"))
 PROFILES_FILE = Path(os.environ.get("FLOW_PROFILES_FILE", Path(__file__).parent / "profiles.json"))
 
 # ─── Smart Late-Replay (Rescuing stalled Google Veo 3 queue jobs) ───

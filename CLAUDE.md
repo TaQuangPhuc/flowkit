@@ -1,8 +1,40 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # Flow Kit
 
 > **Handoff Guide**: Đọc tài liệu bàn giao kỹ thuật & kiến trúc tại [docs/PROJECT_HANDOFF.md](docs/PROJECT_HANDOFF.md).
 
 Base URL: `http://127.0.0.1:8100`
+
+## Commands
+
+```bash
+./setup.sh                     # One-command setup: Python 3.10+, ffmpeg, Chrome, venv, deps
+source venv/bin/activate       # All commands below assume this
+python -m agent.main           # Start agent: REST API :8100 + WebSocket :9222 + queue worker
+
+# Tests (pytest, heavy mocking — no server or Chrome needed)
+pytest tests/                              # all
+pytest tests/unit/test_processor.py        # one file
+pytest tests/unit/test_processor.py::TestIsAlreadyCompleted  # one class
+node --test tests/extension_flow_guard.test.cjs   # extension MV3 tests (.cjs, node:test)
+
+# Dashboard (React 19 + Vite + Tailwind 4, in dashboard/)
+cd dashboard && npm run dev    # dev server
+cd dashboard && npm run build  # tsc -b && vite build
+cd dashboard && npm run lint   # eslint
+
+# Chrome nick launcher (one Chrome per Google account, sticky residential proxy — never datacenter IP, never rotate)
+scripts/flow-chrome.sh nick-a socks5://USER:PASS@HOST:PORT
+
+# Restart agent safely (keeps Chrome + bridges alive)
+python3 scripts/safe_restart.py
+```
+
+Error taxonomy (Flow reasons, HTTP status, worker retry policy) lives in
+`README.md` → **Error Handling** — consult it before guessing at a failure.
 
 ## Pre-flight
 
@@ -46,6 +78,38 @@ that change how you work:
   To restore an
   unported call properly, see `docs/CAPTURE.md`.
 - **A poll saying "Media not found." is not a failure.** Finished jobs report it.
+
+## Architecture
+
+Request path for every generation (why nothing works headless):
+
+```
+caller → FastAPI (:8100, agent/main.py)
+       → FlowClient (agent/services/flow_client.py) — WS bridge to extension (:9222)
+       → Chrome extension (extension/background.js) — picks signed-in flow.google.com tab
+       → page runs batchexecute RPC (agent/services/flow_batch.py builds f.req envelopes)
+       → Flow signs with session cookie + per-page `at` token + single-use reCAPTCHA (minted in-page)
+```
+
+Key layers:
+
+- **`agent/main.py`** — FastAPI app + WS server + lifespan; routes in `agent/api/*` (thin, delegate to services).
+- **`agent/services/flow_client.py`** (~5.5k lines) — core WS bridge; nick routing (`_run_on_profile`: pick least-busy nick, rewrite project, pin poll/get_media to creator nick; failover across nicks only for unpinned calls).
+- **`agent/services/flow_batch.py`** — batchexecute envelope build/parse (`build_envelope`, `RpcError`); rpcids like `eb1hJf` (i2v), `YhhmEf` (t2v).
+- **`agent/worker/processor.py`** — queue worker (`_run_loop`); failure routing in `_handle_failure` is by **`error_message` string content, not HTTP status** (Flow lumps distinct failures under HTTP 400). Polling per operation via `_poll_batch_operation_once`; `agent/services/flow_failover.py` records op failover/replay for restart recovery.
+- **`agent/db/`** — aiosqlite; `crud.py` with column whitelisting. Pydantic models in `agent/models/`.
+- **Multi-nick fleet** — `agent/services/chrome_nicks.py` (launch/lock/sync extension per nick), `agent/services/gologin_service.py` (antidetect Orbita fingerprints), `agent/services/accounts.py` (nick registry, `agent/profiles.json`), proxy stack: `proxy_forward.py` (LocalProxyBridge hot-swap), `proxy_pool.py`, `surfshark.py`, `proxy_checker.py`. Health/fleet state: `GET /health` `workers[]`.
+- **`auto_tvc_server.py`** — separate HTTPServer (not FastAPI) orchestrating full TVC jobs over FlowKit API; imports `batch_image_studio.py` / `fashion_lookbook_studio.py` (which use `batch_scheduler.py` — durable fair per-nick scheduler). Job state in `auto_runs/`.
+- **`extension/background.js`** — MV3 service worker; finds/reuses Flow tab, injects `injected.js` to run RPCs in-page; reports nick identity + captured project id over WS.
+- **Dashboard** — `dashboard/` React SPA backed by same `:8100` API; i18n in `src/i18n`.
+- **`youtube/`** — OAuth2 multi-channel upload (`auth.py`, `upload.py`); per-channel config in `youtube/channels/<name>/` (gitignored).
+- **`agent/sdk/`** — newer typed layer (models/persistence/services) layered over legacy services; `operations.py` polls/resumes video requests.
+
+Gotchas that span files:
+
+- Nick rename via API must stop Chrome → upsert → relaunch (safety net: "Cannot rename while Chrome is running"); read `_live_row` after relaunch.
+- `DELETE /api/accounts/{id}` stops that nick's Chrome; incidents keyed by `job_id` need `Incidents.resolve_by_nick`.
+- `scratch/` contains deployment snapshots and extension backups — reference copies, not live code; edit the top-level originals.
 
 ## Skills
 

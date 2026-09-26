@@ -56,6 +56,7 @@ class AccountBody(BaseModel):
     enabled: bool = True
     mint_only: bool = False
     browser: str = ""
+    cdp_debug: bool = False
     old_id: str | None = None
 
 
@@ -383,6 +384,115 @@ async def diagnose_fleet(hours: float = 24.0):
     }
 
 
+def _lineage_key(nick_id: str) -> str:
+    """Account identity of a nick: the root id with any -dual/-dual-N clone
+    suffix stripped. clone_of chains break when a parent nick is deleted, so
+    the suffix is the durable lineage signal."""
+    import re
+    return re.sub(r"-dual(-\d+)?$", "", nick_id)
+
+
+@router.get("/lineage")
+async def lineage_report():
+    """Per-account (lineage) health: group nicks by Google account and answer
+    'is this account still usable at all?'. A dead root with a live clone is
+    fine; an account is only lost when every member session is dead — that is
+    when the operator should relogin one member and drop the rest."""
+    import re
+    from agent.services.accounts import load_accounts
+    client = get_flow_client()
+    accs = [a for a in load_accounts() if a.get("id")]
+    groups: dict[str, list[dict]] = {}
+    for a in accs:
+        groups.setdefault(_lineage_key(a["id"]), []).append(a)
+
+    accounts = []
+    covered = needs = minted = 0
+    for key in sorted(groups):
+        members = []
+        for a in sorted(groups[key], key=lambda x: (x["id"] != key, x["id"])):
+            st = client.live_state(a["id"])
+            mint = bool(st.get("mint_only"))
+            connected = bool(st.get("connected"))
+            pstate = st.get("page_state")
+            # Session truth, not gate labels: wall/park/terminal are temporary
+            # gates on a signed-in session; signed_out is proven dead; an
+            # offline nick is unknown until launched and probed.
+            if connected:
+                session_state = "dead" if pstate == "signed_out" else "alive"
+            else:
+                session_state = "offline"
+            members.append({
+                "id": a["id"],
+                "role": "root" if a["id"] == key else "clone",
+                "mint_only": mint,
+                "enabled": bool(st.get("enabled")),
+                "connected": connected,
+                "page_state": pstate,
+                "gate": st.get("gate"),
+                "routable": bool(st.get("routable")),
+                "session": session_state,
+            })
+
+        gen = [m for m in members if not m["mint_only"]]
+        mint = [m for m in members if m["mint_only"]]
+        gen_alive = [m for m in gen if m["session"] == "alive"]
+        gen_dead = [m for m in gen if m["session"] == "dead"]
+        gen_off = [m for m in gen if m["session"] == "offline"]
+        mint_alive = [m for m in mint if m["session"] == "alive"]
+
+        if gen and not mint:
+            kind = "gen"
+        elif not gen:
+            kind = "mint"
+        else:
+            kind = "gen+mint"
+
+        serving = [m["id"] for m in gen_alive if m["routable"]]
+        if kind == "mint":
+            state = "mint_ok" if mint_alive else "mint_dead"
+            minted += 1
+            action = None if mint_alive else "mint tab chết — relaunch/reload"
+            keep = None
+        elif gen_alive:
+            state = "ok"
+            covered += 1
+            action = None
+            keep = (serving or [gen_alive[0]["id"]])[0]
+        elif gen_off:
+            state = "unknown"
+            action = "không member nào đang chạy — launch để xác minh session"
+            keep = gen_off[0]["id"]
+        else:
+            state = "needs_relogin"
+            needs += 1
+            # Relogin the root when present, else the first dead member; the
+            # rest of the lineage can be deleted — dead sessions hold nothing.
+            keep = key if any(m["id"] == key for m in gen) else (gen[0]["id"] if gen else None)
+            action = f"relogin {keep} rồi xóa các member còn lại"
+
+        accounts.append({
+            "id": key,
+            "kind": kind,
+            "state": state,
+            "alive": len(gen_alive), "dead": len(gen_dead), "offline": len(gen_off),
+            "serving": serving,
+            "keep_member": keep,
+            "action": action,
+            "members": members,
+        })
+
+    order = {"needs_relogin": 0, "mint_dead": 1, "unknown": 2, "ok": 3, "mint_ok": 4}
+    accounts.sort(key=lambda a: (order.get(a["state"], 5), a["id"]))
+    return {
+        "accounts": accounts,
+        "summary": {
+            "total": len(accounts), "covered": covered,
+            "needs_relogin": needs, "mint_accounts": minted,
+        },
+    }
+
+
 @router.get("/auth-report")
 async def auth_report_endpoint(window_s: int = 3600):
     """Which nicks are 401, judged from raw netlog status codes.
@@ -556,6 +666,34 @@ async def profile_restore(nick_id: str):
             "backup": str(backup), "launch": launch_res, "cleared": cleared}
 
 
+@router.post("/{nick_id}/mint-override")
+async def mint_override(nick_id: str, source: str = "off"):
+    """Diagnostic: pin this nick's captcha token source.
+
+    ``self`` = in-page mint only, ``off`` = normal policy, anything else = the
+    nick whose tab mints the token. In-memory; cleared on restart.
+    """
+    client = get_flow_client()
+    if source == "off":
+        client._mint_override.pop(nick_id, None)
+    else:
+        if source not in ("self", "solver") and get_account(source) is None:
+            raise HTTPException(404, f"unknown minter {source}")
+        client._mint_override[nick_id] = source
+    return {"ok": True, "id": nick_id, "source": client._mint_override.get(nick_id, "off")}
+
+
+@router.post("/{nick_id}/reserve")
+async def reserve_nick(nick_id: str, on: bool = True):
+    """Diagnostic: hold a nick out of customer/failover routing; only calls
+    pinned to it by name still reach it. In-memory; cleared on restart."""
+    if get_account(nick_id) is None:
+        raise HTTPException(404, f"unknown account {nick_id}")
+    client = get_flow_client()
+    (client._reserved_nicks.add if on else client._reserved_nicks.discard)(nick_id)
+    return {"ok": True, "id": nick_id, "reserved": nick_id in client._reserved_nicks}
+
+
 @router.post("/{nick_id}/rotate-proxy")
 async def rotate_proxy(nick_id: str, body: RotateProxyBody | None = None):
     target = body.target_proxy if body else None
@@ -563,6 +701,26 @@ async def rotate_proxy(nick_id: str, body: RotateProxyBody | None = None):
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "Failed to rotate proxy"))
     _reload_router()
+    return res
+
+
+@router.post("/{nick_id}/activity-pulse")
+async def activity_pulse(nick_id: str, seconds: float = 8.0, click: bool = False):
+    """Trusted-input activity pulse on this nick's Flow tab via CDP.
+
+    reCAPTCHA scores recent human signals on the session — a few seconds of
+    real pointer movement right before a mint raises the token score. Requires
+    the account's cdp_debug flag (adds --remote-debugging-port=0 at launch).
+    """
+    from agent.services.cdp_pulse import pulse
+    try:
+        res = await asyncio.wait_for(
+            pulse(nick_id, seconds=min(max(seconds, 1.0), 60.0), click=click),
+            timeout=min(max(seconds, 1.0), 60.0) + 20.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, f"pulse timed out on {nick_id}")
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "pulse failed"))
     return res
 
 
