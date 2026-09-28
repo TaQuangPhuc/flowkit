@@ -72,6 +72,29 @@ _current_route: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
 )
 
 
+def _grpc_active() -> bool:
+    """Direct-gRPC iOS transport switch (FLOW_TRANSPORT).
+
+    ``grpc``/``on`` forces it, ``batch``/``off`` forces the Chrome extension
+    path, default ``auto`` uses gRPC when at least one ``nicks/`` credential
+    bundle exists."""
+    mode = os.environ.get("FLOW_TRANSPORT", "auto").lower()
+    if mode in ("batch", "ext", "extension", "off", "0"):
+        return False
+    if mode in ("grpc", "ios", "on", "1"):
+        return True
+    try:
+        from agent.services.flow_grpc import get_flow_grpc
+        return bool(get_flow_grpc().nicks())
+    except Exception:
+        return False
+
+
+def _grpc():
+    from agent.services.flow_grpc import get_flow_grpc
+    return get_flow_grpc()
+
+
 class _SessionFlagged(Exception):
     """Sentinel: skip rotate+retry on a session-flagged nick so the request
     falls through to cross-nick failover instead of burning ~40s and a fresh
@@ -2336,7 +2359,7 @@ class FlowClient:
 
     @property
     def connected(self) -> bool:
-        return bool(self._extensions)
+        return bool(self._extensions) or _grpc_active()
 
     @property
     def ws_stats(self) -> dict:
@@ -4081,6 +4104,11 @@ class FlowClient:
         old REST one so the parsers downstream do not have to care which
         transport produced it.
         """
+        if _grpc_active():
+            return await _grpc().generate_images(
+                prompt=prompt, project_id=project_id,
+                aspect_ratio=aspect_ratio, profile_id=profile_id,
+                character_media_ids=character_media_ids)
         if not USE_BATCH_RPC:
             return await self._legacy_generate_images(
                 prompt, project_id, aspect_ratio, user_paygate_tier, character_media_ids)
@@ -4144,6 +4172,13 @@ class FlowClient:
                               *,
                               profile_id: str | None = None) -> dict:
         """Submit i2v (start frame) or t2v (no start frame). Returns operations."""
+        if _grpc_active():
+            if end_image_media_id:
+                return {"error": "start+end frame chaining not captured on grpc path"}
+            return await _grpc().generate_video(
+                start_image_media_id=start_image_media_id, prompt=prompt,
+                project_id=project_id, aspect_ratio=aspect_ratio,
+                profile_id=profile_id)
         start = start_image_media_id or None
         if not USE_BATCH_RPC:
             if not start:
@@ -4236,6 +4271,11 @@ class FlowClient:
                                               *,
                                               profile_id: str | None = None) -> dict:
         """Generate video from multiple reference images (r2v)."""
+        if _grpc_active():
+            return await _grpc().generate_video_from_references(
+                reference_media_ids=list(reference_media_ids or []),
+                prompt=prompt, project_id=project_id,
+                aspect_ratio=aspect_ratio, profile_id=profile_id)
         if not USE_BATCH_RPC:
             return await self._legacy_generate_video_from_references(
                 reference_media_ids, prompt, project_id, scene_id,
@@ -4341,6 +4381,8 @@ class FlowClient:
         Everything short of that is PENDING, and the caller's own poll loop
         owns the timeout.
         """
+        if _grpc_active():
+            return await _grpc().check_video_status(operations)
         if not USE_BATCH_RPC:
             return await self._legacy_check_video_status(operations)
 
@@ -4993,8 +5035,19 @@ class FlowClient:
         status = result.get("status", 500)
         return isinstance(status, int) and status == 200
 
+    def media_auth_headers(self, media_id: str) -> dict:
+        """Extra headers needed to download a media URL (lh3 under grpc)."""
+        if _grpc_active():
+            try:
+                return _grpc().media_auth_headers(media_id)
+            except Exception:
+                return {}
+        return {}
+
     async def get_media(self, media_id: str) -> dict:
         """Fetch a media record, which is where a fresh signed url lives."""
+        if _grpc_active():
+            return await _grpc().get_media(media_id)
         if not USE_BATCH_RPC:
             return await self._legacy_get_media(media_id)
         dead_until = self._dead_media.get(media_id, 0)
@@ -5045,6 +5098,11 @@ class FlowClient:
                             *, profile_id: str | None = None,
                             reference_media_id: str | None = None) -> dict:
         """Upload an image into the project so it can be used as a reference."""
+        if _grpc_active():
+            return await _grpc().upload_image(
+                image_base64=image_base64, mime_type=mime_type,
+                project_id=project_id, profile_id=profile_id,
+                reference_media_id=reference_media_id)
         if reference_media_id:
             # A reference owned by an unroutable nick (mint_only/disabled) can
             # no longer bind this upload — rebind the reference itself first.
@@ -5088,6 +5146,13 @@ class FlowClient:
 
         Zero-cost multimodal analysis and scriptwriting using Flow's signed-in session.
         """
+        if _grpc_active() and not self._extensions:
+            return {"status": 501, "error": _unsupported(
+                "vision-analyze",
+                "agJzFb is an in-page batchexecute RPC — it was never "
+                "captured on iOS and cannot run on the gRPC transport. "
+                "Keep one Chrome nick connected for profiling calls, or "
+                "move profiling to NOVA's own Gemini gateway.")}
         async def run(pid: str):
             chosen_session = session_uuid or self._chat_session_for_route()
             if not chosen_session:
