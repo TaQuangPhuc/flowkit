@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from agent.config import (
@@ -33,6 +34,7 @@ from agent.api.accounts import router as accounts_router
 from agent.api.system import router as system_router
 from agent.api.fashion_lookbook import router as fashion_lookbook_router
 from agent.api.incidents import router as incidents_router
+from agent.api.admin import router as admin_router
 from agent.services.central_watchdog import start_central_watchdog, stop_central_watchdog
 from agent.services.flow_trace import FlowTraceMiddleware, emit as trace_emit, identifier as trace_identifier, summary as trace_summary
 from agent.services.request_shield import RequestShieldMiddleware, get_request_shield
@@ -180,6 +182,11 @@ app = FastAPI(title="Flow Kit", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(RequestShieldMiddleware)
 app.add_middleware(FlowTraceMiddleware)
+try:
+    from agent.services.api_key_auth import APIKeyMiddleware
+    app.add_middleware(APIKeyMiddleware)
+except Exception as _auth_err:
+    logger.warning("API key middleware unavailable: %s", _auth_err)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -204,6 +211,13 @@ app.include_router(accounts_router, prefix="/api")
 app.include_router(system_router, prefix="/api")
 app.include_router(fashion_lookbook_router, prefix="/api")
 app.include_router(incidents_router)
+app.include_router(admin_router, prefix="/api")
+
+
+@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+def admin_page():
+    from agent.api.admin import admin_page as _page
+    return _page()
 
 
 import secrets as _secrets
@@ -375,10 +389,21 @@ async def ext_netlog_tail(limit: int = 40):
 @app.get("/health")
 async def health():
     client = get_flow_client()
+    transport = "extension"
+    grpc_nicks = []
+    try:
+        from agent.services.flow_client import _grpc_active, _grpc
+        if _grpc_active():
+            transport = "grpc"
+            grpc_nicks = _grpc().nicks()
+    except Exception:
+        pass
     return {
         "status": "ok",
         "version": "0.2.0",
         "extension_connected": client.connected,
+        "transport": transport,
+        "grpc_nicks": grpc_nicks,
         "video_cooldown_range_s": [PER_WORKER_VIDEO_COOLDOWN_MIN, PER_WORKER_VIDEO_COOLDOWN_MAX],
         "video_cooldown_s": PER_WORKER_VIDEO_COOLDOWN,
         "video_poll_timeout_s": VIDEO_POLL_TIMEOUT,

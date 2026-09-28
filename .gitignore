@@ -28,6 +28,10 @@ logs/
 
 # Generated AI tool configs (run: python setup.py)
 .claude/commands/fk-*
+
+# iPhone gRPC capture credentials — never commit live tokens
+nicks/
+.omc/research/mitm_captured.jsonl
 .gemini/commands/
 AGENTS.md
 GEMINI.md
@@ -52,3 +56,4 @@ scratch/
 gateway/
 .tabnine/
 agent/proxy_burned_ips.json
+secrets.env

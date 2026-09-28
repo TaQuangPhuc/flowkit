@@ -178,6 +178,99 @@ NOVA_BASE_URL = os.environ.get("NOVA_BASE_URL", "https://api.vilao.ai/v1")
 NOVA_API_KEY = os.environ.get("NOVA_API_KEY", "sk-72afd079199f58a7b302e65b6690744ce8cf7b44c0dcd163070052e7fa774535")
 NOVA_MODEL = os.environ.get("NOVA_MODEL", "chib/deepseek-v4.1-flash")
 
+# Remote-call hardening: this server binds 0.0.0.0 and is proxied publicly via
+# novagateway.net/flow-studio/. Without a shared key, anyone could create jobs
+# for free, pick their own tenant_id, and set num_threads above their plan.
+# TVC_API_KEY   — Nova injects X-TVC-Key after session+CSRF+tenant checks.
+# TVC_RUN_SECRET— HMAC key for run_token minted by Nova's charge endpoints;
+#                 proves a wallet charge before batch/lookbook creates run.
+TVC_API_KEY = os.environ.get("TVC_API_KEY", os.environ.get("FLOWKIT_TVC_API_KEY", "")).strip()
+TVC_RUN_SECRET = os.environ.get("TVC_RUN_SECRET", "").strip() or TVC_API_KEY
+_USED_RUN_TOKENS: set = set()
+_USED_RUN_TOKENS_LOCK = threading.Lock()
+
+import hmac as _hmac
+import hashlib as _hashlib
+
+
+def _tvc_local_client(handler) -> bool:
+    try:
+        return handler.client_address[0] in ("127.0.0.1", "::1")
+    except Exception:
+        return False
+
+
+def _tvc_api_authorized(handler) -> bool:
+    """Remote api/* callers need the shared key. Loopback ops stay open."""
+    if _tvc_local_client(handler):
+        return True
+    if not TVC_API_KEY:
+        return False  # fail closed: an unset key would leave the API public
+    key = (handler.headers.get("X-TVC-Key") or "").strip()
+    return bool(key) and _hmac.compare_digest(key, TVC_API_KEY)
+
+
+def _tvc_verify_run_token(token: str, tenant_id: str) -> int:
+    """Returns the token's threads cap on success, 0 on failure."""
+    if not TVC_RUN_SECRET or not token:
+        return 0
+    try:
+        raw, sig = token.rsplit(".", 1)
+        expect = _hmac.new(TVC_RUN_SECRET.encode(), raw.encode(), _hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(sig, expect):
+            return 0
+        pad = "=" * (-len(raw) % 4)
+        data = json.loads(base64.urlsafe_b64decode(raw + pad))
+        if str(data.get("t", "")) != str(tenant_id or ""):
+            return 0
+        if int(data.get("x", 0)) < int(time.time()):
+            return 0
+        # Single-use: one charge mints one run. Tokens live in memory;
+        # surviving a restart only re-opens a 2h window, so this is acceptable.
+        with _USED_RUN_TOKENS_LOCK:
+            if token in _USED_RUN_TOKENS:
+                return 0
+            if len(_USED_RUN_TOKENS) > 10000:
+                _USED_RUN_TOKENS.clear()
+            _USED_RUN_TOKENS.add(token)
+        return int(data.get("th") or 0) or 1
+    except Exception:
+        return 0
+
+
+def _tvc_json_error(handler, status: int, error: str):
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    handler.wfile.write(json.dumps({"ok": False, "error": error}).encode("utf-8"))
+
+
+def _tvc_create_authorized(handler, fields=None) -> bool:
+    """Remote pipeline creates (batch image/outfit, lookbook) must carry a
+    valid single-use run_token minted by Nova after the wallet charge.
+    Loopback callers are exempt (internal tooling, local UI)."""
+    if _tvc_local_client(handler):
+        return True
+    token = (handler.headers.get("X-Run-Token") or "").strip()
+    if not token and fields:
+        tok = fields.get("run_token") or fields.get("run-token") or ""
+        if isinstance(tok, (list, tuple)):
+            token = str(tok[0] or "").strip() if tok else ""
+        else:
+            token = str(tok or "").strip()
+    tenant = (handler.headers.get("X-Tenant-Id") or "").strip()
+    if not tenant and fields:
+        t_val = fields.get("tenant_id") or ""
+        if isinstance(t_val, (list, tuple)):
+            tenant = str(t_val[0] or "").strip() if t_val else ""
+        else:
+            tenant = str(t_val or "").strip()
+    if _tvc_verify_run_token(token, tenant) <= 0:
+        _tvc_json_error(handler, 402, "billing_required")
+        return False
+    return True
+
 _DEFAULT_FALLBACKS = ["spd/grok-4.6", "grok-4.6", "cnt/grok-4.6", "fa/grok-4.6-fast"]
 _env_fallbacks = os.environ.get("NOVA_FALLBACK_MODELS", "")
 if _env_fallbacks:
@@ -3437,7 +3530,13 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
     def do_GET(self, head_only: bool = False):
         p = self.path.split("?")[0].strip("/")
-        
+
+        # api/* plus tenant file paths (job/, batch/, download/) require the
+        # shared key for remote callers; only static shell/UI stays public.
+        if (p.startswith("api/") or p.startswith("job/") or p.startswith("batch/") or p.startswith("download/")) and not _tvc_api_authorized(self):
+            _tvc_json_error(self, 401, "unauthorized")
+            return
+
         # API Diagnostics - Unusual Activity Audit & Proxy Health
         if p == "api/diagnostics/unusual-audit":
             try:
@@ -4042,6 +4141,11 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = self.path.split("?")[0].strip("/")
+
+        if (p.startswith("api/") or p.startswith("job/") or p.startswith("batch/") or p.startswith("download/")) and not _tvc_api_authorized(self):
+            _tvc_json_error(self, 401, "unauthorized")
+            return
+
         if p == "api/product/scrape":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length > 0 else b"{}"
@@ -4547,6 +4651,9 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             fields, files = bis.parse_multipart_form(body, boundary)
 
+            if not _tvc_create_authorized(self, fields):
+                return
+
             face_list = files.get("face_image") or files.get("model") or []
             if not face_list:
                 self.send_response(400)
@@ -4592,6 +4699,9 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             fields, files = bis.parse_multipart_form(body, boundary)
+
+            if not _tvc_create_authorized(self, fields):
+                return
 
             model_list = files.get("model_files") or files.get("model_images") or []
             outfit_list = files.get("outfit_files") or files.get("outfit_images") or []
@@ -4716,6 +4826,10 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
                     bgm_id
                 )
 
+            _lb_fields = fields if "boundary=" in content_type else req_json
+            if not _tvc_create_authorized(self, _lb_fields):
+                return
+
             if not outfit_bytes and not outfit_url:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -4803,6 +4917,19 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
                 pass
         if not tenant_id:
             tenant_id = str(self.headers.get("X-Tenant-Id") or "").strip()
+
+        # Remote creates must come through Nova's charged proxy path:
+        # X-TVC-Billed is injected only after the wallet charge succeeds, and
+        # the proxy strips client-forged copies. X-Tenant-Id from the gateway
+        # is authoritative over any tenant_id field in the form.
+        _remote_create = not _tvc_local_client(self)
+        if _remote_create:
+            if (self.headers.get("X-TVC-Billed") or "") != "1":
+                _tvc_json_error(self, 402, "billing_required")
+                return
+            _hdr_tenant = str(self.headers.get("X-Tenant-Id") or "").strip()
+            if _hdr_tenant:
+                tenant_id = _hdr_tenant
 
         flow_mode = "pov"
         video_engine = "veo"
@@ -4946,6 +5073,27 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"ok": False, "error": "Vui lòng tải lên ít nhất 1 ảnh sản phẩm hoặc chọn ảnh từ gallery!"}).encode("utf-8"))
             return
+
+        # Remote creates: clamp threads to the plan cap Nova injected, then
+        # enforce a tenant-wide in-flight thread budget so stacking jobs
+        # cannot exceed the plan allowance.
+        if _remote_create:
+            try:
+                _cap = int(self.headers.get("X-TVC-Threads") or 0)
+            except Exception:
+                _cap = 0
+            if _cap > 0:
+                num_threads = max(1, min(_cap, num_threads))
+            _inflight = 0
+            for _j in JOBS.values():
+                if str(_j.get("tenant_id") or "") == str(tenant_id) and str(_j.get("status") or "") in ("QUEUED", "PROCESSING", "REGENERATING"):
+                    try:
+                        _inflight += int(_j.get("num_threads") or 1)
+                    except Exception:
+                        _inflight += 1
+            if _cap > 0 and _inflight + num_threads > _cap:
+                _tvc_json_error(self, 429, "thread_budget_exceeded")
+                return
 
         if "veo" in video_engine:
             resolution = "720p"
