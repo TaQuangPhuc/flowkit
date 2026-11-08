@@ -1,0 +1,15 @@
+[Unit]
+Description=FlowKit tlsrelay gateway
+After=network.target flowkit-agent.service
+
+[Service]
+WorkingDirectory=/opt/flowkit
+Environment=GW_LISTEN=0.0.0.0:8100
+ExecStart=/opt/flowkit/tlsrelay /opt/flowkit
+Restart=always
+RestartSec=3
+# relay drains in-flight gRPC calls on SIGTERM before exiting
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

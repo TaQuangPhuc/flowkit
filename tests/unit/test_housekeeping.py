@@ -341,6 +341,33 @@ class TestParkedResponse:
         err = _Err(retry_after=int(res.headers["Retry-After"]))
         assert is_parked(err, res.body.decode()) is True
 
+    def test_upload_invalid_argument_is_not_a_retryable_429(self):
+        res = _respond_flow_result({
+            "status": 400,
+            "error": "Request contains an invalid argument.",
+            "error_code": "upload_invalid_argument",
+            "retryable": False,
+        })
+        assert res.status_code == 400
+        body = json.loads(res.body)
+        assert body["retryable"] is False
+        assert body["error_code"] == "upload_invalid_argument"
+
+    def test_google_internal_error_is_a_retryable_429(self):
+        res = _respond_flow_result({
+            "status": 429,
+            "error": "grpc[friend] Internal error encountered.",
+            "error_code": "google_transient",
+            "retryable": True,
+            "retry_after_s": 5,
+        })
+        assert res.status_code == 429
+        body = json.loads(res.body)
+        assert body["retryable"] is True
+        assert body["error"] == "GOOGLE_TRANSIENT"
+        assert body["error_code"] == "google_transient"
+        assert res.headers["Retry-After"] == "5"
+
     def test_other_errors_still_raise(self):
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as exc:

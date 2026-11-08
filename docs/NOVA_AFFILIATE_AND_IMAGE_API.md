@@ -339,3 +339,32 @@ curl -s -X POST http://127.0.0.1:8089/api/scene/regen \
   -H "Content-Type: application/json" \
   -d '{"job_id": "c88ac2a0", "scene_id": 1, "image_prompt": "Prompt mới", "motion_prompt": "Motion mới", "dialogue": "Thoại mới", "regen_keyframe": true}'
 ```
+
+---
+
+## ADDENDUM 2026-09-28 — gRPC TRANSPORT (iOS credential bundles)
+
+FlowKit :8100 nay chạy transport **gRPC trực tiếp** tới `aisandbox-pa.googleapis.com`
+(không cần Chrome extension). `GET /health` báo `"transport": "grpc"` và
+`"grpc_nicks": [...]`; `extension_connected: true` vẫn giữ nghĩa "có transport".
+
+**NOVA không cần sửa API** — mọi endpoint, payload field và response shape giữ
+nguyên. Field alias đã map sẵn: `referenceImageMediaIds` → refs,
+`aspectRatio` ("9:16"/"16:9") → aspect enum.
+
+Đã verify end-to-end trên gRPC: upload-image, generate-image (refs + portrait/
+landscape), generate-video (i2v/t2v), generate-video-refs (r2v), check-status,
+/api/flow/image/{id} serve.
+
+**Giới hạn còn lại** (extension-only, chưa port):
+- `POST /api/flow/vision-analyze` — in-page RPC agJzFb → trả `501` có giải thích
+  khi chạy pure gRPC. Dùng NOVA Gemini gateway thay thế nếu cần profiler.
+- `POST /api/flow/upscale-video`, Omni Flash, start+end chaining — cũng không port.
+
+**Firewall**: nếu NOVA chạy máy khác, mở inbound rule một lần (admin):
+`netsh advfirewall firewall add rule name="FlowKit-8100" dir=in action=allow protocol=TCP localport=8100`
+`netsh advfirewall firewall add rule name="FlowKit-8089" dir=in action=allow protocol=TCP localport=8089`
+
+**Debug**: mọi request NOVA → :8100 trace theo `X-Request-ID` trong
+`.scratch/flow-trace-api.jsonl` (events `http.*`, `grpc.*`: acquire/facade/rpc
+với nick, elapsed_ms, grpc_code).

@@ -89,6 +89,21 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 VIDEO_POLL_INTERVAL = int(os.environ.get("VIDEO_POLL_INTERVAL", "10"))  # polling interval for video/upscale status
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 VIDEO_POLL_TIMEOUT = int(os.environ.get("VIDEO_POLL_TIMEOUT", "300"))
+# t2v/i2v that never grow a video URL stay PENDING forever and Nova sits
+# at progress 20 until poll_timeout. After this many seconds FlowKit
+# reports FAILED + retryable so Nova can retry instead of hanging.
+VIDEO_STUCK_TIMEOUT = int(os.environ.get("VIDEO_STUCK_TIMEOUT", "240"))
+# Upstream drops some renders silently (BatchCheck complains "Media not
+# found"). Stuck ops auto-resubmit once: immediately when BatchCheck
+# confirms dead, otherwise after this many seconds of polling. Must leave
+# the retried op enough runway before the caller's own deadline (~15 min
+# for Nova/LightVisual) — 5 min here means a fresh render still lands.
+VIDEO_RESUBMIT_S = int(os.environ.get("VIDEO_RESUBMIT_S", "300"))
+# Submit facade retries across nicks until this budget expires instead of
+# giving up after one try per nick — cd-off nicks recover instantly, so a
+# THROTTLED sweep usually clears within seconds. Bounds queue-wait time so
+# a request cannot hold a slot past Nova's own submit timeout.
+FLOW_SUBMIT_RETRY_S = int(os.environ.get("FLOW_SUBMIT_RETRY_S", "90"))
 API_COOLDOWN = int(os.environ.get("API_COOLDOWN", "1"))  # seconds between API calls (anti-spam)
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "65"))  # Google Flow max parallel requests
 STALE_PROCESSING_TIMEOUT = int(os.environ.get("STALE_PROCESSING_TIMEOUT", "600"))  # 10 min
@@ -131,8 +146,8 @@ UNUSUAL_ROTATE_ON_STRIKE = os.environ.get("UNUSUAL_ROTATE_ON_STRIKE", "0") == "1
 # Response is a short exponential cool per nick instead of the old
 # 720s<<depth park: each strike backs the nick off briefly, a clean canary
 # re-admits it, and only a sustained zero-pass streak graduates to terminal.
-UNUSUAL_COOL_BASE_S = float(os.environ.get("UNUSUAL_COOL_BASE_S", "45"))
-UNUSUAL_COOL_CAP_S = float(os.environ.get("UNUSUAL_COOL_CAP_S", "900"))
+UNUSUAL_COOL_BASE_S = int(os.environ.get("UNUSUAL_COOL_BASE_S", "45"))
+UNUSUAL_COOL_CAP_S = int(os.environ.get("UNUSUAL_COOL_CAP_S", "900"))
 UNUSUAL_TERMINAL_STRIKES = int(os.environ.get("UNUSUAL_TERMINAL_STRIKES", "12"))
 UNUSUAL_TERMINAL_WINDOW_S = float(os.environ.get("UNUSUAL_TERMINAL_WINDOW_S", "900"))
 PROFILES_FILE = Path(os.environ.get("FLOW_PROFILES_FILE", Path(__file__).parent / "profiles.json"))

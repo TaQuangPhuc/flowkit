@@ -1,0 +1,16 @@
+[Unit]
+Description=FlowKit iOS mitm capture (%i)
+After=network.target
+# Capture only. Does not sit on :8100 / :8089.
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/flowkit/mitm
+EnvironmentFile=/etc/flowkit/mitm-%i.env
+ExecStart=/opt/flowkit/mitm/run.sh %i
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

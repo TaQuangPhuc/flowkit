@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowKit Admin — Nick Monitor</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e6edf3;
+          --dim:#8b949e; --ok:#3fb950; --err:#f85149; --warn:#d29922; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 "Segoe UI",Consolas,monospace; padding:16px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+          gap:12px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--border);
+          border-radius:8px; padding:12px; }
+  .card h2 { font-size:15px; margin:0 0 8px; display:flex; align-items:center; gap:8px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); }
+  .dot.ok { background:var(--ok); } .dot.err { background:var(--err); }
+  .kv { display:flex; justify-content:space-between; font-size:12px;
+        padding:2px 0; color:var(--dim); }
+  .kv b { color:var(--fg); font-weight:600; }
+  .lasterr { margin-top:8px; font-size:11px; color:var(--err);
+             background:#2d1114; border:1px solid #5c1f23; border-radius:6px;
+             padding:6px 8px; word-break:break-all; display:none; }
+  .bar { height:4px; background:var(--border); border-radius:2px; margin-top:8px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--ok); }
+  .toolbar { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  select, input[type=checkbox] { background:var(--card); color:var(--fg);
+        border:1px solid var(--border); border-radius:6px; padding:5px 8px; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:10px;
+           background:var(--card); border:1px solid var(--border); color:var(--dim); }
+  .badge.hot { color:var(--warn); border-color:var(--warn); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--dim); font-weight:600; position:sticky; top:0; background:var(--bg); }
+  td.ev { font-family:Consolas,monospace; white-space:nowrap; }
+  tr.errrow td { color:var(--err); }
+  tr.okrow td.ev { color:var(--ok); }
+  .logwrap { max-height:520px; overflow-y:auto; border:1px solid var(--border);
+             border-radius:8px; }
+  .tabs { display:flex; gap:6px; margin-bottom:12px; }
+  .tabs button { background:var(--card); color:var(--dim); border:1px solid var(--border);
+                 border-radius:8px; padding:6px 16px; cursor:pointer; font:inherit; }
+  .tabs button.on { color:var(--fg); border-color:var(--ok); background:#12211a; }
+  .cdbtn { font-size:10px; padding:1px 7px; border-radius:8px; cursor:pointer;
+           border:1px solid var(--border); background:var(--card); color:var(--dim);
+           margin-left:auto; font:inherit; }
+  .cdbtn.off { color:var(--warn); border-color:var(--warn); }
+  .tabs button .cnt { color:var(--dim); font-size:11px; margin-left:6px; }
+  .tabs button.haserr .cnt { color:var(--err); }
+  .ts { color:var(--dim); }
+  .extra { color:var(--dim); font-size:11px; }
+</style>
+</head>
+<body>
+<h1>FlowKit Admin — Nick Monitor</h1>
+<div class="sub">gRPC transport · auto-refresh 3s · <span id="srv"></span></div>
+
+<div class="toolbar">
+  <select id="nickSel"><option value="">Tất cả nick</option></select>
+  <label><input type="checkbox" id="errOnly"> Chỉ lỗi</label>
+  <span class="badge" id="waiters">waiters: 0</span>
+  <span class="badge" id="queuedImg">queued img: 0</span>
+  <span class="badge" id="queuedVid">queued vid: 0</span>
+  <span class="badge" id="count">0 events</span>
+</div>
+
+<div class="tabs">
+  <button data-tab="iphone" class="on" onclick="setTab('iphone')">iPhone<span class="cnt" id="cnt-iphone"></span></button>
+  <button data-tab="android" onclick="setTab('android')">Android<span class="cnt" id="cnt-android"></span></button>
+  <button data-tab="premium" onclick="setTab('premium')">Premium<span class="cnt" id="cnt-premium"></span></button>
+</div>
+
+<div class="grid" id="cards"></div>
+
+<div class="logwrap"><table>
+<thead><tr><th>Time</th><th>Nick</th><th>Event</th><th>Trace</th><th>Detail</th></tr></thead>
+<tbody id="log"></tbody>
+</table></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const fmt = ts => ts ? new Date(ts).toLocaleTimeString('vi-VN',{hour12:false}) : '—';
+
+async function jget(u){ const r = await fetch(u); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+let _sig = '';   // skip DOM rebuild when nothing changed
+let curTab = 'iphone';
+function setTab(t){ curTab = t; _sig = '';
+  document.querySelectorAll('.tabs button').forEach(b =>
+    b.classList.toggle('on', b.dataset.tab === t));
+  refresh();
+}
+
+async function toggleCd(nick, off){
+  await fetch(`/api/admin/nicks/${nick}/cooldown?off=${off}`, {method:'POST'});
+  _sig = ''; refresh();
+}
+
+function detailOf(e){
+  const parts = [];
+  if (e.op) parts.push(e.op);
+  if (e.rpc) parts.push(e.rpc);
+  if (e.elapsed_ms != null) parts.push(e.elapsed_ms+'ms');
+  if (e.inflight != null && typeof e.inflight === 'number') parts.push('inflight='+e.inflight);
+  if (e.queued_s) parts.push('queued='+e.queued_s+'s');
+  if (e.paced_s) parts.push('pace='+e.paced_s+'s');
+  if (e.media) parts.push('media='+e.media.map(m=>m.slice(0,8)).join(','));
+  if (e.ops) parts.push('ops='+e.ops.map(m=>(m||'').slice(0,8)).join(','));
+  if (e.ref_ids) parts.push('refs='+Object.entries(e.ref_ids).map(([k,v])=>k+'→'+v).join(','));
+  if (e.error) parts.push('ERR: '+e.error);
+  if (e.status) parts.push('status='+e.status);
+  if (e.path) parts.push(e.path);
+  if (e.response_bytes) parts.push(e.response_bytes+'B');
+  return parts.join(' · ');
+}
+
+async function refresh(){
+  if (document.hidden) return;
+  const nick = $('#nickSel').value, errOnly = $('#errOnly').checked;
+  let n, tr;
+  try {
+    [n, tr] = await Promise.all([
+      jget('/api/admin/nicks'),
+      errOnly
+        ? jget(`/api/admin/errors?nick=${encodeURIComponent(nick)}&hours=48&limit=400`)
+        : jget(`/api/admin/trace?nick=${encodeURIComponent(nick)}&limit=400`)
+    ]);
+  } catch(e) {
+    $('#count').textContent = 'lỗi tải: ' + e.message;
+    return;
+  }
+  // signature: rebuild DOM only when the data actually moved
+  const lastEv = tr.events.length ? tr.events[tr.events.length-1] : null;
+  const sig = curTab + '|' + nick + '|' + errOnly + '|' + tr.events.length + '|' +
+    (n.waiters||0) + '|' + (n.queued_images||0) + '|' + (n.queued_videos||0) + '|' +
+    (lastEv ? (lastEv.ts||'') + (lastEv.event||'') : '') + '|' +
+    n.nicks.map(x => x.nick + ':' + (x.inflight||0) + ':' + (x.errors||0) +
+      ':' + (x.ok||0) + ':' + (x.today_images||0) + ':' + (x.today_videos||0) +
+      ':' + (x.cooldown_s||0) + ':' + (x.cooldown_off?1:0) + ':' + (x.last_ts||'')).join(',');
+  if (sig === _sig) return;
+  _sig = sig;
+  $('#srv').textContent = n.trace_file;
+  $('#waiters').textContent = 'waiters: ' + n.waiters;
+  $('#waiters').className = 'badge' + (n.waiters ? ' hot' : '');
+  $('#queuedImg').textContent = 'queued img: ' + (n.queued_images||0);
+  $('#queuedImg').className = 'badge' + (n.queued_images ? ' hot' : '');
+  $('#queuedVid').textContent = 'queued vid: ' + (n.queued_videos||0);
+  $('#queuedVid').className = 'badge' + (n.queued_videos ? ' hot' : '');
+
+  // platform split — nicks without a platform tag count as iphone
+  const groups = { iphone: [], android: [], premium: [] };
+  for (const x of n.nicks)
+    groups[x.platform === 'android' ? 'android'
+        : x.platform === 'premium' ? 'premium' : 'iphone'].push(x);
+  for (const p of ['iphone','android','premium']) {
+    const g = groups[p], errs = g.reduce((a,x)=>a+(x.errors||0),0);
+    $('#cnt-'+p).textContent = ` ${g.length}${errs?' · '+errs+' err':''}`;
+    document.querySelector(`.tabs button[data-tab="${p}"]`).classList.toggle('haserr', errs>0);
+  }
+
+  // cards
+  const sel = $('#nickSel');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">Tất cả nick</option>' +
+    n.nicks.map(x=>`<option ${x.nick===cur?'selected':''}>${x.nick}</option>`).join('');
+
+  $('#cards').innerHTML = groups[curTab].map(x => {
+    const err = x.errors > 0;
+    const pct = Math.min(100, (x.inflight||0)/n.max_per_nick*100);
+    return `<div class="card">
+      <h2><span class="dot ${err?'err':'ok'}"></span>${x.nick}
+        <span class="badge">${x.proxy?'proxy':'direct'}</span>
+        <button class="cdbtn ${x.cooldown_off?'off':''}" title="THROTTLED cooldown" onclick="toggleCd('${x.nick}',${!x.cooldown_off})">cd ${x.cooldown_off?'off':'on'}</button></h2>
+      <div class="kv"><span>inflight</span><b>${x.inflight||0}/${n.max_per_nick}</b></div>
+      ${x.cooldown_s?`<div class="kv"><span>throttled</span><b style="color:var(--warn)">cooldown ${x.cooldown_s}s${x.throttle_streak>1?' ×'+x.throttle_streak:''}</b></div>`:''}
+      <div class="kv"><span>${x.vids_only?'vids doc':'project'}</span><b>${(x.project||'').slice(0,8)}…</b></div>
+      ${x.credits_left!=null?`<div class="kv"><span>quota (vids)</span><b style="color:${x.credits_left<50?'var(--err)':'var(--ok)'}">${x.credits_left} / ${x.credits_total||'?'} credits</b></div>`:''}
+      <div class="kv"><span>hôm nay</span><b>img ${x.today_images||0} · vid ${x.today_videos||0}</b></div>
+      ${x.first_throttled_ts?`<div class="kv"><span>throttle đầu</span><b style="color:var(--warn)">${fmt(x.first_throttled_ts)} (×${x.throttled_today})</b></div>`:''}
+      <div class="kv"><span>ok / errors</span><b>${x.ok||0} / <span style="color:${err?'var(--err)':'var(--fg)'}">${x.errors||0}</span></b></div>
+      <div class="kv"><span>last activity</span><b>${fmt(x.last_ts)}</b></div>
+      <div class="kv"><span>last op</span><b>${x.last_op||'—'}</b></div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+      ${x.last_error?`<div class="lasterr" style="display:block">[${fmt(x.last_error_ts)}] ${x.last_error_op||''}: ${x.last_error}</div>`:''}
+    </div>`;
+  }).join('');
+
+  // log table
+  $('#count').textContent = tr.events.length + (errOnly ? ' errors (48h, durable)' : ' events');
+  const lw = document.querySelector('.logwrap');
+  const stickBottom = lw.scrollHeight - lw.scrollTop - lw.clientHeight < 80;
+  $('#log').innerHTML = tr.events.map(e => {
+    const isErr = /error|exception/.test(e.event) || (e.status>=400) || (e.result&&e.result.has_error);
+    return `<tr class="${isErr?'errrow':''}">
+      <td class="ts">${fmt(e.ts)}</td>
+      <td>${e.nick||''}</td>
+      <td class="ev">${e.event}</td>
+      <td class="extra">${(e.trace_id||'').slice(0,24)}</td>
+      <td>${detailOf(e)}</td></tr>`;
+  }).join('');
+  if (stickBottom) lw.scrollTop = lw.scrollHeight;
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

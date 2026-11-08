@@ -555,7 +555,10 @@ async def check_proxy(proxy_url: str) -> dict:
     parsed = parse_proxy_url(resolved)
     timeout = aiohttp.ClientTimeout(total=20)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(
+                timeout=timeout,
+                connector=aiohttp.TCPConnector(
+                    resolver=aiohttp.ThreadResolver())) as session:
             async with session.get("https://api.ipify.org", proxy=parsed.raw.rstrip("/")) as resp:
                 body = (await resp.text()).strip()
                 if resp.status != 200 or not body:

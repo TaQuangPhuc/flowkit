@@ -4,6 +4,28 @@ import pytest
 from agent.services import flow_trace as ft
 
 
+def test_summary_check_status_ops_without_urls():
+    body = {
+        "operations": [{
+            "operation": {
+                "name": "e9671b3c-332a-45be-9dac-1f0fffa38ae9",
+                "metadata": {"video": {
+                    "mediaId": "a4550847-e06d-4df3-a6b1-440b1ba30880",
+                    "fifeUrl": "https://flow-content.google/video/secret-token",
+                }},
+            },
+            "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+        }]
+    }
+    out = ft.summary(body)
+    dumped = json.dumps(out)
+    assert "secret-token" not in dumped
+    assert "flow-content" not in dumped
+    assert out["op_status"] == {"SUCCESSFUL": 1}
+    assert out["has_video"] is True
+    assert out["operation_id"] == "e9671b3c-332a-45be-9dac-1f0fffa38ae9"
+
+
 def test_summary_never_leaks_payload():
     secret = 'Bearer test-secret user@example.com https://host/?token=secret private prompt'
     out = json.dumps(ft.summary({'error': 'FLOW_BUSY_NOT_SUBMITTED ' + secret, 'data': secret, 'retryable': True}))

@@ -83,6 +83,46 @@ def update_job(job_id: str, **kwargs):
         except Exception:
             pass
 
+
+def adopt_ready_clips(job_id: str) -> int:
+    """If clip_N.mp4 is already on disk, mark the scene COMPLETED.
+
+    The Veo poller used to download the mp4 then mux TTS before flipping
+    status. A mux error left the file on disk while the UI stayed on
+    RENDERING_VIDEO.
+    """
+    job = JOBS.get(job_id)
+    if not job:
+        jfile = WORK_DIR / job_id / "job.json"
+        if not jfile.exists():
+            return 0
+        try:
+            job = json.loads(jfile.read_text())
+        except Exception:
+            return 0
+        JOBS[job_id] = job
+    job_dir = WORK_DIR / job_id
+    scenes = job.get("scenes") or []
+    adopted = 0
+    for sc in scenes:
+        sid = sc.get("scene_id")
+        if not sid:
+            continue
+        cp = job_dir / f"clip_{sid}.mp4"
+        if not (cp.exists() and cp.stat().st_size > 50000):
+            continue
+        if sc.get("status") == "COMPLETED" and sc.get("video_url"):
+            continue
+        sc["status"] = "COMPLETED"
+        sc["status_text"] = "Đã hoàn thành video"
+        sc["video_url"] = f"/job/{job_id}/clip/{sid}"
+        sc["error"] = None
+        adopted += 1
+    if adopted:
+        update_job(job_id, scenes=scenes)
+        print(f"[ADOPT] Job {job_id}: marked {adopted} scene(s) COMPLETED from disk clips")
+    return adopted
+
 def extract_json_from_text(stdout: str) -> any:
     """Extract JSON object or array from LLM text output using multiple robust strategies + json_repair."""
     try:
@@ -142,6 +182,9 @@ def extract_json_from_text(stdout: str) -> any:
 def run_agy_cli_json(prompt: str, timeout: int = 180) -> any:
     """Run Antigravity CLI (agy) in print mode as primary AI fallback."""
     agy_bin = shutil.which("agy") or "/home/pc/.local/bin/agy"
+    if not os.path.isfile(agy_bin):
+        raw_text = grok_chat_completion([{"role": "user", "content": prompt}], max_tokens=8192)
+        return extract_json_from_text(raw_text)
     cmd = [
         agy_bin, "-p", prompt,
         "--output-format", "text"
@@ -163,6 +206,8 @@ def run_claude_cli_json(prompt: str) -> any:
     except Exception as e_agy:
         print(f"[LLM FALLBACK] agy CLI failed: {e_agy}. Trying claude CLI...")
         claude_bin = shutil.which("claude") or "/home/pc/.local/bin/claude"
+        if not os.path.isfile(claude_bin):
+            raise RuntimeError(f"LLM gateway failed and local CLI fallback is not installed ({e_agy})")
         cmd = [
             claude_bin, "-p", prompt,
             "--output-format", "text"
@@ -201,12 +246,16 @@ def _tvc_local_client(handler) -> bool:
 
 
 def _tvc_api_authorized(handler) -> bool:
-    """Remote api/* callers need the shared key. Loopback ops stay open."""
+    """Remote api/* callers need the shared key (via X-TVC-Key header or ?key= query param). Loopback ops stay open."""
     if _tvc_local_client(handler):
         return True
     if not TVC_API_KEY:
         return False  # fail closed: an unset key would leave the API public
     key = (handler.headers.get("X-TVC-Key") or "").strip()
+    if not key and "?" in getattr(handler, "path", ""):
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(handler.path).query)
+        key = (qs.get("key", [""])[0] or qs.get("token", [""])[0]).strip()
     return bool(key) and _hmac.compare_digest(key, TVC_API_KEY)
 
 
@@ -271,7 +320,7 @@ def _tvc_create_authorized(handler, fields=None) -> bool:
         return False
     return True
 
-_DEFAULT_FALLBACKS = ["spd/grok-4.6", "grok-4.6", "cnt/grok-4.6", "fa/grok-4.6-fast"]
+_DEFAULT_FALLBACKS = ["deepseek-v4.1-flash", "cnt/grok-4.6", "grok-4.6", "spd/grok-4.6", "fa/grok-4.6-fast"]
 _env_fallbacks = os.environ.get("NOVA_FALLBACK_MODELS", "")
 if _env_fallbacks:
     NOVA_FALLBACK_MODELS = [m.strip() for m in _env_fallbacks.split(",") if m.strip()]
@@ -545,8 +594,12 @@ def generate_edge_tts(text: str, output_path: Path, voice: str = "vi-VN-HoaiMyNe
     if not text or not text.strip():
         return False
     import asyncio
-    import edge_tts
     import time
+    try:
+        import edge_tts
+    except ImportError:
+        print("[EDGE-TTS] edge_tts is not installed; skip TTS")
+        return False
     
     clean_text = text.strip()
     
@@ -898,6 +951,71 @@ def sync_dialogue_to_motion_prompt(motion_prompt: str, dialogue: str, veo_voice_
         else:
             return f'{motion_prompt.rstrip()} Say: \\"{clean_dlg}\\".'
 
+
+# Common LLM Vietnamese typos / missing diacritics that Veo then misreads.
+_VN_SPELL_FIXES = (
+    (r"\bsản\s*phẩn\b", "sản phẩm"),
+    (r"\bsảnphẩm\b", "sản phẩm"),
+    (r"\bkhuyễn\s*mãi\b", "khuyến mãi"),
+    (r"\bkhuyến mại\b", "khuyến mãi"),
+    (r"\bưu\s*đải\b", "ưu đãi"),
+    (r"\bgiỏ\s*hang\b", "giỏ hàng"),
+    (r"\bchắc\s*chẳn\b", "chắc chắn"),
+    (r"\bthoải mai\b", "thoải mái"),
+    (r"\bchất lương\b", "chất lượng"),
+    (r"\bđáng\s*đong\s*tiền\b", "đáng đồng tiền"),
+    (r"\bđáng\s*đồng\s*tiên\b", "đáng đồng tiền"),
+    (r"\bchân ái\b", "chân ái"),
+    (r"\bgóc trái màng hình\b", "góc trái màn hình"),
+    (r"\bmàng hình\b", "màn hình"),
+    (r"\bnhận ưu đài\b", "nhận ưu đãi"),
+    (r"\bđộc quyền nhé\b", "độc quyền nhé"),
+    (r"\bBemori\b", "Be-mo-ri"),
+)
+
+
+def normalize_vietnamese_dialogue(text: str, voice_key: str = "female_north") -> str:
+    """Fix spelling so Veo/TTS read Vietnamese correctly; keep north/south dialect."""
+    import unicodedata
+    if not text:
+        return text
+    s = unicodedata.normalize("NFC", text).strip()
+    s = re.sub(r"\s+", " ", s)
+    for pat, rep in _VN_SPELL_FIXES:
+        s = re.sub(pat, rep, s, flags=re.IGNORECASE)
+    key = (voice_key or "").lower()
+    if "north" in key:
+        s = re.sub(r"\bnghen\b", "nhé", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bthiệt sự luôn á\b", "thật sự luôn", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bcả nhà ơi\b", "mọi người ơi", s, flags=re.IGNORECASE)
+    elif "south" in key:
+        s = re.sub(r"\bnhé ạ\b", "nghen", s, flags=re.IGNORECASE)
+    if s and s[-1] not in ".!?…":
+        s += "."
+    return s
+
+
+def lock_scene_voice(sc: dict, voice_info: dict) -> dict:
+    """One speaker id + one Say: line, identical bible on every scene."""
+    voice_key = (voice_info or {}).get("id") or "female_north"
+    dlg = normalize_vietnamese_dialogue(sc.get("audio_dialogue") or "", voice_key)
+    sc["audio_dialogue"] = dlg
+    motion = sc.get("video_motion_prompt") or ""
+    motion = re.sub(r'Say:\s*\\?".*?\\?".*$', '', motion, flags=re.DOTALL | re.IGNORECASE).strip()
+    motion = re.sub(r'Say:\s*".*?".*$', '', motion, flags=re.DOTALL | re.IGNORECASE).strip()
+    motion = re.sub(r'SPEAKER_ID\s+\S+\.?\s*', '', motion)
+    motion = re.sub(r'VOICE LOCK.*$', '', motion, flags=re.DOTALL | re.IGNORECASE).strip()
+    bible = voice_info.get("voice_bible") or {}
+    vid = bible.get("voice_id") or "CHAR_VN_FEMALE_NORTH_01"
+    say = voice_info.get("say_clause") or "a warm, clear Northern Vietnamese female voice"
+    lock = voice_info.get("veo_prompt") or ""
+    sc["video_motion_prompt"] = (
+        f"{motion} SPEAKER_ID {vid}. Same speaker, same pitch, same accent in every scene. "
+        f'Say: \\"{dlg}\\" in {say}. {lock}'
+    )
+    return sc
+
+
 def rotate_profile_proxy(nick_id: str = "nick-a") -> dict:
     """Call FlowKit API to explicitly rotate proxy for a nick."""
     try:
@@ -1045,11 +1163,7 @@ def sanitize_safety_content(text: str) -> str:
     s = re.sub(r"\bthrust(?:s|ing)?\b", "move", s, flags=re.IGNORECASE)
     s = re.sub(r"\bgroan(?:s|ing)?\b|\bmoan(?:s|ing)?\b", "speak", s, flags=re.IGNORECASE)
 
-    # 3. Revealing Attire Normalization (Prevent Grok Video false-positive NSFW blocks)
-    s = re.sub(r"\b(?:halter\s+top|crop\s+top|halter\s+crop\s+top|halterneck)\b", "sporty crewneck top", s, flags=re.IGNORECASE)
-    s = re.sub(r"\b(?:low-rise|booty|mini|short)\s+shorts?\b", "athletic shorts", s, flags=re.IGNORECASE)
-    s = re.sub(r"\blow-rise\b", "mid-rise", s, flags=re.IGNORECASE)
-    s = re.sub(r"\b(?:bare\s+midriff|exposed\s+midriff|belly\s+button)\b", "covered midriff", s, flags=re.IGNORECASE)
+    # 3. Revealing Attire Normalization (Keep legitimate commercial fashion like halter/crop tops intact so reference outfits never morph)
     s = re.sub(r"\b(?:sexy|sensual|seductive|revealing)\b", "stylish", s, flags=re.IGNORECASE)
     s = re.sub(r"\b(?:bikini|lingerie|underwear|undergarment)\b", "casual attire", s, flags=re.IGNORECASE)
 
@@ -1067,6 +1181,55 @@ def sanitize_safety_content(text: str) -> str:
 
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+DUAL_REF_NO_HYBRID = (
+    "SPECIES AND ROLE LOCK — HIGHEST PRIORITY. "
+    "The first reference image is a HUMAN creator only: copy that person's exact face, facial beauty, smooth radiant skin tone, hair, eyes, contact lenses, body proportions, and exact clothing 1:1. "
+    "The creator is a real human. Never replace the creator's face or body with an animal, monkey, ape, primate, cat, dog, "
+    "plush mascot, cartoon creature, or human-animal hybrid. No fur on the face, no snout, no muzzle. "
+    "The product reference image is a PRODUCT object the human holds or shows. Copy ALL product items from that photo exactly: "
+    "same animals, same colors, same shapes, same count of items. Do not invent a different animal or drop one of the items. "
+    "Do not give the product a human face. Do not give the human the product's animal features. "
+    "Do not copy the restaurant booth, other people in the background, watermark, or SKU text from the reference photos; use the clean indoor setting in this prompt. "
+    "EVERY scene must show the exact same human creator AND the exact same product items in the exact same room. "
+    "Never output a product-only catalog still, packshot, or listing photo. Never drop the person in later scenes. "
+    "The creator and the product stay two separate things in one shot: a person displaying an object. "
+)
+
+
+def apply_dual_ref_lock(prompt: str, ref_count: int, mode: str) -> str:
+    """Stop Flow from blending a human model photo with a plush/animal product."""
+    if not prompt or ref_count < 2:
+        return prompt
+    if mode not in ("ugc", "store_review", "fashion", "demo"):
+        return prompt
+    if "SPECIES AND ROLE LOCK" in prompt:
+        return prompt
+    return f"{DUAL_REF_NO_HYBRID}{prompt}"
+
+
+PHOTO_LOOK = (
+    "CAMERA LOOK — High-end iPhone 16 Pro creator video frame with flattering soft diffused indoor lighting. "
+    "Match the exact facial identity, smooth luminous porcelain skin complexion, delicate makeup, eye contact lenses, nose bridge, lip shape, and symmetrical facial proportions of the human reference photo 1:1. "
+    "Flattering 50mm portrait focal length with zero wide-angle facial distortion, zero oily skin shine, zero blotches, zero blemishes. "
+    "Vertical 9:16 frame."
+)
+
+
+def apply_photo_look(prompt: str) -> str:
+    """Ensure clean, flattering creator beauty matching the reference portrait 1:1."""
+    if not prompt:
+        return prompt
+    p = re.sub(
+        r",?\s*photorealistic(?:\s+8k)?(?:\s+vertical\s+9:16)?\.?",
+        "",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    if "CAMERA LOOK" in p:
+        return p
+    return p.rstrip(" .") + ". " + PHOTO_LOOK
+
 
 def sanitize_kf_prompt(prompt: str, canonical_anchor: str = "", model_anchor: str = "", mode: str = "pov") -> str:
     if not prompt:
@@ -1088,7 +1251,7 @@ def sanitize_kf_prompt(prompt: str, canonical_anchor: str = "", model_anchor: st
         if "photorealistic" not in prompt.lower():
             prompt += ", photorealistic 8k vertical 9:16"
         prompt += clean_canvas_guard
-        return sanitize_safety_content(prompt)
+        return apply_photo_look(sanitize_safety_content(prompt))
     elif mode == "pov":
         if canonical_anchor:
             c_low = canonical_anchor.lower()
@@ -1101,7 +1264,7 @@ def sanitize_kf_prompt(prompt: str, canonical_anchor: str = "", model_anchor: st
         if "hands" in prompt.lower() and "exactly 2" not in prompt.lower():
             prompt += ", exactly 2 natural human hands in frame, 5 fingers each, no extra hands or floating limbs"
         prompt += clean_canvas_guard
-        return sanitize_safety_content(prompt)
+        return apply_photo_look(sanitize_safety_content(prompt))
     elif mode == "demo":
         if canonical_anchor and "PRODUCT REFERENCE LOCK" not in prompt:
             prompt = f"PRODUCT REFERENCE LOCK — HIGHEST PRIORITY: {canonical_anchor}. {prompt}"
@@ -1112,7 +1275,7 @@ def sanitize_kf_prompt(prompt: str, canonical_anchor: str = "", model_anchor: st
         if "photorealistic" not in prompt.lower():
             prompt += ", photorealistic 8k vertical 9:16"
         prompt += clean_canvas_guard
-        return sanitize_safety_content(prompt)
+        return apply_photo_look(sanitize_safety_content(prompt))
     elif mode == "fashion":
         if model_anchor and "CREATOR REFERENCE LOCK" not in prompt and "MODEL REFERENCE LOCK" not in prompt:
             prompt = f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {model_anchor}. Same exact person as the attached reference portrait — identical face and hairstyle. {prompt}"
@@ -1121,51 +1284,65 @@ def sanitize_kf_prompt(prompt: str, canonical_anchor: str = "", model_anchor: st
         if "photorealistic" not in prompt.lower():
             prompt += ", luxury fashion boutique lookbook, photorealistic 8k vertical 9:16, elegant drape, realistic fabric textures, clean seams"
         prompt += clean_canvas_guard
-        return sanitize_safety_content(prompt)
+        prompt = apply_dual_ref_lock(prompt, 2 if model_anchor else 1, mode)
+        return apply_photo_look(sanitize_safety_content(prompt))
     else:
         # UGC or Store Review mode
         if model_anchor and "CREATOR REFERENCE LOCK" not in prompt and "KOL REFERENCE LOCK" not in prompt:
             prompt = f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {model_anchor}. Same exact person as the attached reference portrait — identical face and hairstyle. {prompt}"
-        # Triệt tiêu các lệnh dễ làm biến dạng má, xương hàm và nghiêng vẹo mặt
-        prompt = re.sub(r"\bpress(?:es|ing)?\s+(?:the\s+)?(?:soft\s+)?fabric\s+against\s+(?:her\s+|his\s+)?cheek\b", "holding the cute product near chest level while looking straight at camera", prompt, flags=re.IGNORECASE)
-        prompt = re.sub(r"\btilt(?:s|ing)?\s+(?:her\s+|his\s+)?head\b", "facing directly forward toward camera with a gentle warm smile", prompt, flags=re.IGNORECASE)
+        # Triệt tiêu các lệnh dễ làm biến dạng má, xương hàm, nghiêng vẹo mặt hoặc cười nhe răng rộng ở frame đầu làm lệch khẩu hình
+        prompt = re.sub(r"\bpress(?:es|ing)?\s+(?:the\s+)?(?:soft\s+)?fabric\s+against\s+(?:her\s+|his\s+)?cheek\b", "holding the product comfortably in front while looking straight at camera", prompt, flags=re.IGNORECASE)
+        prompt = re.sub(r"\btilt(?:s|ing)?\s+(?:her\s+|his\s+)?head\b", "facing directly forward toward camera", prompt, flags=re.IGNORECASE)
+        prompt = re.sub(r"\b(?:with\s+a\s+)?(?:bright\s+genuine\s+smile|wide\s+smile|toothy\s+smile|big\s+smile|grinning\s+widely|smiling\s+warmly|smiling\s+brightly|radiant\s+smile)\b", "with a poised, gentle expression and softly closed or naturally parted lips ready to begin speaking", prompt, flags=re.IGNORECASE)
+        prompt = re.sub(r"\bgesturing\s+(?:politely\s+)?toward\s+bottom-left\b", "holding the product items clearly in front with both hands", prompt, flags=re.IGNORECASE)
+        prompt += ", poised expression with softly closed or slightly parted lips ready for immediate speech (NO wide toothy grin, NO open-mouth laugh in the still keyframe)"
         if "frontal" not in prompt.lower() and "looking directly" not in prompt.lower():
-            prompt += ", frontal eye-level portrait looking directly at camera with natural symmetrical facial features matching reference face exactly"
+            prompt += ", frontal eye-level portrait looking directly at camera with natural symmetrical facial features matching reference face 1:1"
         if "same person" not in prompt.lower():
-            prompt += ", same person, identical face, identical hairstyle and identical clothing across all scenes"
+            prompt += ", same person, identical face, smooth radiant skin, identical hairstyle and identical clothing across all scenes"
         if "hands" in prompt.lower() and "extra" not in prompt.lower():
             prompt += ", natural human anatomy, 5 fingers each hand, no extra floating limbs"
         prompt += clean_canvas_guard
-        return sanitize_safety_content(prompt)
+        prompt = apply_dual_ref_lock(prompt, 2 if model_anchor else 1, mode)
+        return apply_photo_look(sanitize_safety_content(prompt))
 
 def sanitize_video_motion_prompt(prompt: str, has_model: bool = True) -> str:
-    """Sanitize motion prompt to eliminate on-screen text/captions, enforce safety, and lock facial identity."""
+    """Sanitize motion prompt to eliminate on-screen text/captions, enforce safety, and lock facial identity + frame-0 lip-sync."""
     if not prompt:
         return prompt
 
     cleaned = sanitize_safety_content(prompt.strip())
 
-    # 1. Triệt tiêu các cụm từ dễ khiến Veo 3.1 hallucinate vẽ chữ / infographic lên video
+    # 1. Triệt tiêu các cụm từ dễ khiến Veo 3.1 hallucinate vẽ chữ / infographic / xe đẩy siêu thị lên video
     cleaned = re.sub(r"\b2-in-1\b", "transformable dual-design", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b2\s*in\s*1\b", "transformable dual-design", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b3-in-1\b", "multi-functional", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b\d+%\s*off\b", "promotional discount", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bstep\s*\d+\b", "progression", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bsubtle\s+facial\s+movements\s+only\b", "clear natural Vietnamese lip-sync mouth articulation starting immediately at 0.0s", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bgesturing\s+(?:politely\s+)?toward\s+bottom-left\b", "holding the product steadily in front", cleaned, flags=re.IGNORECASE)
 
-    # 2. Khóa chuyển động đầu & góc mặt nếu có nhân vật để tránh lệch mặt / biến dạng mặt
+    # 2. Khóa nhận diện gương mặt + bắt buộc khớp khẩu hình ngay từ frame 0 (0.0s) và giữ nguyên sản phẩm đến cuối clip
     face_lock = ""
     if has_model:
-        # Thay thế các cụm từ làm lệch/vẹo mặt như "tilts head", "turns head sideways", "presses cheek against"
-        cleaned = re.sub(r"\btilts?\s+(?:her\s+|his\s+)?head\b", "smiles warmly looking directly at camera", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\btilts?\s+(?:her\s+|his\s+)?head\b", "looks directly at camera", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bturns?\s+(?:her\s+|his\s+)?head(?:\s+sideways)?\b", "keeps face centered looking at camera", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bpress(?:es|ing)?\s+(?:the\s+)?(?:soft\s+)?fabric\s+against\s+(?:her\s+|his\s+)?cheek\b", "holds product gently in front", cleaned, flags=re.IGNORECASE)
-        face_lock = " FACIAL IDENTITY LOCK — HIGHEST PRIORITY: Keep identical facial features, eyes, nose, mouth and facial proportions from the start frame 100% frozen. Direct camera eye contact, natural symmetrical facial expression with subtle lip speech movements only. NO head tilting, NO facial morphing, NO deformation, NO face shape changes."
+        face_lock = (
+            " FACIAL IDENTITY & IMMEDIATE LIP-SYNC LOCK — HIGHEST PRIORITY: Preserve the exact facial identity, eyes, nose, smooth skin complexion, hair, and outfit from the start frame 100%. "
+            "0.0s-6.8s: Immediately from frame 0 (0.0s), the speaker's lips articulate clear, natural, accurate Vietnamese lip-sync matching every spoken syllable of the dialogue without any frozen grin on the initial frames. "
+            "6.8s-8.0s: As soon as the spoken sentence finishes, close lips gently into a warm poised smile while keeping the product held steadily in hand in front of the camera until 8.0s. "
+            "NEVER drop, lower, or vanish the product at the end of the clip. NO head tilting, NO facial morphing, NO exaggerated open-mouth screaming."
+        )
 
     # 3. Lệnh cấm triệt để chữ / subtitle / infographic trên màn hình video
-    no_text_rule = " STRICTLY CLEAN CINEMATIC FOOTAGE: ZERO on-screen text, NO subtitles, NO captions, NO words, NO typography, NO watermark, NO logo overlay, NO floating labels, NO graphic icons, NO banners."
+    no_text_rule = (
+        " STRICTLY CLEAN UNALTERED REAL-WORLD FOOTAGE: Keep the wooden table surface and room 100% clean with zero added objects, "
+        "ZERO on-screen text, NO subtitles, NO captions, NO words, NO typography, NO watermark, NO logo overlay, NO floating UI graphics."
+    )
 
     # 4. Enforce strict G-rated commercial safety standard for Veo 3.1 & Grok
-    safety_rule = " STRICT G-RATED COMMERCIAL STANDARD: Family-friendly broadcast footage, modest professional attire, gentle commercial interaction."
+    safety_rule = " STRICT G-RATED COMMERCIAL STANDARD: Family-friendly broadcast footage, clean commercial presentation."
 
     return sanitize_safety_content(f"{cleaned} {face_lock} {no_text_rule} {safety_rule}".strip())
 
@@ -1202,7 +1379,97 @@ def get_or_refresh_ref_ids(job_id: str, force_refresh: bool = False) -> list[str
             return ref_ids
     return refresh_ref_ids_from_disk(job_id)
 
+
+def _resolve_scene_kf_refs_and_prompt(
+    job_id: str,
+    scene_id: int,
+    base_ref_ids: list[str],
+    sanitized_prompt: str,
+    kf_1_mid_override: str = None,
+) -> tuple[list[str], str]:
+    """For Scene 2..N, append Scene 1's rendered keyframe media_id as a 3rd continuity reference
+    so all scenes share the exact same room background, lighting, framing, creator face/skin/outfit,
+    and complete set of product items."""
+    scene_refs = list(base_ref_ids or [])
+    if not scene_id or scene_id <= 1:
+        return scene_refs, sanitized_prompt
+
+    kf_1_mid = kf_1_mid_override
+    if not kf_1_mid and job_id:
+        job = JOBS.get(job_id) or {}
+        for k in (job.get("keyframes") or []):
+            if isinstance(k, dict) and k.get("scene_id") == 1 and k.get("media_id"):
+                kf_1_mid = k.get("media_id")
+                break
+        if not kf_1_mid:
+            kf1_path = WORK_DIR / job_id / "keyframe_1.jpg"
+            if kf1_path.exists() and kf1_path.stat().st_size > 1000:
+                try:
+                    kf_1_mid = upload_to_flowkit(kf1_path, job_id=job_id)
+                except Exception as up_err:
+                    print(f"[SCENE CONTINUITY] Could not upload keyframe_1.jpg for job {job_id}: {up_err}")
+
+    if kf_1_mid:
+        if kf_1_mid not in scene_refs and len(scene_refs) < 3:
+            scene_refs.append(kf_1_mid)
+        if sanitized_prompt and "SCENE 1 CONTINUITY ANCHOR" not in sanitized_prompt:
+            continuity_prefix = (
+                "SCENE 1 CONTINUITY ANCHOR — HIGHEST PRIORITY FOR SCENE-TO-SCENE CONSISTENCY: "
+                "The final reference image is the rendered Scene 1 keyframe. Match the exact room background, "
+                "lighting, camera framing, creator facial features, smooth luminous skin tone, hairstyle, and "
+                "exact clothing from Scene 1 1:1 while keeping ALL product items from the product reference photo "
+                "in hand. Only update the hand gesture for this scene. "
+            )
+            sanitized_prompt = continuity_prefix + sanitized_prompt
+
+    return scene_refs, sanitized_prompt
+
+
+def _keyframe_download_retryable(err: BaseException) -> bool:
+    code = getattr(err, "code", None)
+    if code in (429, 500, 502, 503, 504):
+        return True
+    msg = str(err).lower()
+    return (
+        "timed out" in msg
+        or "timeout" in msg
+        or "bad gateway" in msg
+        or "temporarily" in msg
+        or "connection reset" in msg
+        or "connection aborted" in msg
+    )
+
+
+def download_keyframe_file(url: str, dest: Path, attempts: int = 3) -> None:
+    """Save a generated keyframe. One FlowKit 502 while fetching the image
+    bytes must not fail the scene: GET /api/flow/image often 502s when the
+    nick relay is slow, and the next fetch hits a warm cache or the CDN."""
+    last: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            urllib.request.urlretrieve(url, str(dest))
+            if dest.exists() and dest.stat().st_size > 1000:
+                return
+            size = dest.stat().st_size if dest.exists() else 0
+            last = RuntimeError(f"keyframe download too small ({size} bytes)")
+        except Exception as exc:
+            last = exc
+        if attempt < attempts and last and _keyframe_download_retryable(last):
+            print(f"[KEYFRAME] download attempt {attempt}/{attempts} failed: {last}. Retrying...")
+            time.sleep(2.0 * attempt)
+            continue
+        break
+    if last:
+        raise last
+    raise RuntimeError("keyframe download failed")
+
+
 def generate_keyframe_flowkit(prompt: str, ref_media_ids: list[str], job_id: str = None) -> tuple[str, str]:
+    mode = "pov"
+    if job_id:
+        mode = (JOBS.get(job_id) or {}).get("flow_mode", "pov")
+    prompt = apply_dual_ref_lock(prompt, len(ref_media_ids or []), mode)
+    prompt = apply_photo_look(prompt)
     payload = {
         "prompt": prompt,
         "modelDisplayName": "Nano Banana Pro",
@@ -1234,11 +1501,21 @@ def submit_video_flowkit(keyframe_mid: str, motion_prompt: str, scene_idx: int, 
     Zero-wait submission: takes ~2-3s to get operation_name without blocking on rendering.
     """
     has_model = True
+    job = {}
     if job_id:
-        job = JOBS.get(job_id, {})
+        job = JOBS.get(job_id, {}) or {}
         flow_mode = job.get("flow_mode", "pov")
         if flow_mode in ["pov", "unboxing"]:
             has_model = False
+        voice_key = job.get("voice") or "female_north"
+        voice_info = VOICE_PROFILES.get(voice_key, VOICE_PROFILES["female_north"])
+        scenes = job.get("scenes") or []
+        if 1 <= scene_idx <= len(scenes):
+            sc = scenes[scene_idx - 1]
+            sc["video_motion_prompt"] = motion_prompt
+            lock_scene_voice(sc, voice_info)
+            motion_prompt = sc["video_motion_prompt"]
+            update_job(job_id, scenes=scenes)
 
     sanitized_motion = sanitize_video_motion_prompt(motion_prompt, has_model=has_model)
 
@@ -1310,23 +1587,30 @@ def batch_poll_videos_flowkit(
                     clip_path = job_dir / f"clip_{scene_idx}.mp4"
                     print(f"[BATCH POLLER] 🎉 Scene {scene_idx} completed after {int(time.time() - start_time)}s! Downloading to {clip_path.name}...")
                     urllib.request.urlretrieve(fife, str(clip_path))
+                    if not (clip_path.exists() and clip_path.stat().st_size > 50000):
+                        print(f"[BATCH POLLER] Scene {scene_idx} download too small, will retry")
+                        continue
+                    adopt_ready_clips(job_id)
                     tts_file = job_dir / f"tts_{scene_idx}.mp3"
-                    has_native_audio = check_video_has_audio(clip_path)
-                    if has_native_audio:
-                        print(f"[BATCH POLLER] 🎙️ Scene {scene_idx} has native AI synchronized audio ({clip_path.name}). Preserving native voice!")
-                    else:
-                        job_obj = JOBS.get(job_id) or {}
-                        if not tts_file.exists() or tts_file.stat().st_size < 1000:
-                            sc_list = job_obj.get("scenes", [])
-                            matching_sc = next((s for s in sc_list if s.get("scene_id") == scene_idx), None)
-                            dlg = (matching_sc.get("audio_dialogue") or "").strip() if matching_sc else ""
-                            if dlg:
-                                v_key = job_obj.get("voice", "female_north")
-                                v_info = VOICE_PROFILES.get(v_key, VOICE_PROFILES["female_north"])
-                                generate_edge_tts(dlg, tts_file, voice=v_info["edge_voice"], rate=v_info.get("rate", "+0%"))
-                        if tts_file.exists() and tts_file.stat().st_size > 500:
-                            job_dur = job_obj.get("scene_duration", 8)
-                            mux_tts_to_video(clip_path, tts_file, target_duration=job_dur)
+                    try:
+                        has_native_audio = check_video_has_audio(clip_path)
+                        if has_native_audio:
+                            print(f"[BATCH POLLER] 🎙️ Scene {scene_idx} has native AI synchronized audio ({clip_path.name}). Preserving native voice!")
+                        else:
+                            job_obj = JOBS.get(job_id) or {}
+                            if not tts_file.exists() or tts_file.stat().st_size < 1000:
+                                sc_list = job_obj.get("scenes", [])
+                                matching_sc = next((s for s in sc_list if s.get("scene_id") == scene_idx), None)
+                                dlg = (matching_sc.get("audio_dialogue") or "").strip() if matching_sc else ""
+                                if dlg:
+                                    v_key = job_obj.get("voice", "female_north")
+                                    v_info = VOICE_PROFILES.get(v_key, VOICE_PROFILES["female_north"])
+                                    generate_edge_tts(dlg, tts_file, voice=v_info["edge_voice"], rate=v_info.get("rate", "+0%"))
+                            if tts_file.exists() and tts_file.stat().st_size > 500:
+                                job_dur = job_obj.get("scene_duration", 8)
+                                mux_tts_to_video(clip_path, tts_file, target_duration=job_dur)
+                    except Exception as mux_err:
+                        print(f"[BATCH POLLER] mux/tts warning scene {scene_idx}: {mux_err}")
                     completed_clips[scene_idx] = clip_path
                     del active_ops[scene_idx]
                     if on_clip_done:
@@ -1424,13 +1708,14 @@ def build_grok_video_prompt(
     dialogue: str = "",
     flow_mode: str = "pov",
     voice_key: str = "female_north",
-    has_model: bool = False
+    has_model: bool = False,
+    is_lite: bool = False
 ) -> str:
     """
-    Build structured, token-safe prompt specifically for xAI Grok Imagine Video 1.5.
+    Build structured, token-safe prompt specifically for xAI Grok Imagine Video 1.5 & 1.5 Lite.
     Separates into explicit blocks: VISUAL/MOTION, VOICE, SPEAKING STYLE, DIALOGUE, LIP SYNC, ACTING, AUDIO.
-    Differentiates between on-screen human creator (UGC/Store Review) vs pure product showcase (Unboxing/POV/Demo).
-    Ensures prompt length is ~200-350 tokens, safely below Grok's 4096 token limit.
+    When is_lite=True (grok-imagine-video-1.5-lite), omits spoken dialogue/lip-sync blocks so Stage 4's
+    Vietnamese Edge-TTS voice-over muxes cleanly with zero mouth desync.
     Zero effect on Google Veo 3.1 prompts.
     """
     voice_cfg = GROK_VOICE_CONFIGS.get(voice_key, GROK_VOICE_CONFIGS["female_north"])
@@ -1446,8 +1731,11 @@ def build_grok_video_prompt(
     # Extract clean visual motion part by stripping 'Say: "..." ...' from motion_prompt
     clean_motion = re.sub(r'Say:\s*\\?".*?\\?"(?:\s*in\s*[^.]+)?\.?', '', motion_prompt, flags=re.DOTALL | re.IGNORECASE).strip()
     clean_motion = re.sub(r'Say:\s*".*?"(?:\s*in\s*[^.]+)?\.?', '', clean_motion, flags=re.DOTALL | re.IGNORECASE).strip()
-    # Replace suppression of facial movements with active mouth articulation for speaking character
-    clean_motion = re.sub(r'subtle facial movements only\.?', 'natural expressive facial animation with clear mouth articulation matching spoken dialogue.', clean_motion, flags=re.IGNORECASE)
+    if is_lite:
+        clean_motion = re.sub(r'subtle facial movements only\.?', 'warm poised closed-lip smile and natural expressive eye contact.', clean_motion, flags=re.IGNORECASE)
+    else:
+        # Replace suppression of facial movements with active mouth articulation for speaking character
+        clean_motion = re.sub(r'subtle facial movements only\.?', 'natural expressive facial animation with clear mouth articulation matching spoken dialogue.', clean_motion, flags=re.IGNORECASE)
     # Sanitize false-positive trigger keywords that trigger xAI Grok content policy violations
     clean_motion = sanitize_safety_content(clean_motion)
     clean_motion = re.sub(r'\s+', ' ', clean_motion).strip(' .,')
@@ -1461,7 +1749,29 @@ def build_grok_video_prompt(
     if re.search(r'\bno\s+human\b|\bzero\s+human\b|\bempty\s+of\s+people\b', clean_motion, re.IGNORECASE):
         is_human = False
 
-    if is_human:
+    if is_lite:
+        if is_human:
+            prompt_parts = [
+                "CHARACTER & VISUAL:",
+                f"{clean_motion}.",
+                "Maintain natural eye contact with camera. Warm, poised, welcoming smile with lips gently closed (no speaking mouth movement, voice-over narration will be added).",
+                "Consistent face, hair, modest clothing, and natural studio lighting.",
+                "Smooth steady camera movement, photorealistic commercial 8k vertical 9:16.",
+                "STRICTLY ZERO on-screen text, NO subtitles, NO captions, NO typography, NO watermark, NO logo overlay.",
+                "STRICT G-RATED COMMERCIAL BROADCAST STANDARD: 100% family-friendly, fully clothed modest attire, zero sensitive content."
+            ]
+        else:
+            prompt_parts = [
+                "VISUAL:",
+                "PRODUCT LOCK — HIGHEST PRIORITY. KEEP PRODUCT PRISTINE AND CONSISTENT.",
+                f"{clean_motion}.",
+                "Purely product showcase. STRICTLY NO humans, NO human face, NO people visible in frame.",
+                "Smooth steady camera movement, beautiful dramatic studio lighting, photorealistic 8k vertical 9:16.",
+                "STRICTLY ZERO on-screen character or mouth animation on the product.",
+                "STRICTLY ZERO on-screen text, NO subtitles, NO captions, NO words, NO typography, NO watermark, NO logo overlay.",
+                "STRICT G-RATED COMMERCIAL BROADCAST STANDARD: 100% family-friendly, zero sensitive content."
+            ]
+    elif is_human:
         prompt_parts = [
             "CHARACTER & VISUAL:",
             f"{clean_motion}.",
@@ -1594,8 +1904,9 @@ def generate_video_grok(
     voice_key: str = ""
 ) -> Path:
     """Generate a single video clip from Keyframe using xAI Grok Imagine Video via NOVA Gateway."""
-    base_url = os.environ.get("NOVA_BASE_URL", NOVA_BASE_URL).rstrip("/")
-    api_key = os.environ.get("NOVA_API_KEY", NOVA_API_KEY)
+    base_url = os.environ.get("NOVA_VIDEO_BASE_URL", "https://lightvisual.studio/v1").rstrip("/")
+    api_root = base_url[:-3] if base_url.endswith("/v1") else base_url
+    api_key = os.environ.get("NOVA_VIDEO_API_KEY", os.environ.get("TVC_API_KEY", NOVA_API_KEY))
     
     if not keyframe_path or not keyframe_path.exists():
         raise FileNotFoundError(f"Keyframe file not found for scene {scene_idx}: {keyframe_path}")
@@ -1617,6 +1928,7 @@ def generate_video_grok(
                 break
                 
     has_model = (flow_mode in ["ugc", "store_review", "fashion"]) or ((keyframe_path.parent / "model.jpg").exists())
+    is_lite = ("lite" in model.lower()) or model.lower().endswith("grok-imagine-video")
 
     # Build structured prompt for Grok (token-safe, clear speech/lip-sync/voice-over blocks)
     grok_prompt = build_grok_video_prompt(
@@ -1624,16 +1936,22 @@ def generate_video_grok(
         dialogue=dialogue,
         flow_mode=flow_mode,
         voice_key=voice_key,
-        has_model=has_model
+        has_model=has_model,
+        is_lite=is_lite
     )
-    print(f"[GROK VIDEO] Scene {scene_idx} structured prompt ({len(grok_prompt.split())} words, ~{len(grok_prompt)//4} tokens)")
+    print(f"[GROK VIDEO] Scene {scene_idx} ({model}) structured prompt ({len(grok_prompt.split())} words, ~{len(grok_prompt)//4} tokens)")
     
+    norm_res = str(resolution or "480p").strip().lower()
+    if norm_res not in ("480p", "720p", "1080p"):
+        norm_res = "480p"
+    dur_int = max(1, min(15, int(duration_s or 6)))
     payload = {
         "model": model,
         "prompt": grok_prompt,
         "aspect_ratio": "9:16",
-        "duration": duration_s,
-        "resolution": resolution,
+        "seconds": dur_int,
+        "duration": dur_int,
+        "resolution": norm_res,
         "image": {"url": data_url}
     }
     
@@ -1644,7 +1962,7 @@ def generate_video_grok(
         for init_attempt in range(3):
             try:
                 req = urllib.request.Request(
-                    f"{base_url}/v1/videos",
+                    f"{api_root}/v1/videos",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={
                         "Authorization": f"Bearer {api_key}",
@@ -1673,7 +1991,7 @@ def generate_video_grok(
             
         print(f"[GROK VIDEO] Job {job_id} Scene {scene_idx}: video_id={video_id} submitted (round {render_round}). Polling...")
         
-        poll_url = f"{base_url}/v1/videos/{video_id}"
+        poll_url = f"{api_root}/v1/videos/{video_id}"
         t0 = time.time()
         round_failed_transient = False
         for poll_cycle in range(60): # up to ~5 minutes
@@ -1693,6 +2011,8 @@ def generate_video_grok(
                     v_url = pdata.get("video_url") or pdata.get("url") or pdata.get("share_url")
                     if not v_url:
                         raise RuntimeError("No video URL returned in completed Grok response")
+                    if v_url.startswith("/"):
+                        v_url = f"{api_root}{v_url}"
                     clip_path = keyframe_path.parent / f"clip_{scene_idx}.mp4"
                     
                     # Retry download up to 3 times to guard against network blips
@@ -1714,7 +2034,7 @@ def generate_video_grok(
 
                     # Auto-align lip-sync lead-in: If speech starts immediately at t=0 (<0.1s) without pause,
                     # add a micro 250ms delay so mouth opening and spoken voice start in perfect synchrony
-                    if has_model and clip_path.exists() and clip_path.stat().st_size > 10000:
+                    if has_model and not is_lite and clip_path.exists() and clip_path.stat().st_size > 10000:
                         try:
                             p_cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", str(clip_path)]
                             has_audio = bool(subprocess.check_output(p_cmd).decode().strip())
@@ -1811,16 +2131,61 @@ def batch_generate_videos_grok(
                 
     return completed
 
+def _detect_clip_speech_bounds(clip_path: Path, dur: float) -> tuple[float, float]:
+    """Detect where active voiced speech starts and ends using 100ms PCM RMS windows
+    so post-speech silent tails or cloth-rustle tails (where Veo drops or lowers props) are cleanly trimmed."""
+    try:
+        import array
+        import math
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(clip_path), "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+            capture_output=True, timeout=15
+        )
+        raw = r.stdout or b""
+        samples = array.array("h")
+        samples.frombytes(raw[: (len(raw) // 2) * 2])
+        win = 1600  # 0.10s at 16kHz
+        rms_list = []
+        for i in range(0, len(samples), win):
+            chunk = samples[i : i + win]
+            if not chunk:
+                break
+            s2 = sum(x * x for x in chunk) / len(chunk)
+            rms_list.append(math.sqrt(s2))
+        if not rms_list:
+            return 0.0, dur
+        peak = max(rms_list)
+        if peak < 300.0:
+            return 0.0, dur
+        thr = max(peak * 0.22, 650.0)
+        active = [val >= thr for val in rms_list]
+        sustained = []
+        for idx in range(len(active)):
+            lo = max(0, idx - 1)
+            hi = min(len(active), idx + 2)
+            sustained.append(active[idx] and sum(active[lo:hi]) >= 2)
+        active_indices = [idx for idx, ok in enumerate(sustained) if ok]
+        if not active_indices:
+            return 0.0, dur
+        first_s = active_indices[0] * 0.10
+        last_s = (active_indices[-1] + 1) * 0.10
+        speech_start = max(0.0, first_s - 0.06) if 0.22 < first_s < 0.85 else 0.0
+        speech_end = min(dur, last_s + 0.22) if last_s >= 3.5 else dur
+        return round(speech_start, 3), round(speech_end, 3)
+    except Exception:
+        return 0.0, dur
+
+
 def smart_concat_videos(
     clips: list[Path],
     output_path: Path,
-    crossfade_s: float = 0.35,
+    crossfade_s: float = 0.30,
     trim_start_s: float = 0.0,
-    trim_end_s: float = 0.15,
+    trim_end_s: float = 0.20,
     target_duration: float = None,
     bgm_path: Path = None
 ):
-    """Seamlessly concatenate AI video clips: trim freeze frames, enforce target duration, apply crossfades, and optionally apply Auto-Ducking BGM."""
+    """Seamlessly concatenate AI video clips: trim freeze/dead tail frames in-place, enforce target duration, apply crossfades or trimmed concat, and optionally apply Auto-Ducking BGM."""
     valid_clips = [c for c in clips if c and c.exists()]
     if not valid_clips:
         raise RuntimeError("No valid clips to concatenate")
@@ -1828,36 +2193,53 @@ def smart_concat_videos(
     temp_concat = output_path.parent / f"temp_concat_{output_path.name}"
 
     try:
+        # Step 1: Trim dead pre-speech freeze / post-speech tails on each clip in-place so both Scene Studio cards and final concat stay clean
         durations = []
-        for c in valid_clips:
+        for i, c in enumerate(valid_clips):
             cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(c)]
             dur = float(subprocess.check_output(cmd).decode().strip())
+            sp_start, sp_end = _detect_clip_speech_bounds(c, dur)
+            clip_limit = float(target_duration) if target_duration else dur
+            end_t = min(dur, clip_limit, sp_end)
+            if (sp_start > 0.08 or end_t < dur - 0.25) and (end_t - sp_start >= 3.5):
+                tmp_c = c.parent / f"trim_{c.name}"
+                tr_res = subprocess.run([
+                    "ffmpeg", "-y", "-i", str(c),
+                    "-ss", f"{sp_start:.3f}", "-to", f"{end_t:.3f}",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "19", "-preset", "fast",
+                    "-c:a", "aac", "-b:a", "192k", str(tmp_c)
+                ], capture_output=True, text=True)
+                if tr_res.returncode == 0 and tmp_c.exists() and tmp_c.stat().st_size > 30000:
+                    tmp_c.replace(c)
+                    dur = float(subprocess.check_output(cmd).decode().strip())
+                    print(f"[SMART TRIM] Trimmed {c.name} in-place to [{sp_start:.2f}s .. {end_t:.2f}s] -> new dur={dur:.2f}s")
             durations.append(dur)
 
         if len(valid_clips) == 1:
             c = valid_clips[0]
-            if target_duration and durations[0] > float(target_duration):
-                subprocess.run(["ffmpeg", "-y", "-i", str(c), "-t", str(target_duration), "-c", "copy", str(temp_concat)], check=True)
-            else:
-                subprocess.run(["ffmpeg", "-y", "-i", str(c), "-c", "copy", str(temp_concat)], check=True)
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(c),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "19", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "192k", str(temp_concat)
+            ], check=True)
         else:
             inputs = []
             for c in valid_clips:
                 inputs.extend(["-i", str(c)])
 
             eff_lens = []
-            filter_parts = []
-            for i, dur in enumerate(durations):
-                start_t = 0.0 if i == 0 else trim_start_s
-                clip_limit = float(target_duration) if target_duration else dur
-                effective_dur = min(dur, clip_limit)
-                end_t = effective_dur if i == len(durations) - 1 else max(1.0, effective_dur - trim_end_s)
+            trim_parts = []
+            for i, (c, dur) in enumerate(zip(valid_clips, durations)):
+                start_t = 0.0
+                end_t = dur
                 eff_len = max(1.0, end_t - start_t)
                 eff_lens.append(eff_len)
+                print(f"[SMART CONCAT] Clip {i+1} ({c.name}): dur={eff_len:.2f}s")
 
-                filter_parts.append(f"[{i}:v]trim=start={start_t:.3f}:end={end_t:.3f},setpts=PTS-STARTPTS[v{i}]")
-                filter_parts.append(f"[{i}:a]atrim=start={start_t:.3f}:end={end_t:.3f},asetpts=PTS-STARTPTS[a{i}]")
+                trim_parts.append(f"[{i}:v]trim=start={start_t:.3f}:end={end_t:.3f},setpts=PTS-STARTPTS[v{i}]")
+                trim_parts.append(f"[{i}:a]atrim=start={start_t:.3f}:end={end_t:.3f},asetpts=PTS-STARTPTS[a{i}]")
 
+            filter_parts = list(trim_parts)
             last_v = "[v0]"
             last_a = "[a0]"
             curr_offset = eff_lens[0] - crossfade_s
@@ -1887,12 +2269,25 @@ def smart_concat_videos(
             ]
             res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
             if res.returncode != 0 or not temp_concat.exists():
-                print(f"Smart concat failed ({res.returncode}), falling back to demuxer...")
-                scenes_txt = output_path.parent / "scenes.txt"
-                with open(scenes_txt, "w") as f:
-                    for clip in valid_clips:
-                        f.write(f"file '{clip.name}'\n")
-                subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(scenes_txt), "-c", "copy", str(temp_concat)], check=True)
+                # FFmpeg 3.x fallback: use trimmed concat filter (preserves exact start/end speech trims on older FFmpeg without xfade)
+                print(f"Smart xfade concat unsupported ({res.returncode}), using trimmed filter_complex concat...")
+                concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(valid_clips)))
+                fc_fallback = "; ".join(trim_parts + [f"{concat_inputs}concat=n={len(valid_clips)}:v=1:a=1[vout][aout]"])
+                res_fb = subprocess.run([
+                    "ffmpeg", "-y", *inputs,
+                    "-filter_complex", fc_fallback,
+                    "-map", "[vout]", "-map", "[aout]",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "19", "-preset", "fast",
+                    "-c:a", "aac", "-b:a", "192k",
+                    str(temp_concat)
+                ], capture_output=True, text=True)
+                if res_fb.returncode != 0 or not temp_concat.exists():
+                    print(f"Trimmed concat failed ({res_fb.returncode}), falling back to demuxer...")
+                    scenes_txt = output_path.parent / "scenes.txt"
+                    with open(scenes_txt, "w") as f:
+                        for clip in valid_clips:
+                            f.write(f"file '{clip.name}'\n")
+                    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(scenes_txt), "-c", "copy", str(temp_concat)], check=True)
 
         # Apply BGM with Auto-Ducking if selected
         if bgm_path and bgm_path.exists():
@@ -1902,7 +2297,7 @@ def smart_concat_videos(
                 "-i", str(temp_concat),
                 "-i", str(bgm_path),
                 "-filter_complex",
-                "[1:a]aloop=loop=-1:size=2e+09[bgm_loop];[bgm_loop]volume=0.10[bgm_vol];[0:a][bgm_vol]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]",
+                "[1:a]aloop=loop=-1:size=2e+09[bgm_loop];[bgm_loop]volume=0.10[bgm_vol];[0:a][bgm_vol]amix=inputs=2:duration=first:dropout_transition=2[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-c:v", "copy",
@@ -1917,11 +2312,14 @@ def smart_concat_videos(
 
     except Exception as e:
         print(f"Smart concat exception: {e}, falling back to direct concat")
-        scenes_txt = output_path.parent / "scenes.txt"
-        with open(scenes_txt, "w") as f:
-            for clip in valid_clips:
-                f.write(f"file '{clip.name}'\n")
-        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(scenes_txt), "-c", "copy", str(output_path)], check=True)
+        if temp_concat.exists() and temp_concat.stat().st_size > 50000:
+            temp_concat.replace(output_path)
+        else:
+            scenes_txt = output_path.parent / "scenes.txt"
+            with open(scenes_txt, "w") as f:
+                for clip in valid_clips:
+                    f.write(f"file '{clip.name}'\n")
+            subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(scenes_txt), "-c", "copy", str(output_path)], check=True)
 
 def run_pipeline_worker(job_id: str):
     job = JOBS[job_id]
@@ -1956,14 +2354,19 @@ def run_pipeline_worker(job_id: str):
             print("No model image provided, falling back to POV mode.")
             flow_mode = "pov"
 
-    video_engine = job.get("video_engine", "veo")
-    if "veo" in str(job.get("video_model", "")).lower():
+    video_engine = str(job.get("video_engine") or "veo").lower()
+    vm_raw = str(job.get("video_model") or "").lower()
+    if "veo" in vm_raw:
         video_engine = "veo"
-    elif "grok" in str(job.get("video_model", "")).lower():
-        if "10" in str(job.get("video_model", "")).lower() or "v1" in str(job.get("video_model", "")).lower():
+    elif "grok" in vm_raw or "lite" in vm_raw:
+        if "lite" in vm_raw:
+            video_engine = "grok_lite"
+        elif "10" in vm_raw or "v1" in vm_raw:
             video_engine = "grok_10"
         else:
             video_engine = "grok_15"
+    elif "lite" in video_engine:
+        video_engine = "grok_lite"
 
     default_dur = 6 if "grok" in video_engine.lower() else 8
     scene_duration = int(job.get("scene_duration") or default_dur)
@@ -1996,8 +2399,10 @@ def run_pipeline_worker(job_id: str):
         word_count_rule = "EXACTLY between 13 to 16 Vietnamese words (nói vừa vặn trong ~4.8s, TUYỆT ĐỐI KHÔNG vượt quá 16 từ)"
     elif scene_duration <= 8:
         word_count_rule = "EXACTLY between 18 to 22 Vietnamese words (nói tự nhiên vừa vặn trong ~6.5s, TUYỆT ĐỐI KHÔNG vượt quá 22 từ)"
-    else: # 10s+
-        word_count_rule = f"EXACTLY between 23 to 27 Vietnamese words (nói tự nhiên vừa vặn trong ~{scene_duration - 1.5:.1f}s, TUYỆT ĐỐI KHÔNG vượt quá 27 từ)"
+    elif scene_duration <= 10:
+        word_count_rule = "EXACTLY between 23 to 27 Vietnamese words (nói tự nhiên vừa vặn trong ~8.5s, TUYỆT ĐỐI KHÔNG vượt quá 27 từ)"
+    else: # 15s
+        word_count_rule = f"EXACTLY between 35 to 42 Vietnamese words (nói tự nhiên vừa vặn trong ~{scene_duration - 2.0:.1f}s, TUYỆT ĐỐI KHÔNG vượt quá 42 từ)"
 
     try:
         # ─── GIAI ĐOẠN 0: ZERO-KNOWLEDGE PROFILER (AI VISION) ────────
@@ -2368,8 +2773,8 @@ Extract exact details and return a strict JSON object with:
                     "duration_seconds": scene_duration,
                     "audio_dialogue": f"Lời thoại tiếng Việt tự nhiên cho Phân Cảnh {i+1} ({word_count_rule}).",
                     "visual_plan": f"Mô tả bối cảnh và hành động chi tiết cho Phân Cảnh {i+1}...",
-                    "image_generation_prompt": f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {canonical_model_anchor}. PRODUCT REFERENCE LOCK: {canonical_anchor}. [Action and angle for Scene {i+1}]. Direct camera eye contact, upright frontal posture, identical face and identical clothing across all scenes. Photorealistic 8k vertical 9:16.",
-                    "video_motion_prompt": f"CREATOR LOCK — HIGHEST PRIORITY: [Creator movement and product interaction for Scene {i+1}]. Direct camera eye contact, upright head posture, subtle facial movements only. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['say_clause']}. {voice_info['veo_prompt']}"
+                    "image_generation_prompt": f"CREATOR REFERENCE LOCK — HIGHEST PRIORITY: {canonical_model_anchor}. PRODUCT REFERENCE LOCK: {canonical_anchor}. [Action and angle for Scene {i+1}]. Direct camera eye contact, upright frontal posture, soft warm closed-lip smile or gently parted lips ready to speak (no wide open-teeth grin), identical face and identical clothing across all scenes. Photorealistic 8k vertical 9:16.",
+                    "video_motion_prompt": f"CREATOR LOCK — HIGHEST PRIORITY: [Creator movement and product interaction for Scene {i+1}]. Direct camera eye contact, upright head posture, natural speaking mouth articulation from frame 0. Say: \\\"[exact audio_dialogue for Scene {i+1}]\\\" in {voice_info['say_clause']}. {voice_info['veo_prompt']}"
                 } for i in range(num_scenes)
             ]
         skeleton_json = json.dumps(skeleton_items, indent=2, ensure_ascii=False)
@@ -2481,8 +2886,11 @@ Suggested Setting: {profile_data.get('suggested_background', 'cozy personal bedr
 CRITICAL UGC PRODUCTION RULES:
 1. LOẠI HÌNH: UGC (User Generated Content - Người dùng thật chia sẻ kinh nghiệm tại phòng riêng).
 2. ZERO-MORPHING & CHARACTER CONTINUITY: The creator's appearance, face, hair, and exact clothing are 100% FROZEN across all scenes! Every scene's "image_generation_prompt" MUST preserve both the CREATOR REFERENCE LOCK ({canonical_model_anchor}) and PRODUCT REFERENCE LOCK ({canonical_anchor}). NEVER change the creator's outfit, face, or hairstyle in later scenes!
-3. FACIAL IDENTITY & DIRECT EYE CONTACT LOCK: The creator MUST maintain direct camera eye contact with upright, natural frontal posture looking straight at the lens. NEVER tell the creator to tilt head ('tilts head'), roll head sideways, or press the product against their cheek ('presses against cheek'). Tilting or pressing against face deforms facial geometry and causes face desync/morphing in AI video generation! The creator must hold the product comfortably in front near chest level.
-4. ZERO ON-SCREEN TEXT OR GRAPHICS: TUYỆT ĐỐI KHÔNG CÓ CHỮ TRÊN MÀN HÌNH (NO on-screen text, NO subtitles, NO captions, NO typography, NO watermark, NO banners). NEVER write '2-in-1', '3-in-1', '50% off', or numeric slogans in prompts.
+3. FACIAL IDENTITY, SPEAKING-READY MOUTH & DIRECT EYE CONTACT LOCK:
+   - The creator MUST maintain direct camera eye contact with upright, natural frontal posture looking straight at the lens.
+   - In every "image_generation_prompt", describe the mouth as a "soft warm closed-lip smile or gently parted lips ready to speak" — NEVER a "wide grin", "open-mouth laugh", or "showing teeth", because a wide open-teeth grin causes frame-0 lip-sync freeze when speech begins!
+   - NEVER tell the creator to tilt head ('tilts head'), roll head sideways, or press the product against their cheek ('presses against cheek'). The creator must hold ALL product items comfortably in front near chest level across all scenes.
+4. ZERO ON-SCREEN TEXT, GRAPHICS OR SHOPPING CART PROPS: TUYỆT ĐỐI KHÔNG CÓ CHỮ TRÊN MÀN HÌNH VÀ KHÔNG VẼ XE ĐẨY/GIỎ HÀNG VẬT LÝ (NO on-screen text, NO subtitles, NO captions, NO typography, NO watermark, NO banners, NO physical shopping cart or basket prop). Even when the audio dialogue mentions 'giỏ hàng góc trái', NEVER write 'pointing at bottom-left', 'gesturing toward bottom-left', or 'shopping cart' in image_generation_prompt or video_motion_prompt! Instead, have the creator hold the product slightly closer to the camera with a warm encouraging nod.
 5. PROMPTS MUST BE 100% IN ENGLISH: "image_generation_prompt" and "video_motion_prompt" MUST be written in concise English only!
 6. TOTAL SCENES: EXACTLY {num_scenes} SCENES.
 7. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
@@ -2490,12 +2898,12 @@ CRITICAL UGC PRODUCTION RULES:
 9. VOICE STYLE & DIALECT: {voice_info['label']} — {voice_info['tone_desc']}
 10. TONE & VOCABULARY: Đời thường, gần gũi, khuyên dùng thật lòng, tâm sự chân thật (ví dụ: 'Mình dùng được 2 tuần nay rồi...', '{example_opener} chân ái đây rồi...', 'Nói thật lúc đầu mình cũng đắn đo nhưng cầm lên tay là mê thực sự...', 'Đáng đồng tiền bát gạo luôn nha').
 11. {persona_prompt_block}
-12. CAMERA & ENVIRONMENT: Frontal camera / selfie close-up angle, creator sitting in personal room/desk, holding product naturally, genuine smiles, natural lighting.
-13. SCENE CONTINUITY LOCK (LIỀN MẠCH — BẮT BUỘC): All {num_scenes} scenes happen in ONE continuous take in the SAME room ({profile_data.get('suggested_background', 'cozy personal bedroom with desk setup')}), SAME creator position, SAME outfit, SAME lighting, SAME framing. Every scene's "visual_plan" and "image_generation_prompt" MUST reuse that exact environment verbatim — NEVER move the creator to a new location, change the background, or re-pose them between scenes. Scene N+1 opens from the exact state where Scene N ended (product in hand, posture, camera distance carry over). Only dialogue and small gestures progress; the physical world stays identical — the viewer must feel ONE unbroken talking take, not 3 separate shots.
+12. CAMERA & ENVIRONMENT: Frontal camera / selfie medium close-up angle, creator sitting in personal room/desk, holding product naturally near chest level, soft warm closed-lip smile ready to speak, flattering natural indoor lighting.
+13. SCENE CONTINUITY LOCK (LIỀN MẠCH — BẮT BUỘC): All {num_scenes} scenes happen in ONE continuous take in the SAME room ({profile_data.get('suggested_background', 'cozy personal bedroom with desk setup')}), SAME creator position, SAME outfit, SAME lighting, SAME framing, holding the SAME complete set of product items. Every scene's "visual_plan" and "image_generation_prompt" MUST reuse that exact environment verbatim — NEVER move the creator to a new location, change the background, drop one of the product items, or re-pose them between scenes. Scene N+1 opens from the exact state where Scene N ended (product in hand, posture, camera distance carry over). Only dialogue and small hand gestures progress; the physical world stays identical — the viewer must feel ONE unbroken talking take, not 3 separate shots.
 14. ZERO CONTENT-POLICY VIOLATIONS (STRICT G-RATED COMMERCIAL STANDARD): TUYỆT ĐỐI KHÔNG VI PHẠM CHÍNH SÁCH KIỂM DUYỆT CỦA GOOGLE VEO VÀ xAI GROK!
     - Preserve the creator's exact outfit and appearance ({canonical_model_anchor}) with 100% consistency across all scenes.
     - NEVER use ambiguous tactile actions in prompts or dialogue (NO 'unzipping slit', NO 'smooth zipper', NO 'pulling out of slit', NO 'khóa kéo mở bung', NO 'rubbing', NO 'stroking').
-    - For product interaction: keep gestures natural, gentle, and commercial: 'holding product comfortably near chest level', 'pointing gently at feature', 'gently opening the presentation pouch to reveal the cute character'.
+    - For product interaction: keep gestures natural, gentle, and commercial: 'holding both product items comfortably near chest level', 'tapping gently on the plush surface', 'gently showing the cute character details to the camera'.
 15. OUTPUT EXACTLY {num_scenes} SCENES matching the template below. You MUST complete every scene from 1 to {num_scenes}. DO NOT return fewer than {num_scenes} scenes!
 
 Return ONLY the completed JSON array of EXACTLY {num_scenes} scenes:
@@ -2550,8 +2958,11 @@ Showroom Environment: {profile_data.get('suggested_background', 'sleek modern lu
 CRITICAL STORE REVIEW PRODUCTION RULES:
 1. LOẠI HÌNH: Review Cửa Hàng / Showroom chuyên nghiệp sang trọng.
 2. ZERO-MORPHING & CHARACTER CONTINUITY: The KOL's appearance, face, hair, and exact outfit are 100% FROZEN across all scenes! Every scene's "image_generation_prompt" MUST preserve both the CREATOR REFERENCE LOCK ({canonical_model_anchor}) and PRODUCT REFERENCE LOCK ({canonical_anchor}). NEVER change outfit, face, or hairstyle in later scenes!
-3. FACIAL IDENTITY & STABLE HEAD POSTURE: The KOL MUST maintain direct camera eye contact with upright, confident frontal posture looking straight at camera. NEVER instruct the KOL to tilt head or turn away. Keep hands holding product comfortably in front.
-4. ZERO ON-SCREEN TEXT OR GRAPHICS: TUYỆT ĐỐI KHÔNG CÓ CHỮ TRÊN MÀN HÌNH (NO on-screen text, NO subtitles, NO captions, NO typography, NO watermark, NO banners). NEVER write '2-in-1', '3-in-1', or numeric slogans in prompts.
+3. FACIAL IDENTITY, SPEAKING-READY MOUTH & STABLE HEAD POSTURE:
+   - The KOL MUST maintain direct camera eye contact with upright, confident frontal posture looking straight at camera.
+   - In every "image_generation_prompt", describe the mouth as a "soft warm closed-lip smile or gently parted lips ready to speak" — NEVER a wide open-teeth grin.
+   - NEVER instruct the KOL to tilt head or turn away. Keep hands holding ALL product items comfortably in front near chest level.
+4. ZERO ON-SCREEN TEXT, GRAPHICS OR SHOPPING CART PROPS: TUYỆT ĐỐI KHÔNG CÓ CHỮ TRÊN MÀN HÌNH VÀ KHÔNG VẼ XE ĐẨY/GIỎ HÀNG VẬT LÝ (NO on-screen text, NO subtitles, NO captions, NO typography, NO watermark, NO banners, NO physical shopping cart or basket prop). Even when the audio dialogue mentions 'giỏ hàng góc trái', NEVER write 'pointing at bottom-left', 'gesturing toward bottom-left', or 'shopping cart' in image_generation_prompt or video_motion_prompt!
 5. PROMPTS MUST BE 100% IN ENGLISH: "image_generation_prompt" and "video_motion_prompt" MUST be written in concise English only!
 6. TOTAL SCENES: EXACTLY {num_scenes} SCENES.
 7. EACH SCENE DURATION: EXACTLY {scene_duration} SECONDS.
@@ -2579,7 +2990,7 @@ CRITICAL AFFILIATE SCRIPT STYLE: REVIEW BÁN HÀNG TIKTOK SHOP (HIGH CONVERSION)
 - Hook cực mạnh ở Phân cảnh 1 gây chú ý lập tức, giải quyết nỗi đau hoặc hé lộ deal hot.
 - Lồng ghép tự nhiên thông số: {product_name or 'sản phẩm'} với mức giá khuyến mãi {product_price or ''} {product_discount or ''} của shop {product_shop or ''}.
 - Tận dụng các điểm nhấn nổi bật (USPs): {product_highlights or 'chất lượng đỉnh cao, tiện dụng'}.
-- Phân cảnh cuối bắt buộc lời kêu gọi hành động (CTA) dứt khoát: 'Bấm ngay vào giỏ hàng màu vàng ở góc trái màn hình để nhận ưu đãi độc quyền nhé!'.
+- Phân cảnh cuối bắt buộc lời kêu gọi hành động (CTA) dứt khoát trong audio_dialogue: 'Bấm ngay vào giỏ hàng màu vàng ở góc trái màn hình để nhận ưu đãi độc quyền nhé!' (LƯU Ý: Chỉ nói trong audio_dialogue, TUYỆT ĐỐI KHÔNG mô tả động tác chỉ tay xuống góc trái hay nhắc đến shopping cart/basket trong image_generation_prompt và video_motion_prompt để tránh AI vẽ xe đẩy siêu thị thật!).
 """
         elif script_style == "pov_ugc":
             style_block = f"""
@@ -2675,13 +3086,7 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                 if "video_motion_prompt" in sc:
                     sc["video_motion_prompt"] = sanitize_safety_content(sc["video_motion_prompt"])
                     sc["video_motion_prompt"] = apply_persona_replacements(sc["video_motion_prompt"], persona_info.get("replacements", {}))
-                # CRITICAL: Always synchronize motion prompt's Say: clause with dialogue for lip-sync
-                if sc.get("audio_dialogue") and sc.get("video_motion_prompt"):
-                    sc["video_motion_prompt"] = sync_dialogue_to_motion_prompt(
-                        sc["video_motion_prompt"],
-                        sc["audio_dialogue"],
-                        voice_info.get("say_clause", "")
-                    )
+                lock_scene_voice(sc, voice_info)
             update_job(job_id, scenes=scenes_data)
 
         # ─── GIAI ĐOẠN 2: KEYFRAME ANCHORING (GOOGLE BANANA PRO 2) ──
@@ -2774,12 +3179,23 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
 
         # 2. Băng chuyền song song: Sinh đồng thời toàn bộ Keyframe qua ThreadPoolExecutor!
         is_grok = video_engine.startswith("grok")
+        is_grok_lite = "lite" in video_engine
         is_grok_v1 = "10" in video_engine or "v1" in video_engine
-        grok_model_name = "xai/grok-imagine-video" if is_grok_v1 else "xai/grok-imagine-video-1.5"
-        grok_display = "Grok Video 1.0" if is_grok_v1 else "Grok Video 1.5"
+        if is_grok_lite:
+            grok_model_name = "xai/grok-imagine-video-1.5-lite"
+            grok_display = "Grok 1.5 Lite"
+        elif is_grok_v1:
+            grok_model_name = "xai/grok-imagine-video"
+            grok_display = "Grok Video 1.0"
+        else:
+            grok_model_name = "xai/grok-imagine-video-1.5"
+            grok_display = "Grok Video 1.5"
 
         state_lock = threading.Lock()
         kf_errors = []
+        scene1_kf_event = threading.Event()
+        if num_scenes <= 1:
+            scene1_kf_event.set()
 
         def _process_scene_keyframe(i, sc):
             clip_path = job_dir / f"clip_{i}.mp4"
@@ -2796,6 +3212,8 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                         scenes_data[i - 1]["video_url"] = f"/job/{job_id}/clip/{i}"
                         scenes_data[i - 1]["keyframe_url"] = f"/job/{job_id}/kf/{i}"
                         update_job(job_id, clips=[f"/job/{job_id}/clip/{j+1}" for j in range(num_scenes) if clips[j] is not None], scenes=scenes_data)
+                    if i == 1:
+                        scene1_kf_event.set()
                     return
 
                 # Sinh Keyframe cho Cảnh i nếu chưa có
@@ -2808,16 +3226,22 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                         break
 
                 if not kf_mid:
-                    # Chống cờ RATE_BURST: Thêm độ trễ so le nhẹ (~0.95s) giữa các luồng
-                    # Cảnh 1: 0s, Cảnh 2: ~0.95s, Cảnh 3: ~1.9s, Cảnh 4: ~2.85s...
-                    # Giúp các request đến Google giãn cách tự nhiên như người dùng thật, triệt tiêu 100% lỗi RATE_BURST
-                    stagger_s = (i - 1) * 0.95
-                    if stagger_s > 0:
-                        time.sleep(stagger_s)
-
+                    if i > 1:
+                        # Đợi Keyframe Cảnh 1 hoàn tất để dùng làm mỏ neo đồng bộ phòng + nhân vật 100% giữa các cảnh
+                        scene1_kf_event.wait(timeout=90.0)
+                        stagger_s = (i - 2) * 0.95
+                        if stagger_s > 0:
+                            time.sleep(stagger_s)
                     sanitized_prompt = sanitize_kf_prompt(sc["image_generation_prompt"], canonical_anchor, canonical_model_anchor, mode=flow_mode)
-                    kf_mid, kf_url = generate_keyframe_flowkit(sanitized_prompt, ref_ids, job_id=job_id)
-                    urllib.request.urlretrieve(kf_url, str(kf_path))
+                    kf_1_mid_now = None
+                    if i > 1:
+                        with state_lock:
+                            kf_1_mid_now = (keyframes[0] or {}).get("media_id") if keyframes else None
+                    scene_refs, sanitized_prompt = _resolve_scene_kf_refs_and_prompt(
+                        job_id, i, ref_ids, sanitized_prompt, kf_1_mid_override=kf_1_mid_now
+                    )
+                    kf_mid, kf_url = generate_keyframe_flowkit(sanitized_prompt, scene_refs, job_id=job_id)
+                    download_keyframe_file(kf_url, kf_path)
 
                 with state_lock:
                     keyframes[i - 1] = {"scene_id": i, "media_id": kf_mid, "url": f"/job/{job_id}/kf/{i}"}
@@ -2829,6 +3253,9 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                     scenes_data[i - 1]["keyframe_url"] = f"/job/{job_id}/kf/{i}"
                     scenes_data[i - 1]["image_url"] = f"/job/{job_id}/kf/{i}"
                     update_job(job_id, keyframes=done_kfs, message=f"Băng chuyền: Cảnh {i}/{num_scenes} Keyframe hoàn tất! ({len(done_kfs)}/{num_scenes})", scenes=scenes_data)
+
+                if i == 1:
+                    scene1_kf_event.set()
 
                 if is_grok:
                     with state_lock:
@@ -2851,6 +3278,8 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                         update_job(job_id, status="RENDERING", message=f"Băng chuyền [Cảnh {i}/{num_scenes}]: Đã nạp Cảnh {i} vào cụm GPU Veo 3 ({scene_duration}s)...", step=4, scenes=scenes_data)
                         print(f"Job {job_id}: Scene {i} submitted to Veo 3 (op: {op_name[:16]}...).")
             except Exception as err:
+                if i == 1:
+                    scene1_kf_event.set()
                 print(f"Job {job_id}: Scene {i} keyframe generation failed: {err}")
                 with state_lock:
                     scenes_data[i - 1]["status"] = "FAILED"
@@ -2860,7 +3289,7 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
                 kf_errors.append(f"Cảnh {i}: {err}")
 
         max_kf_workers = max(1, min(num_scenes, num_threads, 20))
-        print(f"Job {job_id}: Generating {num_scenes} keyframes concurrently with {max_kf_workers} workers...")
+        print(f"Job {job_id}: Generating {num_scenes} keyframes (Scene 1 anchor -> parallel Scenes 2..{num_scenes}) with {max_kf_workers} workers...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_kf_workers) as kf_executor:
             futures = [kf_executor.submit(_process_scene_keyframe, i, sc) for i, sc in enumerate(scenes_data, start=1)]
             concurrent.futures.wait(futures)
@@ -2875,9 +3304,17 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
 
         # 3. Tất cả các cảnh đã được nạp vào Video Engine -> Bộ Giám Sát Tập Trung
         if video_engine.startswith("grok"):
+            is_grok_lite = "lite" in video_engine
             is_grok_v1 = "10" in video_engine or "v1" in video_engine
-            grok_model_name = "xai/grok-imagine-video" if is_grok_v1 else "xai/grok-imagine-video-1.5"
-            grok_display = "Grok Video 1.0" if is_grok_v1 else "Grok Video 1.5"
+            if is_grok_lite:
+                grok_model_name = "xai/grok-imagine-video-1.5-lite"
+                grok_display = "Grok 1.5 Lite"
+            elif is_grok_v1:
+                grok_model_name = "xai/grok-imagine-video"
+                grok_display = "Grok Video 1.0"
+            else:
+                grok_model_name = "xai/grok-imagine-video-1.5"
+                grok_display = "Grok Video 1.5"
 
             def _on_clip_done(scene_idx, c_path):
                 clips[scene_idx - 1] = c_path
@@ -2976,21 +3413,28 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
             )
 
         # ─── GIAI ĐOẠN 4: HẬU KỲ & XUẤT BẢN (FFMPEG ENGINE) ──────────
-        valid_clips = [c for c in clips if c is not None and c.exists() and c.stat().st_size > 50000]
+        adopt_ready_clips(job_id)
+        valid_clips = []
+        for i in range(1, num_scenes + 1):
+            c = job_dir / f"clip_{i}.mp4"
+            if c.exists() and c.stat().st_size > 50000:
+                valid_clips.append(c)
+                clips[i - 1] = c
         final_mp4 = job_dir / "final_tvc.mp4"
         has_failures = any(sc.get("status") == "FAILED" for sc in scenes_data) or (len(valid_clips) < num_scenes)
 
         if not has_failures and len(valid_clips) == num_scenes:
-            # If any clip has no audio (e.g. silent video), apply Edge-TTS fallback (except fashion mode which is zero-dialogue)
+            # If any clip has no spoken voice (e.g. grok_lite, grok_10, or silent video), apply Edge-TTS voiceover (except fashion mode which is zero-dialogue)
             if flow_mode != "fashion":
+                needs_tts_mux = ("lite" in video_engine.lower()) or ("10" in video_engine.lower()) or ("v1" in video_engine.lower())
                 for idx, c in enumerate(valid_clips, start=1):
-                    if not check_video_has_audio(c):
+                    if needs_tts_mux or not check_video_has_audio(c):
                         t_f = job_dir / f"tts_{idx}.mp3"
                         if not t_f.exists() or t_f.stat().st_size < 1000:
                             sc_data = scenes_data[idx - 1] if idx - 1 < len(scenes_data) else {}
                             dlg = (sc_data.get("audio_dialogue") or "").strip()
                             if dlg:
-                                print(f"Job {job_id}: Recovering missing TTS for silent scene {idx} before concatenation...")
+                                print(f"Job {job_id}: Generating TTS for scene {idx} before concatenation...")
                                 generate_edge_tts(dlg, t_f, voice=voice_info["edge_voice"], rate=voice_info.get("rate", "+0%"))
                         if t_f.exists() and t_f.stat().st_size > 500:
                             mux_tts_to_video(c, t_f, target_duration=scene_duration)
@@ -3057,6 +3501,40 @@ Return ONLY a strict JSON array of the {missing_count} missing scene(s):
             update_job(job_id, status="FAILED", message="Không có phân cảnh nào hoàn thành, vui lòng thử lại.", final_video_url=None, scenes=scenes_data)
 
     except Exception as exc:
+        adopt_ready_clips(job_id)
+        job_now = JOBS.get(job_id) or {}
+        scenes_now = job_now.get("scenes") or []
+        job_dir_now = WORK_DIR / job_id
+        disk_clips = [
+            job_dir_now / f"clip_{i}.mp4"
+            for i in range(1, len(scenes_now) + 1)
+            if (job_dir_now / f"clip_{i}.mp4").exists()
+            and (job_dir_now / f"clip_{i}.mp4").stat().st_size > 50000
+        ]
+        if scenes_now and len(disk_clips) == len(scenes_now):
+            try:
+                final_mp4 = job_dir_now / "final_tvc.mp4"
+                smart_concat_videos(
+                    disk_clips, final_mp4,
+                    target_duration=job_now.get("scene_duration", 8),
+                    bgm_path=None,
+                )
+                update_job(
+                    job_id, status="COMPLETED", error=None,
+                    message=f"Hoàn thành {len(disk_clips)}/{len(scenes_now)} phân cảnh.",
+                    final_video_url=f"/job/{job_id}/final",
+                    completed_at=time.time(),
+                    scenes=scenes_now,
+                )
+                return
+            except Exception as concat_err:
+                print(f"Job {job_id}: concat after worker error: {concat_err}")
+                update_job(
+                    job_id, status="PARTIAL_SUCCESS", error=None,
+                    message=f"Đã có đủ {len(disk_clips)} clip. Ghép final lỗi: {concat_err}",
+                    scenes=scenes_now,
+                )
+                return
         err_text = str(exc)
         if "UNUSUAL" in err_text or "proxy" in err_text.lower():
             clean_err = "Hệ thống máy chủ AI đang bận điều phối tài nguyên, vui lòng bấm Tiếp tục hoặc Tái tạo lại."
@@ -3126,9 +3604,10 @@ def run_keyframe_regeneration_worker(job_id: str, scene_id: int, image_prompt: s
         kf_path = job_dir / f"keyframe_{scene_id}.jpg"
         ref_ids = get_or_refresh_ref_ids(job_id)
         sanitized_prompt = sanitize_kf_prompt(sc["image_generation_prompt"], canonical_anchor, canonical_model_anchor, mode=flow_mode)
-        
-        kf_mid, kf_url = generate_keyframe_flowkit(sanitized_prompt, ref_ids, job_id=job_id)
-        urllib.request.urlretrieve(kf_url, str(kf_path))
+        scene_refs, sanitized_prompt = _resolve_scene_kf_refs_and_prompt(job_id, scene_id, ref_ids, sanitized_prompt)
+
+        kf_mid, kf_url = generate_keyframe_flowkit(sanitized_prompt, scene_refs, job_id=job_id)
+        download_keyframe_file(kf_url, kf_path)
 
         # Update keyframes list in job
         kfs = job.get("keyframes", [])
@@ -3296,8 +3775,9 @@ def run_scene_regeneration_worker(
             )
             ref_ids = get_or_refresh_ref_ids(job_id)
             sanitized_prompt = sanitize_kf_prompt(sc["image_generation_prompt"], canonical_anchor, canonical_model_anchor, mode=flow_mode)
-            kf_mid, kf_url = generate_keyframe_flowkit(sanitized_prompt, ref_ids, job_id=job_id)
-            urllib.request.urlretrieve(kf_url, str(kf_path))
+            scene_refs, sanitized_prompt = _resolve_scene_kf_refs_and_prompt(job_id, scene_id, ref_ids, sanitized_prompt)
+            kf_mid, kf_url = generate_keyframe_flowkit(sanitized_prompt, scene_refs, job_id=job_id)
+            download_keyframe_file(kf_url, kf_path)
 
             # Update keyframes list in job
             kfs = job.get("keyframes", [])
@@ -3318,10 +3798,18 @@ def run_scene_regeneration_worker(
         if video_res not in ["480p", "720p", "1080p"]:
             video_res = "720p" if "veo" in video_engine.lower() else "480p"
         clip_path = job_dir / f"clip_{scene_id}.mp4"
-        if "grok" in video_engine.lower():
+        if "grok" in video_engine.lower() or "lite" in video_engine.lower():
+            is_grok_lite = "lite" in video_engine.lower()
             is_grok_v1 = "10" in video_engine or "v1" in video_engine
-            grok_model_name = "xai/grok-imagine-video" if is_grok_v1 else "xai/grok-imagine-video-1.5"
-            grok_display = "Grok Video 1.0" if is_grok_v1 else "Grok Video 1.5"
+            if is_grok_lite:
+                grok_model_name = "xai/grok-imagine-video-1.5-lite"
+                grok_display = "Grok 1.5 Lite"
+            elif is_grok_v1:
+                grok_model_name = "xai/grok-imagine-video"
+                grok_display = "Grok Video 1.0"
+            else:
+                grok_model_name = "xai/grok-imagine-video-1.5"
+                grok_display = "Grok Video 1.5"
             update_job(
                 job_id,
                 regen_status={
@@ -3397,7 +3885,8 @@ def run_scene_regeneration_worker(
         )
         tts_path = job_dir / f"tts_{scene_id}.mp3"
         generate_edge_tts(sc.get("audio_dialogue", ""), tts_path, voice=voice_info["edge_voice"], rate=voice_info.get("rate", "+0%"))
-        if not check_video_has_audio(clip_path) and tts_path.exists() and tts_path.stat().st_size > 500:
+        needs_tts_mux = ("lite" in video_engine.lower()) or ("10" in video_engine.lower()) or ("v1" in video_engine.lower())
+        if (needs_tts_mux or not check_video_has_audio(clip_path)) and tts_path.exists() and tts_path.stat().st_size > 500:
             mux_tts_to_video(clip_path, tts_path, target_duration=job.get("scene_duration", 8))
 
         # Update scene in scenes list
@@ -3761,6 +4250,7 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
                     JOBS[jid] = json.loads(jfile.read_text())
                 except Exception:
                     pass
+            adopt_ready_clips(jid)
             job = JOBS.get(jid, {"status": "NOT_FOUND"})
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -4907,12 +5397,30 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
         parts = body.split(b"--" + boundary)
         tenant_id = ""
+        qs_engine = ""
+        qs_res = ""
+        qs_dur = None
+        qs_scenes = None
         if "?" in self.path:
             try:
                 from urllib.parse import parse_qs, urlparse
                 qs = parse_qs(urlparse(self.path).query)
                 if "tenant_id" in qs and qs["tenant_id"]:
                     tenant_id = str(qs["tenant_id"][0]).strip()
+                if "video_engine" in qs and qs["video_engine"]:
+                    qs_engine = str(qs["video_engine"][0]).strip().lower()
+                if "resolution" in qs and qs["resolution"]:
+                    qs_res = str(qs["resolution"][0]).strip().lower()
+                if "scene_duration" in qs and qs["scene_duration"]:
+                    try:
+                        qs_dur = int(str(qs["scene_duration"][0]).strip())
+                    except Exception:
+                        pass
+                if "num_scenes" in qs and qs["num_scenes"]:
+                    try:
+                        qs_scenes = int(str(qs["num_scenes"][0]).strip())
+                    except Exception:
+                        pass
             except Exception:
                 pass
         if not tenant_id:
@@ -4933,10 +5441,20 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
         flow_mode = "pov"
         video_engine = "veo"
-        resolution = "720p"
-        num_scenes = 3
+        if qs_engine:
+            if "grok" in qs_engine or "lite" in qs_engine:
+                if "lite" in qs_engine:
+                    video_engine = "grok_lite"
+                elif "10" in qs_engine or "v1" in qs_engine:
+                    video_engine = "grok_10"
+                else:
+                    video_engine = "grok_15"
+            else:
+                video_engine = "veo"
+        resolution = qs_res if qs_res in ["480p", "720p", "1080p"] else None
+        num_scenes = max(1, min(5, qs_scenes)) if qs_scenes else 3
         num_threads = 5
-        scene_duration = 8
+        scene_duration = qs_dur if (qs_dur is not None and 1 <= qs_dur <= 15) else None
         voice = "female_north"
         bgm = "tiktok_upbeat"
         script_style = "tiktok_shop"
@@ -4989,22 +5507,36 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             elif b'name="video_engine"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 ve_str = val.strip().decode(errors="ignore").lower()
-                if "grok" in ve_str:
-                    video_engine = "grok_10" if ("10" in ve_str or "v1" in ve_str) else "grok_15"
+                if "grok" in ve_str or "lite" in ve_str:
+                    if "lite" in ve_str:
+                        video_engine = "grok_lite"
+                    elif "10" in ve_str or "v1" in ve_str:
+                        video_engine = "grok_10"
+                    else:
+                        video_engine = "grok_15"
                 else:
                     video_engine = "veo"
             elif b'name="video_model"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 vm_str = val.strip().decode(errors="ignore").lower()
-                if "grok" in vm_str:
-                    video_engine = "grok_10" if ("10" in vm_str or "v1" in vm_str) else "grok_15"
+                if "grok" in vm_str or "lite" in vm_str:
+                    if "lite" in vm_str:
+                        video_engine = "grok_lite"
+                    elif "10" in vm_str or "v1" in vm_str:
+                        video_engine = "grok_10"
+                    else:
+                        video_engine = "grok_15"
                 else:
                     video_engine = "veo"
             elif b'name="resolution"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 r_str = val.strip().decode(errors="ignore").lower()
-                if r_str in ["480p", "720p", "1080p"]:
-                    resolution = r_str
+                if r_str in ["1080", "1080p"]:
+                    resolution = "1080p"
+                elif r_str in ["720", "720p"]:
+                    resolution = "720p"
+                elif r_str in ["480", "480p"]:
+                    resolution = "480p"
             elif b'name="num_scenes"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 try:
@@ -5015,10 +5547,10 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
                 _, val = part.split(b"\r\n\r\n", 1)
                 try:
                     val_int = int(val.strip())
-                    if val_int in [4, 6, 8, 10]:
+                    if 1 <= val_int <= 15:
                         scene_duration = val_int
                 except:
-                    scene_duration = 6 if "grok" in video_engine else 8
+                    pass
             elif b'name="voice"' in part and b"\r\n\r\n" in part:
                 _, val = part.split(b"\r\n\r\n", 1)
                 v_str = val.strip().decode(errors="ignore")
@@ -5038,7 +5570,7 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
             elif b'name="product"' in part and b"\r\n\r\n" in part:
                 _, data = part.split(b"\r\n\r\n", 1)
                 data = data.rstrip(b"\r\n")
-                if data:
+                if data and len(data) > 1000:
                     (job_dir / "product.jpg").write_bytes(data)
             elif b'name="model"' in part and b"\r\n\r\n" in part:
                 _, data = part.split(b"\r\n\r\n", 1)
@@ -5097,6 +5629,17 @@ class AutoTvcHandler(BaseHTTPRequestHandler):
 
         if "veo" in video_engine:
             resolution = "720p"
+            if scene_duration not in (4, 6, 8):
+                scene_duration = 8
+        else:
+            if not resolution or resolution not in ["480p", "720p", "1080p"]:
+                resolution = "480p"
+            if video_engine == "grok_10" and resolution == "1080p":
+                resolution = "720p"
+            if not scene_duration or scene_duration <= 0:
+                scene_duration = 6
+            else:
+                scene_duration = max(1, min(15, int(scene_duration)))
 
         JOBS[job_id] = {
             "job_id": job_id,
@@ -5353,9 +5896,9 @@ HTML_UI = r"""<!DOCTYPE html>
                     <div>
                         <label style="font-size: 13px; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">⏱️ Thời lượng mỗi cảnh:</label>
                         <select name="scene_duration" id="selDuration">
-                            <option value="8" selected>8 Giây (Chuẩn: 34-36 từ thoại)</option>
-                            <option value="6">6 Giây (Năng động: 21-25 từ thoại)</option>
-                            <option value="4">4 Giây (Siêu nhanh: 13-16 từ thoại)</option>
+                            <option value="8" selected>8 Giây (Chuẩn: 18-22 từ thoại)</option>
+                            <option value="6">6 Giây (Năng động: 13-16 từ thoại)</option>
+                            <option value="4">4 Giây (Siêu nhanh: 8-10 từ thoại)</option>
                         </select>
                     </div>
                     <div>
@@ -7375,6 +7918,7 @@ def orphan_op_sweeper():
                     sid = sc.get("scene_id")
                     cp = jfile.parent / f"clip_{sid}.mp4"
                     if cp.exists() and cp.stat().st_size > 50000:
+                        adopt_ready_clips(job_id)
                         continue
                     print(f"[SWEEPER] Job {job_id}: scene {sid} stuck RENDERING_VIDEO >{int(stale_after)}s — dispatching regen (adopts op {str(sc.get('operation_name'))[:12]} if still live).")
                     threading.Thread(
@@ -7393,10 +7937,37 @@ if __name__ == "__main__":
             if p.is_dir() and (p / "job.json").exists():
                 try:
                     loaded_job = json.loads((p / "job.json").read_text())
-                    if loaded_job.get("status") not in ["COMPLETED", "FAILED"]:
+                    JOBS[p.name] = loaded_job
+                    adopt_ready_clips(p.name)
+                    loaded_job = JOBS[p.name]
+                    scenes = loaded_job.get("scenes") or []
+                    all_done = bool(scenes) and all(s.get("status") == "COMPLETED" for s in scenes)
+                    any_done = any(s.get("status") == "COMPLETED" for s in scenes)
+                    live = any(
+                        (s.get("status") == "RENDERING_VIDEO" and s.get("operation_name"))
+                        or s.get("status") == "GENERATING_KEYFRAME"
+                        for s in scenes
+                    )
+                    if all_done:
+                        loaded_job["status"] = "COMPLETED"
+                        loaded_job["error"] = None
+                    elif live:
+                        loaded_job["status"] = "RENDERING"
+                        loaded_job["error"] = None
+                    elif any_done:
+                        loaded_job["status"] = "PARTIAL_SUCCESS"
+                        loaded_job["error"] = None
+                        n_ok = sum(1 for s in scenes if s.get("status") == "COMPLETED")
+                        loaded_job["message"] = (
+                            f"Đã hoàn thành {n_ok}/{len(scenes)} phân cảnh. "
+                            "Render lại các cảnh còn thiếu để xuất video final."
+                        )
+                    elif loaded_job.get("status") not in ("COMPLETED", "FAILED"):
                         loaded_job["status"] = "FAILED"
                         loaded_job["error"] = "Tiến trình bị gián đoạn do server khởi động lại."
-                    JOBS[p.name] = loaded_job
+                    update_job(p.name, status=loaded_job["status"],
+                               error=loaded_job.get("error"),
+                               scenes=scenes)
                 except Exception:
                     pass
     print(f"Loaded {len(JOBS)} past jobs from {WORK_DIR}")
@@ -7409,6 +7980,8 @@ if __name__ == "__main__":
 
     threading.Thread(target=orphan_op_sweeper, daemon=True).start()
 
-    server = HTTPServer(("0.0.0.0", 8089), AutoTvcHandler)
+    from http.server import ThreadingHTTPServer
+    server = ThreadingHTTPServer(("0.0.0.0", 8089), AutoTvcHandler)
+    server.daemon_threads = True
     print("Auto-TVC Studio running at http://0.0.0.0:8089")
     server.serve_forever()

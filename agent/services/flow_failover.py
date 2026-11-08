@@ -55,18 +55,29 @@ def save_operation_replay(
 
     try:
         with _get_conn() as conn:
-            conn.execute(
+            # SQLite < 3.24 (Ubuntu 18.04 ships 3.22) has no ON CONFLICT
+            # upsert — UPDATE first, INSERT when the row does not exist.
+            cur = conn.execute(
                 """
-                INSERT INTO flow_operation_replay (
-                    operation_id, request_type, payload, worker_id, retry_count, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 0, 'PENDING', ?, ?)
-                ON CONFLICT(operation_id) DO UPDATE SET
-                    payload = excluded.payload,
-                    worker_id = COALESCE(NULLIF(excluded.worker_id, ''), flow_operation_replay.worker_id),
-                    updated_at = excluded.updated_at
+                UPDATE flow_operation_replay
+                SET payload = ?,
+                    worker_id = COALESCE(NULLIF(?, ''), worker_id),
+                    updated_at = ?
+                WHERE operation_id = ?
                 """,
-                (cid, request_type, payload_str, worker_id or "", now, now),
+                (payload_str, worker_id or "", now, cid),
             )
+            if cur.rowcount == 0:
+                conn.execute(
+                    """
+                    INSERT INTO flow_operation_replay (
+                        operation_id, request_type, payload, worker_id,
+                        retry_count, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 0, 'PENDING', ?, ?)
+                    """,
+                    (cid, request_type, payload_str, worker_id or "",
+                     now, now),
+                )
             conn.commit()
         logger.info("Saved flow operation replay for %s (type=%s, worker=%s)", cid[:12], request_type, worker_id)
     except Exception as exc:
@@ -137,20 +148,32 @@ def record_operation_failover(
     now = time.time()
     try:
         with _get_conn() as conn:
-            conn.execute(
+            # SQLite < 3.24 (Ubuntu 18.04 ships 3.22) has no ON CONFLICT
+            # upsert — UPDATE first, INSERT when the row does not exist.
+            cur = conn.execute(
                 """
-                INSERT INTO flow_operation_failover (
-                    original_op_id, new_op_id, original_worker_id, failover_worker_id, failover_at, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(original_op_id) DO UPDATE SET
-                    new_op_id = excluded.new_op_id,
-                    original_worker_id = excluded.original_worker_id,
-                    failover_worker_id = excluded.failover_worker_id,
-                    failover_at = excluded.failover_at,
-                    status = excluded.status
+                UPDATE flow_operation_failover
+                SET new_op_id = ?,
+                    original_worker_id = ?,
+                    failover_worker_id = ?,
+                    failover_at = ?,
+                    status = ?
+                WHERE original_op_id = ?
                 """,
-                (c_orig, c_new, original_worker_id, failover_worker_id, now, status, now),
+                (c_new, original_worker_id, failover_worker_id, now,
+                 status, c_orig),
             )
+            if cur.rowcount == 0:
+                conn.execute(
+                    """
+                    INSERT INTO flow_operation_failover (
+                        original_op_id, new_op_id, original_worker_id,
+                        failover_worker_id, failover_at, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (c_orig, c_new, original_worker_id,
+                     failover_worker_id, now, status, now),
+                )
             # Mark replay as failed over
             conn.execute(
                 """

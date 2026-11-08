@@ -7,6 +7,7 @@ not import from the research tree.
 """
 from __future__ import annotations
 
+import re
 
 def varint(n: int) -> bytes:
     out = bytearray()
@@ -146,6 +147,58 @@ def replace_fields(top_bytes: bytes, path: list[int], fnum: int,
     return encode(out)
 
 
+def _looks_msg(v: bytes) -> bool:
+    """True iff v strict-parses as a protobuf message: every field's payload
+    must fit exactly (decode() is lenient — fixed32/64 reads slice short, so
+    plain text like b'monkey image' fake-parses into phantom fields)."""
+    i, n = 0, len(v)
+    if n < 2:
+        return False
+    while i < n:
+        tag = shift = 0
+        while i < n:
+            tag |= (v[i] & 0x7F) << shift
+            shift += 7
+            if not v[i] & 0x80:
+                i += 1
+                break
+            i += 1
+        else:
+            return False
+        fnum, wire = tag >> 3, tag & 7
+        if fnum == 0:
+            return False
+        if wire == 0:
+            while i < n:
+                if not v[i] & 0x80:
+                    i += 1
+                    break
+                i += 1
+            else:
+                return False
+        elif wire == 2:
+            ln = shift = 0
+            while i < n:
+                ln |= (v[i] & 0x7F) << shift
+                shift += 7
+                if not v[i] & 0x80:
+                    i += 1
+                    break
+                i += 1
+            else:
+                return False
+            i += ln
+        elif wire == 5:
+            i += 4
+        elif wire == 1:
+            i += 8
+        else:
+            return False
+        if i > n:
+            return False
+    return i == n
+
+
 def fld_varint(fnum: int, n: int) -> bytes:
     return varint((fnum << 3) | 0) + varint(n)
 
@@ -159,15 +212,25 @@ def fld_str(fnum: int, s) -> bytes:
     return fld_msg(fnum, b)
 
 
+_TEXT_LEAF = re.compile(
+    rb"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:_(?:4k_)?upsampled)?"
+    rb"|https?://\S+)$")
+
+
 def walk_leaves(buf: bytes, path=None, out=None):
     """Yield (path, value) for every leaf; wire-2 values that decode cleanly
     recurse, others are leaves. A bytes leaf is yielded only if decoding it
-    produces no fields."""
+    produces no fields.
+
+    UUIDs and URLs are always leaves: ~24% of random UUIDs happen to decode
+    as protobuf ("29726444-…" -> {f6: "726444-…"}), which hid finished clips
+    from the poller."""
     path = path or []
     out = out if out is not None else []
     for fnum, wire, val in decode(buf):
         p = path + [fnum]
-        if wire == 2 and isinstance(val, bytes) and len(val) > 2:
+        if (wire == 2 and isinstance(val, bytes) and len(val) > 2
+                and not _TEXT_LEAF.match(val)):
             try:
                 sub = decode(val)
             except Exception:

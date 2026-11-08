@@ -1,0 +1,13 @@
+[Unit]
+Description=FlowKit tlsrelay bridge — temporary SO_REUSEPORT partner during graceful restarts
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/flowkit
+Environment=GW_LISTEN=0.0.0.0:8100
+ExecStart=/opt/flowkit/tlsrelay /opt/flowkit
+Restart=no
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

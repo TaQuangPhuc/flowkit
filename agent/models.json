@@ -67,5 +67,63 @@
       "veo_3_1_t2v_lite_low_priority"
     ],
     "default": "veo_3_1_i2v_lite_low_priority"
+  },
+  "omni_1_2_flash_models": {
+    "text_to_video": {
+      "3": "macaron_cookie_t2v_3s",
+      "4": "macaron_cookie_t2v_4s",
+      "5": "macaron_cookie_t2v_5s",
+      "6": "macaron_cookie_t2v_6s",
+      "7": "macaron_cookie_t2v_7s",
+      "8": "macaron_cookie_t2v_8s",
+      "9": "macaron_cookie_t2v_9s",
+      "10": "macaron_cookie_t2v_10s",
+      "11": "macaron_cookie_t2v_11s",
+      "12": "macaron_cookie_t2v_12s",
+      "13": "macaron_cookie_t2v_13s",
+      "14": "macaron_cookie_t2v_14s",
+      "15": "macaron_cookie_t2v_15s"
+    },
+    "frame_to_video": {
+      "3": "macaron_cookie_i2v_3s",
+      "4": "macaron_cookie_i2v_4s",
+      "5": "macaron_cookie_i2v_5s",
+      "6": "macaron_cookie_i2v_6s",
+      "7": "macaron_cookie_i2v_7s",
+      "8": "macaron_cookie_i2v_8s",
+      "9": "macaron_cookie_i2v_9s",
+      "10": "macaron_cookie_i2v_10s",
+      "11": "macaron_cookie_i2v_11s",
+      "12": "macaron_cookie_i2v_12s",
+      "13": "macaron_cookie_i2v_13s",
+      "14": "macaron_cookie_i2v_14s",
+      "15": "macaron_cookie_i2v_15s"
+    },
+    "start_end_frame_to_video": {
+      "3": "macaron_cookie_i2v_fl_3s",
+      "4": "macaron_cookie_i2v_fl_4s",
+      "5": "macaron_cookie_i2v_fl_5s",
+      "6": "macaron_cookie_i2v_fl_6s",
+      "7": "macaron_cookie_i2v_fl_7s",
+      "8": "macaron_cookie_i2v_fl_8s",
+      "9": "macaron_cookie_i2v_fl_9s",
+      "10": "macaron_cookie_i2v_fl_10s"
+    },
+    "reference_to_video": {
+      "3": "macaron_cookie_r2v_3s",
+      "4": "macaron_cookie_r2v_4s",
+      "5": "macaron_cookie_r2v_5s",
+      "6": "macaron_cookie_r2v_6s",
+      "7": "macaron_cookie_r2v_7s",
+      "8": "macaron_cookie_r2v_8s",
+      "9": "macaron_cookie_r2v_9s",
+      "10": "macaron_cookie_r2v_10s",
+      "11": "macaron_cookie_r2v_11s",
+      "12": "macaron_cookie_r2v_12s",
+      "13": "macaron_cookie_r2v_13s",
+      "14": "macaron_cookie_r2v_14s",
+      "15": "macaron_cookie_r2v_15s"
+    },
+    "upsampler_360p": "omni_upsampler_360p"
   }
 }

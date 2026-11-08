@@ -123,7 +123,8 @@ class _URLExpiredError(Exception):
 
 async def _download_video(url: str, dest: Path) -> None:
     """Download video from URL to local path. Raises _URLExpiredError on 400."""
-    conn = aiohttp.TCPConnector(ssl=_ssl_ctx)
+    conn = aiohttp.TCPConnector(ssl=_ssl_ctx,
+                                resolver=aiohttp.ThreadResolver())
     async with aiohttp.ClientSession(connector=conn) as session:
         async with session.get(url) as resp:
             if resp.status == 400:

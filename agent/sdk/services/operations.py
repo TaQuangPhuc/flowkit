@@ -32,6 +32,18 @@ def _build_continuation_prompt(base_prompt: str) -> str:
     )
 
 
+def _scene_veo_duration(scene: dict) -> int:
+    """Scene length for Veo t2v/i2v. Missing or other values stay on 8s."""
+    raw = scene.get("duration")
+    if raw in (None, ""):
+        return 8
+    try:
+        dur = int(round(float(raw)))
+    except (TypeError, ValueError):
+        return 8
+    return dur if dur in (4, 6, 8) else 8
+
+
 def _char_matches(c: dict, name_set: set) -> bool:
     """Check if a character matches any name in the set by slug OR display name."""
     slug = c.get("slug") or ""
@@ -507,6 +519,7 @@ class OperationService:
             aspect_ratio=aspect,
             end_image_media_id=end_id,
             user_paygate_tier=tier,
+            duration_s=_scene_veo_duration(scene),
         )
 
         if _is_error(submit_result):
@@ -968,7 +981,8 @@ async def _upload_character_image(client: FlowClient, char: dict, project_id: st
             ssl_ctx = ssl.create_default_context(cafile=certifi.where())
         except ImportError:
             ssl_ctx = ssl.create_default_context()
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(
+                resolver=aiohttp.ThreadResolver())) as session:
             async with session.get(ref_url, ssl=ssl_ctx) as resp:
                 if resp.status != 200:
                     logger.error("Failed to download character image: HTTP %d", resp.status)

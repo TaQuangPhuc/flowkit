@@ -95,6 +95,25 @@ def _grpc():
     return get_flow_grpc()
 
 
+def _batch_veo_duration_error(duration_s: int) -> dict | None:
+    """Batchexecute captures are the 8-second model. 4s/6s need grpc."""
+    try:
+        dur = int(duration_s)
+    except (TypeError, ValueError):
+        dur = 0
+    if dur == 8:
+        return None
+    return {
+        "status": 400,
+        "retryable": False,
+        "error_code": "invalid_argument",
+        "error": (
+            "Veo clip length on the batchexecute transport is 8 seconds. "
+            "A 4-second or 6-second clip needs the grpc transport."
+        ),
+    }
+
+
 class _SessionFlagged(Exception):
     """Sentinel: skip rotate+retry on a session-flagged nick so the request
     falls through to cross-nick failover instead of burning ~40s and a fresh
@@ -3809,6 +3828,15 @@ class FlowClient:
                 rebound, target, sorted(known))
         return out
 
+    def _ios_mrr_token(self, nick_name: str, action: str) -> str | None:
+        from agent.services.flow_grpc import get_flow_grpc
+        t = get_flow_grpc()
+        nick = t._nicks.get(nick_name)
+        if nick is None:
+            raise RuntimeError(f"unknown iOS nick {nick_name}")
+        tok = nick.mint_captcha(force=True, action=action)
+        return tok.decode() if isinstance(tok, bytes) else tok
+
     async def _foreign_captcha_token(self, action: str) -> str | None:
         """Token minted outside the requesting nick's own page.
 
@@ -3820,6 +3848,25 @@ class FlowClient:
         generation entirely.
         """
         prof_id = (_current_route.get() or {}).get("profile_id")
+        ios_nick = os.environ.get("CAPTCHA_IOS_MRR_NICK", "").strip()
+        if ios_nick:
+            # Experiment: token from the iPhone app's reCAPTCHA (mrr replay).
+            # Falls back to in-page minting on any failure.
+            try:
+                tok = await asyncio.to_thread(self._ios_mrr_token, ios_nick, action)
+                if tok:
+                    if prof_id:
+                        self._active_minter[prof_id] = f"ios:{ios_nick}"
+                    self._mint_event("mint_ok", minter=f"ios:{ios_nick}",
+                                     target=prof_id, action=action,
+                                     token_len=len(tok))
+                    return tok
+            except Exception as exc:
+                logger.warning("iOS mrr mint failed (%s); in-page fallback", exc)
+                self._mint_event("mint_fail", minter=f"ios:{ios_nick}",
+                                 target=prof_id, reason=str(exc)[:120],
+                                 action=action)
+
         override = self._mint_override.get(prof_id) if prof_id else None
         if override:
             # Diagnostic pin: "self" = in-page mint only; otherwise mint on
@@ -4108,7 +4155,8 @@ class FlowClient:
             return await _grpc().generate_images(
                 prompt=prompt, project_id=project_id,
                 aspect_ratio=aspect_ratio, profile_id=profile_id,
-                character_media_ids=character_media_ids)
+                character_media_ids=character_media_ids,
+                image_model=image_model or "")
         if not USE_BATCH_RPC:
             return await self._legacy_generate_images(
                 prompt, project_id, aspect_ratio, user_paygate_tier, character_media_ids)
@@ -4169,16 +4217,27 @@ class FlowClient:
                               aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
                               end_image_media_id: str = None,
                               user_paygate_tier: str = "PAYGATE_TIER_TWO",
+                              video_model: str = "",
+                              priority: str = "",
                               *,
-                              profile_id: str | None = None) -> dict:
-        """Submit i2v (start frame) or t2v (no start frame). Returns operations."""
+                              profile_id: str | None = None,
+                              duration_s: int = 8) -> dict:
+        """Submit i2v (start frame) or t2v (no start frame). Returns operations.
+
+        ``duration_s`` 4 or 6 selects the short Veo clip on the grpc transport.
+        8 keeps the captured model key.
+        """
         if _grpc_active():
             if end_image_media_id:
                 return {"error": "start+end frame chaining not captured on grpc path"}
             return await _grpc().generate_video(
                 start_image_media_id=start_image_media_id, prompt=prompt,
                 project_id=project_id, aspect_ratio=aspect_ratio,
-                profile_id=profile_id)
+                profile_id=profile_id, video_model=video_model,
+                priority=priority, duration_s=duration_s)
+        batch_dur = _batch_veo_duration_error(duration_s)
+        if batch_dur:
+            return batch_dur
         start = start_image_media_id or None
         if not USE_BATCH_RPC:
             if not start:
@@ -4268,14 +4327,22 @@ class FlowClient:
                                               prompt: str, project_id: str, scene_id: str,
                                               aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
                                               user_paygate_tier: str = "PAYGATE_TIER_TWO",
+                                              video_model: str = "",
+                                              priority: str = "",
                                               *,
-                                              profile_id: str | None = None) -> dict:
+                                              profile_id: str | None = None,
+                                              duration_s: int = 8) -> dict:
         """Generate video from multiple reference images (r2v)."""
         if _grpc_active():
             return await _grpc().generate_video_from_references(
                 reference_media_ids=list(reference_media_ids or []),
                 prompt=prompt, project_id=project_id,
-                aspect_ratio=aspect_ratio, profile_id=profile_id)
+                aspect_ratio=aspect_ratio, profile_id=profile_id,
+                video_model=video_model, priority=priority,
+                duration_s=duration_s)
+        batch_dur = _batch_veo_duration_error(duration_s)
+        if batch_dur:
+            return batch_dur
         if not USE_BATCH_RPC:
             return await self._legacy_generate_video_from_references(
                 reference_media_ids, prompt, project_id, scene_id,
@@ -4357,6 +4424,10 @@ class FlowClient:
                              aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
                              resolution: str = "VIDEO_RESOLUTION_4K") -> dict:
         """Upscale a video."""
+        if _grpc_active():
+            return await _grpc().upscale_video(
+                media_id=media_id, scene_id=scene_id,
+                aspect_ratio=aspect_ratio, resolution=resolution)
         if not USE_BATCH_RPC:
             return await self._legacy_upscale_video(media_id, scene_id, aspect_ratio, resolution)
         return {"error": _unsupported(
@@ -5043,6 +5114,15 @@ class FlowClient:
             except Exception:
                 return {}
         return {}
+
+    def media_url_via_relay(self, url: str, media_id: str = "") -> str:
+        """Route a media CDN url through the owning nick's TLS relay."""
+        if _grpc_active():
+            try:
+                return _grpc().media_url_via_relay(url, media_id)
+            except Exception:
+                return url
+        return url
 
     async def get_media(self, media_id: str) -> dict:
         """Fetch a media record, which is where a fresh signed url lives."""

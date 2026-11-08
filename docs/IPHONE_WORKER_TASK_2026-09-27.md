@@ -1,10 +1,42 @@
 # Task: iPhone as FlowKit worker node (ios-webkit-debug-proxy transport)
 
 Date: 2026-09-27
-Status: SPEC — not started. Home machine: pull this repo, do NOT run the server
-until bench tests pass.
+Status: **SUPERSEDED 2026-09-27 — see "Direct gRPC transport" below.**
 
-## Why
+## Update 2026-09-27: Direct gRPC transport (verified, replaces this spec)
+
+MITM capture of the native Flow iOS app (`com.google.whisk`, WireGuard +
+mitmproxy with an HTTP/2 prior-knowledge hook) revealed that the app does
+**not** use batchexecute — it calls plain gRPC on
+`aisandbox-pa.googleapis.com`. Every generation call was replayed
+successfully from a plain PC (different IP, different TLS stack):
+
+- `FlowService/BatchGenerateImages` — image gen (12/12 burst @1.5s)
+- `VideoFxService/BatchAsyncGenerateVideoText` — t2v
+- `VideoFxService/BatchAsyncGenerateVideoReferenceImages` — r2v (1..N
+  ingredient media uuids)
+- `VideoFxService/BatchAsyncGenerateVideoStartImage` — true i2v
+- `FlowService/UploadImage` — external image → media uuid
+- `issuetoken` refresh→ya29, `recaptcha/api3/mrr` captcha mint — both
+  replayed standalone from PC
+
+Consequences:
+
+- **No iPhone needed at runtime** — the phone's only role is a one-time
+  credential bootstrap (capture the `1//` refresh token + blob set once).
+- No Safari tab, no USB dock, no debug proxy, no injected.js.
+- reCAPTCHA is required on gen calls but the same token replays for ~2h+
+  and can be minted fresh from PC by replaying `mrr`.
+- Per-nick egress IP works via `https_proxy` on the gRPC channel / HTTP
+  calls — verified 10/10 through a residential proxy.
+- Full field maps + replay scripts: `.omc/research/FLOW_IOS_API.md`,
+  `proto_lib.py`, `replay_*.py`, `mitm_logger.py`.
+
+The Safari/debug-proxy design below is retained for history only.
+
+---
+
+## Why (original spec)
 
 Measured 2026-09-27 on account `friend-test` (heavily UNUSUAL-flagged on web):
 

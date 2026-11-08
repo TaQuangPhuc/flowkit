@@ -349,7 +349,8 @@ async def _dispatch(req: dict, orientation: str) -> dict:
 async def _reupload_media(url: str, project_id: str) -> str | None:
     """Download image from URL and re-upload to get a fresh media_id."""
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(
+                resolver=aiohttp.ThreadResolver())) as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status != 200:
                     logger.warning("Re-upload: failed to download %s (status %d)", url[:60], resp.status)
@@ -490,7 +491,11 @@ async def _handle_failure(rid: str, req: dict, result: dict, retry_after: dict =
                 # Still in backoff — reset to PENDING so it's not stuck in PROCESSING
                 await crud.update_request(rid, status="PENDING", error_message=str(error_msg))
                 return
-            retry_after[rid] = now + min(2 ** retry * 10, 300)
+            wait = min(2 ** retry * 10, 300)
+            hinted = result.get("retry_after_s")
+            if isinstance(hinted, (int, float)) and hinted > 0:
+                wait = min(float(hinted), 300)
+            retry_after[rid] = now + wait
         await crud.update_request(rid, status="PENDING", retry_count=retry, error_message=str(error_msg))
         logger.warning("Request %s failed (retry %d/%d): %s", rid[:8], retry, MAX_RETRIES, error_msg)
     else:

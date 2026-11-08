@@ -34,6 +34,7 @@ from agent.api.accounts import router as accounts_router
 from agent.api.system import router as system_router
 from agent.api.fashion_lookbook import router as fashion_lookbook_router
 from agent.api.incidents import router as incidents_router
+from agent.api.vids import router as vids_router
 from agent.api.admin import router as admin_router
 from agent.services.central_watchdog import start_central_watchdog, stop_central_watchdog
 from agent.services.flow_trace import FlowTraceMiddleware, emit as trace_emit, identifier as trace_identifier, summary as trace_summary
@@ -85,6 +86,15 @@ async def run_ws_server():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Blocking gRPC/HTTP calls run via asyncio.to_thread; the stock pool is
+    # cpu+4 threads (10 on the VPS) while the fleet runs 100+ in-flight
+    # calls — requests queued ~35s for a thread. I/O-bound, so go wide.
+    import asyncio as _aio
+    import os as _osx
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    _aio.get_running_loop().set_default_executor(_TPE(
+        max_workers=int(_osx.environ.get("FLOWKIT_IO_THREADS", "160")),
+        thread_name_prefix="flowio"))
     await init_db()
 
     # Load custom materials from DB into in-memory registry
@@ -105,51 +115,63 @@ async def lifespan(app: FastAPI):
 
     controller = get_worker_controller()
 
+    # FLOWKIT_ROLE=api → lean serving instance: no WS bridge (:9222 would
+    # collide), no queue worker (batch jobs would be processed twice), no
+    # watchdog/reconciler daemons. Used for the second agent behind the
+    # gateway load balancer — it only needs the HTTP API + gRPC transport.
+    import os as _os
+    light = _os.environ.get("FLOWKIT_ROLE") == "api"
+
     # Start background tasks
-    ws_task = asyncio.create_task(run_ws_server())
-    worker_task = asyncio.create_task(controller.start())
-    from agent.services.video_reconciliation import VideoReconciler
-    from agent.config import VIDEO_POLL_TIMEOUT
-    reconciler = VideoReconciler(get_flow_client(), BASE_DIR / '.scratch' / 'video-reconciliation.json',
-                                render_timeout=VIDEO_POLL_TIMEOUT)
-    reconcile_task = asyncio.create_task(reconciler.run())
-    logger.info("WS server + worker started")
+    ws_task = worker_task = reconcile_task = None
+    if not light:
+        ws_task = asyncio.create_task(run_ws_server())
+        worker_task = asyncio.create_task(controller.start())
+        from agent.services.video_reconciliation import VideoReconciler
+        from agent.config import VIDEO_POLL_TIMEOUT
+        reconciler = VideoReconciler(get_flow_client(), BASE_DIR / '.scratch' / 'video-reconciliation.json',
+                                    render_timeout=VIDEO_POLL_TIMEOUT)
+        reconcile_task = asyncio.create_task(reconciler.run())
+        logger.info("WS server + worker started")
 
-    # Auto-restore bridges and launch enabled nicks
-    try:
-        from agent.services.accounts import load_accounts
-        from agent.services.chrome_nicks import ensure_nick_active, restore_all_bridges
-        # 1. ALWAYS restore proxy bridges immediately on startup so running Chromes never fail
-        restored_bridges = await restore_all_bridges()
-        if restored_bridges:
-            logger.info("Restored proxy bridges on startup: %s", restored_bridges)
-        # 2. Ensure all enabled accounts are active
-        for acc in load_accounts():
-            if acc.get("enabled", True):
-                logger.info("Auto-ensuring Chrome & proxy bridge for enabled nick: %s", acc["id"])
-                asyncio.create_task(ensure_nick_active(acc["id"]))
-    except Exception as e:
-        logger.warning("Auto-restoring nicks & bridges failed: %s", e)
+        # Auto-restore bridges and launch enabled nicks
+        try:
+            from agent.services.accounts import load_accounts
+            from agent.services.chrome_nicks import ensure_nick_active, restore_all_bridges
+            # 1. ALWAYS restore proxy bridges immediately on startup so running Chromes never fail
+            restored_bridges = await restore_all_bridges()
+            if restored_bridges:
+                logger.info("Restored proxy bridges on startup: %s", restored_bridges)
+            # 2. Ensure all enabled accounts are active
+            for acc in load_accounts():
+                if acc.get("enabled", True):
+                    logger.info("Auto-ensuring Chrome & proxy bridge for enabled nick: %s", acc["id"])
+                    asyncio.create_task(ensure_nick_active(acc["id"]))
+        except Exception as e:
+            logger.warning("Auto-restoring nicks & bridges failed: %s", e)
 
-    # Start proxy health & temporary expiry daemon
-    try:
-        from agent.services.proxy_checker import start_proxy_health_daemon
-        start_proxy_health_daemon(interval_seconds=180)
-        logger.info("Proxy health & auto-expiry daemon started")
-    except Exception as e:
-        logger.warning("Failed to start proxy health daemon: %s", e)
+        # Start proxy health & temporary expiry daemon
+        try:
+            from agent.services.proxy_checker import start_proxy_health_daemon
+            start_proxy_health_daemon(interval_seconds=180)
+            logger.info("Proxy health & auto-expiry daemon started")
+        except Exception as e:
+            logger.warning("Failed to start proxy health daemon: %s", e)
 
-    # Start Central Watchdog & Self-Healing Daemon
-    try:
-        start_central_watchdog()
-        logger.info("Central Watchdog Daemon started")
-    except Exception as e:
-        logger.warning("Failed to start central watchdog: %s", e)
+        # Start Central Watchdog & Self-Healing Daemon
+        try:
+            start_central_watchdog()
+            logger.info("Central Watchdog Daemon started")
+        except Exception as e:
+            logger.warning("Failed to start central watchdog: %s", e)
+    else:
+        logger.info("FLOWKIT_ROLE=api — background daemons skipped")
 
     yield
 
-    reconcile_task.cancel()
-    await asyncio.gather(reconcile_task, return_exceptions=True)
+    if reconcile_task:
+        reconcile_task.cancel()
+        await asyncio.gather(reconcile_task, return_exceptions=True)
 
     # Graceful shutdown: Never drop in-flight client requests
     shield = get_request_shield()
@@ -172,8 +194,17 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    ws_task.cancel()
-    worker_task.cancel()
+    try:
+        from agent.services import flow_grpc as _fg
+        if _fg._transport is not None:
+            await asyncio.to_thread(_fg._transport._flush_routes)
+    except Exception:
+        logger.exception("Graceful shutdown: routes flush failed")
+
+    if ws_task:
+        ws_task.cancel()
+    if worker_task:
+        worker_task.cancel()
     await close_db()
     logger.info("Flow Kit stopped cleanly without dropping client requests")
 
@@ -211,6 +242,7 @@ app.include_router(accounts_router, prefix="/api")
 app.include_router(system_router, prefix="/api")
 app.include_router(fashion_lookbook_router, prefix="/api")
 app.include_router(incidents_router)
+app.include_router(vids_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
 
 

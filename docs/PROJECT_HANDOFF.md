@@ -137,6 +137,10 @@ Quản lý tại [agent/models.json](file:///home/pc/flowkit/agent/models.json):
 
 ---
 
+## 5b. VPS gen (Nova gọi từ máy khác)
+
+Xem [docs/VPS.md](VPS.md). SSH: `powershell -File scripts/vps_ssh.ps1`. Deploy: `python scripts/vps_deploy.py`. Nova: `http://180.93.43.217:8100` và `http://180.93.43.217:8089`.
+
 ## 6. Vận hành & Lệnh quan trọng (Operational Commands)
 
 ### Môi trường thực thi:
@@ -174,5 +178,5 @@ curl -s -X POST http://127.0.0.1:8100/api/accounts/nick-a/rotate-proxy
 
 1. **KHÔNG BAO GIỜ dùng IP Datacenter** cho Chrome / nick Flow. Chỉ dùng proxy Residential (IP dân cư sạch).
 2. **Media ID luôn là UUID** (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Tuyệt đối không dùng chuỗi dạng `CAMS...` / base64.
-3. **Không bind port 8100 ra public internet**. Giao tiếp với Nova VPS hoàn toàn qua reverse SSH tunnel (`ssh -R 127.0.0.1:8100:127.0.0.1:8100`).
+3. **Cổng public chỉ 8100 + 8089** trên VPS gen (`180.93.43.217`). Nova là máy khác. Không mở 8101 / 51900–51904 / 9222. Chi tiết: [docs/VPS.md](VPS.md).
 4. **Không viết throwaway script loop request**. Mọi batch generate dùng `POST /api/requests/batch`, server tự throttle concurrency max 5 + cooldown 10s.

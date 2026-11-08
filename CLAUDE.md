@@ -5,8 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Flow Kit
 
 > **Handoff Guide**: Đọc tài liệu bàn giao kỹ thuật & kiến trúc tại [docs/PROJECT_HANDOFF.md](docs/PROJECT_HANDOFF.md).
+>
+> **VPS gen**: [docs/VPS.md](docs/VPS.md) — Nova gọi `http://180.93.43.217:8100` và `:8089`. SSH: `scripts/vps_ssh.ps1`. Deploy: `python scripts/vps_deploy.py`.
 
-Base URL: `http://127.0.0.1:8100`
+Base URL (máy local): `http://127.0.0.1:8100`
 
 ## Commands
 
@@ -69,13 +71,15 @@ that change how you work:
 
 - **Projects are not created by Flow Kit any more.** Make one in the Flow UI and
   pin its uuid as `FLOW_PROJECT_ID`, or pass `flow_project_id` to `POST /api/projects`.
-- **Three capabilities are unported** because their payloads were never captured:
-  4K upscale, start+end-frame chaining, and Omni Flash. They fail with
+- **Two capabilities are unported** because their payloads were never captured:
+  start+end-frame chaining and Omni Flash. They fail with
   `UNSUPPORTED_ON_BATCH_API` rather than silently producing the wrong thing.
-  `FLOW_ALLOW_DEGRADED=1` drops chaining to plain i2v; upscale has no
-  fallback. r2v is ported (StreamChat + `CHAT_GENERATION`). t2v is ported
+  `FLOW_ALLOW_DEGRADED=1` drops chaining to plain i2v. r2v is ported
+  (StreamChat + `CHAT_GENERATION`). t2v is ported
   (`YhhmEf`; omit `start_image_media_id` on `POST /api/flow/generate-video`).
-  To restore an
+  Video upscale is ported on the gRPC path (`BatchAsyncGenerateVideoUpsampleVideo`,
+  `POST /api/flow/upscale-video`; 1080p verified, 4K model name plausible
+  but uncaptured). To restore an
   unported call properly, see `docs/CAPTURE.md`.
 - **A poll saying "Media not found." is not a failure.** Finished jobs report it.
 
